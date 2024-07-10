@@ -132,23 +132,23 @@ app_license = "mit"
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
+scheduler_events = {
 # 	"all": [
 # 		"eseller_suite.tasks.all"
 # 	],
 # 	"daily": [
 # 		"eseller_suite.tasks.daily"
 # 	],
-# 	"hourly": [
-# 		"eseller_suite.tasks.hourly"
-# 	],
+	"hourly": [
+		"eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.schedule_get_order_details",
+	],
 # 	"weekly": [
 # 		"eseller_suite.tasks.weekly"
 # 	],
 # 	"monthly": [
 # 		"eseller_suite.tasks.monthly"
 # 	],
-# }
+}
 
 # Testing
 # -------
