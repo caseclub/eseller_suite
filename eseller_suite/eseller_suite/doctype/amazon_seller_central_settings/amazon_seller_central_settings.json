@@ -13,11 +13,15 @@
   "column_break_zctr",
   "client_secret",
   "authorisation_token",
-  "section_break_zuvx",
-  "token_generated_on",
-  "token_exprire_on",
-  "column_break_tvrc",
-  "access_token"
+  "syncing_section",
+  "after_date",
+  "sync_orders",
+  "column_break_uykf",
+  "enable_scheduled_sync",
+  "next_token",
+  "section_break_swvl",
+  "create_items_if_not_exists",
+  "default_item_group"
  ],
  "fields": [
   {
@@ -69,36 +73,58 @@
    "hide_border": 1
   },
   {
-   "fieldname": "section_break_zuvx",
+   "fieldname": "syncing_section",
+   "fieldtype": "Section Break",
+   "label": "Syncing"
+  },
+  {
+   "fieldname": "after_date",
+   "fieldtype": "Date",
+   "label": "After Date"
+  },
+  {
+   "fieldname": "sync_orders",
+   "fieldtype": "Button",
+   "label": "Sync Orders"
+  },
+  {
+   "fieldname": "column_break_uykf",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_scheduled_sync",
+   "fieldtype": "Check",
+   "label": "Enable Scheduled Sync"
+  },
+  {
+   "default": "0",
+   "fieldname": "create_items_if_not_exists",
+   "fieldtype": "Check",
+   "label": "Create Items If Not Exists"
+  },
+  {
+   "fieldname": "section_break_swvl",
    "fieldtype": "Section Break"
   },
   {
-   "fieldname": "access_token",
-   "fieldtype": "Password",
-   "label": "Access Token",
-   "read_only": 1
+   "fieldname": "default_item_group",
+   "fieldtype": "Link",
+   "label": "Default Item Group",
+   "mandatory_depends_on": "create_items_if_not_exists",
+   "options": "Item Group"
   },
   {
-   "fieldname": "token_generated_on",
-   "fieldtype": "Datetime",
-   "label": "Token Generated On",
+   "fieldname": "next_token",
+   "fieldtype": "Small Text",
+   "label": "Next Token",
    "read_only": 1
-  },
-  {
-   "fieldname": "token_exprire_on",
-   "fieldtype": "Datetime",
-   "label": "Token Exprire On",
-   "read_only": 1
-  },
-  {
-   "fieldname": "column_break_tvrc",
-   "fieldtype": "Column Break"
   }
  ],
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2024-06-26 15:56:14.453678",
+ "modified": "2024-07-10 12:50:36.638630",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Seller Central Settings",
