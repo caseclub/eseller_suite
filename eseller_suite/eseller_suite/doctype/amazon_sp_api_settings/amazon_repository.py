@@ -67,7 +67,7 @@ class AmazonRepository:
 		frappe.throw(
 			_("Scheduled sync has been temporarily disabled because maximum retries have been exceeded!")
 		)
- 
+
 	def get_finances_instance(self) -> Finances:
 		return Finances(**self.instance_params)
 
@@ -227,7 +227,7 @@ class AmazonRepository:
 	def get_item_code(self, order_item) -> str:
 		if frappe.db.exists('Item', { 'custom_amazon_item_code': order_item['SellerSKU']}):
 			return frappe.db.get_value('Item', { 'custom_amazon_item_code': order_item['SellerSKU']})
-		
+
 		item_code = self.create_item(order_item)
 		return item_code
 
@@ -387,7 +387,7 @@ class AmazonRepository:
 					so.append("taxes", fee)
 
 			so.flags.ignore_mandatory = True
-			so.flags.ignore_validate = True
+			# so.flags.ignore_validate = True
 			so.save(ignore_permissions=True)
 			so.submit()
 
