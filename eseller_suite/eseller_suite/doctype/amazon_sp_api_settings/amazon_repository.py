@@ -368,7 +368,7 @@ class AmazonRepository:
 			so.amazon_order_id = order_id
 			so.marketplace_id = order.get("MarketplaceId")
 			so.customer = customer_name
-			so.delivery_date = delivery_date
+			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
 			so.transaction_date = transaction_date
 			so.company = self.amz_setting.company
 
