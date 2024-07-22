@@ -155,8 +155,8 @@ def create_sales_invoice(order, order_items):
         frappe.throw('Please configure the `Default POS Profile` in {0}'.format(get_link_to_form('eSeller Settings', 'eSeller Settings')))
 
     new_sales_invoice = frappe.new_doc('Sales Invoice')
-    new_sales_invoice.custom_amazon_order_id = order.get('AmazonOrderId')
-    new_sales_invoice.custom_transaction_type = order.get('OrderType')
+    new_sales_invoice.amazon_order_id = order.get('AmazonOrderId')
+    new_sales_invoice.transaction_type = order.get('OrderType')
     purchase_date = order.get('PurchaseDate')
     if purchase_date:
         posting_date = datetime.strptime(purchase_date, '%Y-%m-%dT%H:%M:%SZ').strftime('%Y-%m-%d')
@@ -173,8 +173,8 @@ def create_sales_invoice(order, order_items):
                 default_item_group = frappe.db.get_single_value("Amazon Seller Central Settings", "default_item_group")
                 item_doc = frappe.new_doc('Item')
                 item_doc.item_code = amazon_item_code
-                item_doc.item_name = amazon_item_code 
-                item_doc.description = item.get('Title') or '' 
+                item_doc.item_name = amazon_item_code
+                item_doc.description = item.get('Title') or ''
                 item_doc.item_group = default_item_group
                 item_doc.custom_amazon_item_code = amazon_item_code
                 item_doc.flags.ignore_mandatory = True

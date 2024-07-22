@@ -104,8 +104,8 @@ def create_sales_invoices(docname):
         if payment.transaction_type == 'Order Payment' and payment.item_code:
             new_sales_invoice = frappe.new_doc('Sales Invoice')
             new_sales_invoice.posting_date = payment.date
-            new_sales_invoice.custom_amazon_order_id = payment.order_id
-            new_sales_invoice.custom_transaction_type = payment.transaction_type
+            new_sales_invoice.amazon_order_id = payment.order_id
+            new_sales_invoice.transaction_type = payment.transaction_type
             new_sales_invoice.customer = default_amazon_customer
             new_sales_invoice.update_stock = 1
             new_sales_invoice.is_pos = 1
@@ -151,8 +151,8 @@ def update_sales_invoices_with_shipping_charges(docname):
     amazon_payment_extractor = frappe.get_doc('Amazon Payment Extractor', docname)
     for payment in amazon_payment_extractor.payment_details:
         if payment.transaction_type == 'Amazon Easy Ship Charges' and payment.item_code:
-            if frappe.db.exists('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0 }):
-                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0 })
+            if frappe.db.exists('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0 }):
+                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0 })
                 existing_sales_invoice = frappe.get_doc('Sales Invoice', sales_invoice_id)
                 existing_sales_invoice.append('items', {
                     'item_code': payment.item_code,
@@ -185,20 +185,20 @@ def create_return_invoice(docname):
     amazon_payment_extractor = frappe.get_doc("Amazon Payment Extractor", docname)
     for payment in amazon_payment_extractor.payment_details:
         if payment.transaction_type == 'Refund' and payment.item_code:
-            if frappe.db.exists('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0 }):
-                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0 })
+            if frappe.db.exists('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0 }):
+                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0 })
                 existing_sales_invoice = frappe.get_doc('Sales Invoice', sales_invoice_id)
                 existing_sales_invoice.flags.ignore_mandatory = True
                 existing_sales_invoice.flags.ignore_validate = True
                 existing_sales_invoice.submit()
-            if frappe.db.exists('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':1 }):
-                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':1 })
+            if frappe.db.exists('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':1 }):
+                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':1 })
                 existing_sales_invoice = frappe.get_doc('Sales Invoice', sales_invoice_id)
                 return_invoice = frappe.new_doc('Sales Invoice')
                 return_invoice.posting_date = payment.date
-                return_invoice.custom_amazon_order_id = payment.order_id
+                return_invoice.amazon_order_id = payment.order_id
                 return_invoice.customer = existing_sales_invoice.customer
-                return_invoice.custom_transaction_type = payment.transaction_type
+                return_invoice.transaction_type = payment.transaction_type
                 return_invoice.is_return = 1
                 return_invoice.return_against = existing_sales_invoice.name
                 return_invoice.update_outstanding_for_self = 0
@@ -237,8 +237,8 @@ def update_sales_invoices_with_fulfillment_fee_refund(docname):
     amazon_payment_extractor = frappe.get_doc('Amazon Payment Extractor', docname)
     for payment in amazon_payment_extractor.payment_details:
         if payment.transaction_type == 'Fulfillment Fee Refund' and payment.item_code:
-            if frappe.db.exists('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0, 'is_return':1 }):
-                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0, 'is_return':1 })
+            if frappe.db.exists('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'is_return':1 }):
+                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'is_return':1 })
                 existing_sales_invoice = frappe.get_doc('Sales Invoice', sales_invoice_id)
                 existing_sales_invoice.append('items', {
                     'item_code': payment.item_code,
@@ -271,8 +271,8 @@ def submit_all_invoices(docname):
     amazon_payment_extractor = frappe.get_doc('Amazon Payment Extractor', docname)
     for payment in amazon_payment_extractor.payment_details:
         if payment.transaction_type == 'Order Payment':
-            if frappe.db.exists('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0, 'custom_transaction_type':payment.transaction_type }):
-                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'custom_amazon_order_id':payment.order_id, 'docstatus':0, 'custom_transaction_type':payment.transaction_type })
+            if frappe.db.exists('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'transaction_type':payment.transaction_type }):
+                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'transaction_type':payment.transaction_type })
                 sales_invoice = frappe.get_doc('Sales Invoice', sales_invoice_id)
                 sales_invoice.flags.ignore_mandatory = True
                 sales_invoice.flags.ignore_validate = True
