@@ -347,12 +347,118 @@ class AmazonRepository:
 				make_address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
 				make_address.address_type = "Shipping"
 				make_address.insert()
+    
+		def get_refunds(self, order_id) -> dict:
+			finances = self.get_finances_instance()
+			financial_events_payload = self.call_sp_api_method(
+				sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
+			)
+   
+			refund_events = []
+
+			while True:
+				refund_event_list = financial_events_payload.get("FinancialEvents", {}).get("RefundEventList", [])
+				next_token = financial_events_payload.get("NextToken")
+
+				for refund_event in refund_event_list:
+					if refund_event:
+						charges_and_fees = {"posting_date": "", "items":[], "charges": [], "fees": []}
+						charges_and_fees["posting_date"] = refund_event.get("PostedDate")
+						for refund_item in refund_event.get("ShipmentItemAdjustmentList", []):
+							charges = refund_item.get("ItemChargeAdjustmentList", [])
+							fees = refund_item.get("ItemFeeAdjustmentList", [])
+							seller_sku = refund_item.get("SellerSKU")
+
+							for charge in charges:
+								charge_type = charge.get("ChargeType")
+								amount = charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
+
+								if charge_type != "Principal" and float(amount) != 0:
+									charge_account = self.get_account(charge_type)
+									charges_and_fees.get("charges").append(
+										{
+											"charge_type": "Actual",
+											"account_head": charge_account,
+											"tax_amount": amount,
+											"description": charge_type + " refund for " + seller_sku,
+										}
+									)
+								else:
+									charges_and_fees.get("items").append(
+										{
+											"item_name": seller_sku,
+											"qty": refund_item.get("QuantityShipped"),
+											"refund_amount": charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
+										}
+									)
+
+							for fee in fees:
+								fee_type = fee.get("FeeType")
+								amount = fee.get("FeeAmount", {}).get("CurrencyAmount", 0)
+
+								if float(amount) != 0:
+									fee_account = self.get_account(fee_type)
+									charges_and_fees.get("fees").append(
+										{
+											"charge_type": "Actual",
+											"account_head": fee_account,
+											"tax_amount": amount,
+											"description": fee_type + " refund for " + seller_sku,
+										}
+									)
+         
+						refund_events.append(charges_and_fees)
+
+				if not next_token:
+					break
+
+				financial_events_payload = self.call_sp_api_method(
+					sp_api_method=finances.list_financial_events_by_order_id,
+					order_id=order_id,
+					next_token=next_token,
+				)
+
+			return refund_events
 
 		order_id = order.get("AmazonOrderId")
 		so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
 
 		if so:
+			refunds = get_refunds(self, order_id)
+   
+			for refund in refunds:
+				if not frappe.db.exists("Sales Invoice Item", {"sales_order":so}):
+					break
+				si = frappe.db.get_value("Sales Invoice Item", {"sales_order":so}, "parent")
+				return_si = frappe.new_doc("Sales Invoice")
+				return_si.is_return = 1
+				return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
+				for item in refund.get("items", []):
+					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item["item_name"], "custom_refunded":1}):
+						break
+					return_si.append("items", {
+						"item_code": item["item_name"],
+						"qty": -1 * item["qty"],
+						"rate": abs(item["refund_amount"]/item["qty"]),
+						"sales_order": so,
+						"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so}, "name")
+					})
+     
+				frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item["item_name"]}, "custom_refunded", 1)
+	
+				for charge in refund.get("charges", []):
+					return_si.append("taxes", charge)
+
+				for fee in refund.get("fees", []):
+					return_si.append("taxes", fee)
+	
+				return_si.custom_amazon_order_id = frappe.db.get_value("Sales Invoice", si, "custom_amazon_order_id")
+    
+				return_si.insert(ignore_permissions=True)
+				return_si.submit()
+
 			return so
+
 		else:
 			items = self.get_order_items(order_id)
 
