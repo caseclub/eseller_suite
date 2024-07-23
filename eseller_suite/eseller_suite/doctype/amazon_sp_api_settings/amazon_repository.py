@@ -347,7 +347,7 @@ class AmazonRepository:
 				make_address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
 				make_address.address_type = "Shipping"
 				make_address.insert()
-    
+	
 		def get_refunds(self, order_id) -> dict:
 			finances = self.get_finances_instance()
 			financial_events_payload = self.call_sp_api_method(
@@ -406,7 +406,7 @@ class AmazonRepository:
 											"description": fee_type + " refund for " + seller_sku,
 										}
 									)
-         
+		 
 						refund_events.append(charges_and_fees)
 
 				if not next_token:
@@ -419,6 +419,41 @@ class AmazonRepository:
 				)
 
 			return refund_events
+
+		def update_sales_order(self, sales_order_id):
+			"""method updates existing sales order with updated data from amazon
+
+			Args:
+				sales_order_id (str): ID of the sales order
+			"""
+			delivery_date = dateutil.parser.parse(order.get("LatestShipDate")).strftime("%Y-%m-%d")
+			transaction_date = dateutil.parser.parse(order.get("PurchaseDate")).strftime("%Y-%m-%d")
+
+			so = frappe.get_doc("Sales Order", sales_order_id)
+			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
+			so.transaction_date = transaction_date
+
+			taxes_and_charges = self.amz_setting.taxes_charges
+
+			if taxes_and_charges:
+				charges_and_fees = self.get_charges_and_fees(order_id)
+
+				for charge in charges_and_fees.get("charges"):
+					if frappe.db.exists("Sales Taxes and Charges", charge.update({"parent":so.name})):
+						so.append("taxes", charge)
+
+				for fee in charges_and_fees.get("fees"):
+					if frappe.db.exists("Sales Taxes and Charges", fee.update({"parent":so.name})):
+						so.append("taxes", fee)
+
+			so.flags.ignore_mandatory = True
+			# so.flags.ignore_validate = True
+			so.save(ignore_permissions=True)
+   
+			so.custom_amazon_order_status = order.get("OrderStatus")
+
+			if so.docstatus != 1 and order.get("OrderStatus") == "Shipped":
+				so.submit()
 
 		order_id = order.get("AmazonOrderId")
 		so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
@@ -443,7 +478,7 @@ class AmazonRepository:
 						"sales_order": so,
 						"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so}, "name")
 					})
-     
+	 
 				frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item["item_name"]}, "custom_refunded", 1)
 	
 				for charge in refund.get("charges", []):
@@ -453,9 +488,11 @@ class AmazonRepository:
 					return_si.append("taxes", fee)
 	
 				return_si.custom_amazon_order_id = frappe.db.get_value("Sales Invoice", si, "custom_amazon_order_id")
-    
+	
 				return_si.insert(ignore_permissions=True)
 				return_si.submit()
+	
+			update_sales_order(self, so)
 
 			return so
 
@@ -496,7 +533,11 @@ class AmazonRepository:
 			so.flags.ignore_mandatory = True
 			# so.flags.ignore_validate = True
 			so.save(ignore_permissions=True)
-			so.submit()
+   
+			so.custom_amazon_order_status = order.get("OrderStatus")
+
+			if order.get("OrderStatus") == "Shipped":
+				so.submit()
 
 			return so.name
 
