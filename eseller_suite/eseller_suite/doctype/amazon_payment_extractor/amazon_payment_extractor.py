@@ -105,7 +105,7 @@ def create_sales_invoices(docname):
             new_sales_invoice = frappe.new_doc('Sales Invoice')
             new_sales_invoice.posting_date = payment.date
             new_sales_invoice.amazon_order_id = payment.order_id
-            new_sales_invoice.transaction_type = payment.transaction_type
+            new_sales_invoice.amazon_transaction_type = payment.transaction_type
             new_sales_invoice.customer = default_amazon_customer
             new_sales_invoice.update_stock = 1
             new_sales_invoice.is_pos = 1
@@ -198,7 +198,7 @@ def create_return_invoice(docname):
                 return_invoice.posting_date = payment.date
                 return_invoice.amazon_order_id = payment.order_id
                 return_invoice.customer = existing_sales_invoice.customer
-                return_invoice.transaction_type = payment.transaction_type
+                return_invoice.amazon_transaction_type = payment.transaction_type
                 return_invoice.is_return = 1
                 return_invoice.return_against = existing_sales_invoice.name
                 return_invoice.update_outstanding_for_self = 0
@@ -271,8 +271,8 @@ def submit_all_invoices(docname):
     amazon_payment_extractor = frappe.get_doc('Amazon Payment Extractor', docname)
     for payment in amazon_payment_extractor.payment_details:
         if payment.transaction_type == 'Order Payment':
-            if frappe.db.exists('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'transaction_type':payment.transaction_type }):
-                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'transaction_type':payment.transaction_type })
+            if frappe.db.exists('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'amazon_transaction_type':payment.transaction_type }):
+                sales_invoice_id = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':payment.order_id, 'docstatus':0, 'amazon_transaction_type':payment.transaction_type })
                 sales_invoice = frappe.get_doc('Sales Invoice', sales_invoice_id)
                 sales_invoice.flags.ignore_mandatory = True
                 sales_invoice.flags.ignore_validate = True
