@@ -454,16 +454,26 @@ class AmazonRepository:
 						so.append("taxes", fee)
 
 			so.flags.ignore_mandatory = True
-			so.flags.ignore_validate = True
-			so.save(ignore_permissions=True)
+			so.custom_validate()
+			if so.grand_total >=0:
+				# so.flags.ignore_validate = True
+				so.save(ignore_permissions=True)
 
-			so.custom_amazon_order_status = order.get("OrderStatus")
+				so.custom_amazon_order_status = order.get("OrderStatus")
 
-			if so.docstatus != 1 and order.get("OrderStatus") == "Shipped":
-				so.submit()
+				if so.docstatus != 1 and order.get("OrderStatus") == "Shipped":
+					so.submit()
+			else:
+				if so.amazon_order_id:
+					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+					failed_sync_record.amazon_order_id = so.amazon_order_id
+					failed_sync_record.remarks = 'Failed to update Sales Order {0}'.format(so.name)
+					failed_sync_record.save(ignore_permissions=True)
 
 		order_id = order.get("AmazonOrderId")
-		so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
+		so = None
+		if frappe.db.exists("Sales Order", {"amazon_order_id": order_id}):
+			so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
 
 		if so:
 			refunds = get_refunds(self, order_id)
@@ -538,13 +548,20 @@ class AmazonRepository:
 					so.append("taxes", fee)
 
 			so.flags.ignore_mandatory = True
-			so.flags.ignore_validate = True
-			so.save(ignore_permissions=True)
+			so.custom_validate()
+			if so.grand_total>=0:
+				# so.flags.ignore_validate = True
+				so.save(ignore_permissions=True)
 
-			so.custom_amazon_order_status = order.get("OrderStatus")
+				so.custom_amazon_order_status = order.get("OrderStatus")
 
-			if order.get("OrderStatus") == "Shipped":
-				so.submit()
+				if order.get("OrderStatus") == "Shipped":
+					so.submit()
+			else:
+				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+				failed_sync_record.amazon_order_id = order_id
+				failed_sync_record.remarks = 'Failed to create Sales Order for {0}'.format(order_id)
+				failed_sync_record.save(ignore_permissions=True)
 
 			return so.name
 
