@@ -247,16 +247,23 @@ class AmazonRepository:
 
 			for order_item in order_items_list:
 				if order_item.get("QuantityOrdered") > 0:
+					item_rate = order_item.get("ItemPrice", {}).get("Amount", 0)
+					item_qty = order_item.get("QuantityOrdered")
 					final_order_items.append(
 						{
 							"item_code": self.get_item_code(order_item),
 							"item_name": order_item.get("SellerSKU"),
 							"description": order_item.get("Title"),
-							"rate": order_item.get("ItemPrice", {}).get("Amount", 0),
-							"qty": order_item.get("QuantityOrdered"),
+							"rate": item_rate,
+							"base_rate": item_rate,
+							"qty": item_qty,
+							"amount": item_rate*item_qty,
+							"base_amount": item_rate*item_qty,
+							"uom": "Nos",
 							"stock_uom": "Nos",
 							"warehouse": warehouse,
 							"conversion_factor": 1.0,
+							"allow_zero_valuation_rate": 1
 						}
 					)
 
@@ -347,13 +354,13 @@ class AmazonRepository:
 				make_address.append("links", {"link_doctype": "Customer", "link_name": customer_name})
 				make_address.address_type = "Shipping"
 				make_address.insert()
-	
+
 		def get_refunds(self, order_id) -> dict:
 			finances = self.get_finances_instance()
 			financial_events_payload = self.call_sp_api_method(
 				sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
 			)
-   
+
 			refund_events = []
 
 			while True:
@@ -406,7 +413,7 @@ class AmazonRepository:
 											"description": fee_type + " refund for " + seller_sku,
 										}
 									)
-		 
+
 						refund_events.append(charges_and_fees)
 
 				if not next_token:
@@ -447,20 +454,30 @@ class AmazonRepository:
 						so.append("taxes", fee)
 
 			so.flags.ignore_mandatory = True
-			# so.flags.ignore_validate = True
-			so.save(ignore_permissions=True)
-   
-			so.custom_amazon_order_status = order.get("OrderStatus")
+			so.custom_validate()
+			if so.grand_total >=0:
+				# so.flags.ignore_validate = True
+				so.save(ignore_permissions=True)
 
-			if so.docstatus != 1 and order.get("OrderStatus") == "Shipped":
-				so.submit()
+				so.custom_amazon_order_status = order.get("OrderStatus")
+
+				if so.docstatus != 1 and order.get("OrderStatus") == "Shipped":
+					so.submit()
+			else:
+				if so.amazon_order_id:
+					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+					failed_sync_record.amazon_order_id = so.amazon_order_id
+					failed_sync_record.remarks = 'Failed to update Sales Order {0}'.format(so.name)
+					failed_sync_record.save(ignore_permissions=True)
 
 		order_id = order.get("AmazonOrderId")
-		so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
+		so = None
+		if frappe.db.exists("Sales Order", {"amazon_order_id": order_id}):
+			so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
 
 		if so:
 			refunds = get_refunds(self, order_id)
-   
+
 			for refund in refunds:
 				if not frappe.db.exists("Sales Invoice Item", {"sales_order":so}):
 					break
@@ -478,20 +495,20 @@ class AmazonRepository:
 						"sales_order": so,
 						"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so}, "name")
 					})
-	 
+
 				frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item["item_name"]}, "custom_refunded", 1)
-	
+
 				for charge in refund.get("charges", []):
 					return_si.append("taxes", charge)
 
 				for fee in refund.get("fees", []):
 					return_si.append("taxes", fee)
-	
+
 				return_si.custom_amazon_order_id = frappe.db.get_value("Sales Invoice", si, "custom_amazon_order_id")
-	
+
 				return_si.insert(ignore_permissions=True)
 				return_si.submit()
-	
+
 			update_sales_order(self, so)
 
 			return so
@@ -531,13 +548,20 @@ class AmazonRepository:
 					so.append("taxes", fee)
 
 			so.flags.ignore_mandatory = True
-			# so.flags.ignore_validate = True
-			so.save(ignore_permissions=True)
-   
-			so.custom_amazon_order_status = order.get("OrderStatus")
+			so.custom_validate()
+			if so.grand_total>=0:
+				# so.flags.ignore_validate = True
+				so.save(ignore_permissions=True)
 
-			if order.get("OrderStatus") == "Shipped":
-				so.submit()
+				so.custom_amazon_order_status = order.get("OrderStatus")
+
+				if order.get("OrderStatus") == "Shipped":
+					so.submit()
+			else:
+				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+				failed_sync_record.amazon_order_id = order_id
+				failed_sync_record.remarks = 'Failed to create Sales Order for {0}'.format(order_id)
+				failed_sync_record.save(ignore_permissions=True)
 
 			return so.name
 

@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"fgLuQOKLke\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Payment Extractor\",\"col\":3}},{\"id\":\"7J5AkQlv_E\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Flipkart Payment Extractor\",\"col\":3}},{\"id\":\"9mnGTTtFTk\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Seller Central Settings\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}}]",
+ "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"fgLuQOKLke\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Payment Extractor\",\"col\":3}},{\"id\":\"7J5AkQlv_E\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Flipkart Payment Extractor\",\"col\":3}},{\"id\":\"9mnGTTtFTk\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Seller Central Settings\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}}]",
  "creation": "2024-05-27 13:20:31.068773",
  "custom_blocks": [],
  "docstatus": 0,
@@ -13,7 +13,7 @@
  "is_hidden": 0,
  "label": "eSeller Suite",
  "links": [],
- "modified": "2024-07-10 16:13:39.000170",
+ "modified": "2024-07-26 16:54:26.521329",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Suite",
@@ -29,6 +29,14 @@
  ],
  "sequence_id": 2.0,
  "shortcuts": [
+  {
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "Amazon Failed Sync Record",
+   "link_to": "Amazon Failed Sync Record",
+   "stats_filter": "[]",
+   "type": "DocType"
+  },
   {
    "color": "Grey",
    "doc_view": "List",

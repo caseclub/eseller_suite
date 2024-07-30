@@ -114,23 +114,24 @@ app_license = "mit"
 # ---------------
 # Override standard doctype classes
 
-# override_doctype_class = {
-# 	"ToDo": "custom_app.overrides.CustomToDo"
-# }
+override_doctype_class = {
+	"Sales Order": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.SalesOrderOverride"
+}
 
 # Document Events
 # ---------------
 # Hook on document methods and events
 
-doc_events = {
+# doc_events = {
 	# 'Sales Invoice':{
 	# 	"before_submit": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.before_submit",
     #     "on_submit": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.auto_create_return_sales_invoice"
     # },
-	'Sales Order':{
-		"on_submit": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.on_submit"
-	}
-}
+	# 'Sales Order':{
+	# 	"on_submit": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.on_submit",
+	# 	"after_insert": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.after_insert"
+	# }
+# }
 
 # Scheduled Tasks
 # ---------------
@@ -161,9 +162,9 @@ scheduler_events = {
 # Overriding Methods
 # ------------------------------
 #
-# override_whitelisted_methods = {
-# 	"frappe.desk.doctype.event.event.get_events": "eseller_suite.event.get_events"
-# }
+override_whitelisted_methods = {
+	"erpnext.selling.doctype.sales_order.sales_order.make_sales_invoice": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.make_sales_invoice"
+}
 #
 # each overriding function accepts a `data` argument;
 # generated from the base implementation of the doctype dashboard,
