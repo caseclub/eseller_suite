@@ -1,0 +1,306 @@
+[
+ {
+  "amazon_state": "ANDAMAN & NICOBAR ISLANDS",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:11.937534",
+  "name": "ANDAMAN & NICOBAR ISLANDS",
+  "state": "Andaman and Nicobar Islands"
+ },
+ {
+  "amazon_state": "ANDHRA PRADESH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:11.971319",
+  "name": "ANDHRA PRADESH",
+  "state": "Andhra Pradesh"
+ },
+ {
+  "amazon_state": "ARUNACHAL PRADESH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:11.989726",
+  "name": "ARUNACHAL PRADESH",
+  "state": "Arunachal Pradesh"
+ },
+ {
+  "amazon_state": "ASSAM",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.007112",
+  "name": "ASSAM",
+  "state": "Assam"
+ },
+ {
+  "amazon_state": "BIHAR",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.023553",
+  "name": "BIHAR",
+  "state": "Bihar"
+ },
+ {
+  "amazon_state": "CHANDIGARH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.042312",
+  "name": "CHANDIGARH",
+  "state": "Chandigarh"
+ },
+ {
+  "amazon_state": "CHHATTISGARH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.059393",
+  "name": "CHHATTISGARH",
+  "state": "Chhattisgarh"
+ },
+ {
+  "amazon_state": "DADRA AND NAGAR HAVELI AND DAMAN AND DIU",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.078724",
+  "name": "DADRA AND NAGAR HAVELI AND DAMAN AND DIU",
+  "state": "Dadra and Nagar Haveli and Daman and Diu"
+ },
+ {
+  "amazon_state": "DELHI",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.096371",
+  "name": "DELHI",
+  "state": "Delhi"
+ },
+ {
+  "amazon_state": "GOA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.114340",
+  "name": "GOA",
+  "state": "Goa"
+ },
+ {
+  "amazon_state": "GUJARAT",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.131423",
+  "name": "GUJARAT",
+  "state": "Gujarat"
+ },
+ {
+  "amazon_state": "HARYANA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.150411",
+  "name": "HARYANA",
+  "state": "Haryana"
+ },
+ {
+  "amazon_state": "HIMACHAL PRADESH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.167318",
+  "name": "HIMACHAL PRADESH",
+  "state": "Himachal Pradesh"
+ },
+ {
+  "amazon_state": "JAMMU & KASHMIR",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.186580",
+  "name": "JAMMU & KASHMIR",
+  "state": "Jammu and Kashmir"
+ },
+ {
+  "amazon_state": "JHARKHAND",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.203410",
+  "name": "JHARKHAND",
+  "state": "Jharkhand"
+ },
+ {
+  "amazon_state": "KARNATAKA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.221360",
+  "name": "KARNATAKA",
+  "state": "Karnataka"
+ },
+ {
+  "amazon_state": "KERALA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.239397",
+  "name": "KERALA",
+  "state": "Kerala"
+ },
+ {
+  "amazon_state": "LADAKH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.256757",
+  "name": "LADAKH",
+  "state": "Ladakh"
+ },
+ {
+  "amazon_state": "LAKSHADWEEP",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.280565",
+  "name": "LAKSHADWEEP",
+  "state": "Lakshadweep Islands"
+ },
+ {
+  "amazon_state": "MADHYA PRADESH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.297747",
+  "name": "MADHYA PRADESH",
+  "state": "Madhya Pradesh"
+ },
+ {
+  "amazon_state": "MAHARASHTRA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.314163",
+  "name": "MAHARASHTRA",
+  "state": "Maharashtra"
+ },
+ {
+  "amazon_state": "MANIPUR",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.330800",
+  "name": "MANIPUR",
+  "state": "Manipur"
+ },
+ {
+  "amazon_state": "MEGHALAYA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.347658",
+  "name": "MEGHALAYA",
+  "state": "Meghalaya"
+ },
+ {
+  "amazon_state": "MIZORAM",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.364385",
+  "name": "MIZORAM",
+  "state": "Mizoram"
+ },
+ {
+  "amazon_state": "NAGALAND",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.383908",
+  "name": "NAGALAND",
+  "state": "Nagaland"
+ },
+ {
+  "amazon_state": "ODISHA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.410726",
+  "name": "ODISHA",
+  "state": "Odisha"
+ },
+ {
+  "amazon_state": "Other Countries",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.428993",
+  "name": "Other Countries",
+  "state": "Other Countries"
+ },
+ {
+  "amazon_state": "Other Territory",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.453452",
+  "name": "Other Territory",
+  "state": "Other Territory"
+ },
+ {
+  "amazon_state": "PUDUCHERRY",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.475912",
+  "name": "PUDUCHERRY",
+  "state": "Puducherry"
+ },
+ {
+  "amazon_state": "PUNJAB",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.503817",
+  "name": "PUNJAB",
+  "state": "Punjab"
+ },
+ {
+  "amazon_state": "RAJASTHAN",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.522168",
+  "name": "RAJASTHAN",
+  "state": "Rajasthan"
+ },
+ {
+  "amazon_state": "SIKKIM",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.539499",
+  "name": "SIKKIM",
+  "state": "Sikkim"
+ },
+ {
+  "amazon_state": "TAMIL NADU",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.557116",
+  "name": "TAMIL NADU",
+  "state": "Tamil Nadu"
+ },
+ {
+  "amazon_state": "TELANGANA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.574149",
+  "name": "TELANGANA",
+  "state": "Telangana"
+ },
+ {
+  "amazon_state": "TRIPURA",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.593007",
+  "name": "TRIPURA",
+  "state": "Tripura"
+ },
+ {
+  "amazon_state": "UTTAR PRADESH",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.609292",
+  "name": "UTTAR PRADESH",
+  "state": "Uttar Pradesh"
+ },
+ {
+  "amazon_state": "UTTARAKHAND",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.627553",
+  "name": "UTTARAKHAND",
+  "state": "Uttarakhand"
+ },
+ {
+  "amazon_state": "WEST BENGAL",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-06 15:32:12.646151",
+  "name": "WEST BENGAL",
+  "state": "West Bengal"
+ }
+]

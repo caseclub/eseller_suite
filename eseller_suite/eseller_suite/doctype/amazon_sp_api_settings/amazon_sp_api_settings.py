@@ -54,7 +54,7 @@ class AmazonSPAPISettings(Document):
 				job_name=job_name,
 				method=get_orders,
 				amz_setting_name=self.name,
-				created_after=self.after_date,
+				last_updated_after=self.after_date,
 				timeout=4000,
 				now=frappe.flags.in_test,
 			)
@@ -79,7 +79,7 @@ def schedule_get_order_details():
 	)
 
 	for amz_setting in amz_settings:
-		get_orders(amz_setting_name=amz_setting.name, created_after=amz_setting.after_date)
+		get_orders(amz_setting_name=amz_setting.name, last_updated_after=amz_setting.after_date)
 
 
 def setup_custom_fields():

@@ -90,6 +90,12 @@ class AmazonRepository:
 		financial_events_payload = self.call_sp_api_method(
 			sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
 		)
+  
+		if not (
+				financial_events_payload
+				and len(financial_events_payload.get("FinancialEvents", {}))
+			):
+				return []
 
 		charges_and_fees = {"charges": [], "fees": []}
 
@@ -152,6 +158,10 @@ class AmazonRepository:
 
 	def create_item(self, order_item) -> str:
 		def create_item_group(amazon_item) -> str:
+			if not amazon_item:
+				return self.amz_setting.parent_item_group
+			if not amazon_item.get("AttributeSets"):
+				return self.amz_setting.parent_item_group
 			item_group_name = amazon_item.get("AttributeSets")[0].get("ProductGroup")
 
 			if item_group_name:
@@ -168,6 +178,11 @@ class AmazonRepository:
 			raise (KeyError("ProductGroup"))
 
 		def create_brand(amazon_item) -> str:
+			if not amazon_item:
+				return
+			if not amazon_item.get("AttributeSets"):
+				return
+
 			brand_name = amazon_item.get("AttributeSets")[0].get("Brand")
 
 			if not brand_name:
@@ -183,6 +198,11 @@ class AmazonRepository:
 			return existing_brand
 
 		def create_manufacturer(amazon_item) -> str:
+			if not amazon_item:
+				return
+			if not amazon_item.get("AttributeSets"):
+				return
+	  
 			manufacturer_name = amazon_item.get("AttributeSets")[0].get("Manufacturer")
 
 			if not manufacturer_name:
@@ -200,6 +220,11 @@ class AmazonRepository:
 			return existing_manufacturer
 
 		def create_item_price(amazon_item, item_code) -> None:
+			if not amazon_item:
+				return
+			if not amazon_item.get("AttributeSets"):
+				return
+	  
 			item_price = frappe.new_doc("Item Price")
 			item_price.price_list = self.amz_setting.price_list
 			item_price.price_list_rate = (
@@ -333,7 +358,15 @@ class AmazonRepository:
 				make_address = frappe.new_doc("Address")
 				make_address.address_line1 = shipping_address.get("AddressLine1", "Not Provided")
 				make_address.city = shipping_address.get("City", "Not Provided")
-				make_address.state = shipping_address.get("StateOrRegion").title()
+				amazon_state = shipping_address.get("StateOrRegion")
+				if frappe.db.exists("Amazon State Mapping", {"amazon_state": amazon_state}):
+					make_address.state = frappe.db.get_value("Amazon State Mapping", {"amazon_state": amazon_state}, "state")
+				else:
+					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+					failed_sync_record.amazon_order_id = order_id
+					failed_sync_record.remarks = 'No State Mapping found for {0}'.format(amazon_state)
+					failed_sync_record.save(ignore_permissions=True)
+					return
 				make_address.pincode = shipping_address.get("PostalCode")
 
 				filters = [
@@ -360,7 +393,15 @@ class AmazonRepository:
 			financial_events_payload = self.call_sp_api_method(
 				sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
 			)
+   
+			if not (
+				financial_events_payload
+				and financial_events_payload.get("FinancialEvents")
+				and financial_events_payload["FinancialEvents"].get("RefundEventList")
+			):
+				return []
 
+   
 			refund_events = []
 
 			while True:
@@ -508,8 +549,8 @@ class AmazonRepository:
 
 				return_si.insert(ignore_permissions=True)
 				return_si.submit()
-
-			update_sales_order(self, so)
+	
+			# update_sales_order(self, so)
 
 			return so
 
@@ -554,8 +595,15 @@ class AmazonRepository:
 				so.save(ignore_permissions=True)
 
 				so.custom_amazon_order_status = order.get("OrderStatus")
+	
+				order_statuses = [
+					"Shipped",
+					"InvoiceUnconfirmed",
+					"Canceled",
+					"Unfulfillable",
+				]
 
-				if order.get("OrderStatus") == "Shipped":
+				if order.get("OrderStatus") in order_statuses:
 					so.submit()
 			else:
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
@@ -565,13 +613,9 @@ class AmazonRepository:
 
 			return so.name
 
-	def get_orders(self, created_after) -> list:
+	def get_orders(self, last_updated_after) -> list:
 		orders = self.get_orders_instance()
 		order_statuses = [
-			"PendingAvailability",
-			"Pending",
-			"Unshipped",
-			"PartiallyShipped",
 			"Shipped",
 			"InvoiceUnconfirmed",
 			"Canceled",
@@ -581,7 +625,7 @@ class AmazonRepository:
 
 		orders_payload = self.call_sp_api_method(
 			sp_api_method=orders.get_orders,
-			created_after=created_after,
+			last_updated_after=last_updated_after,
 			order_statuses=order_statuses,
 			fulfillment_channels=fulfillment_channels,
 			max_results=50,
@@ -605,7 +649,7 @@ class AmazonRepository:
 				break
 
 			orders_payload = self.call_sp_api_method(
-				sp_api_method=orders.get_orders, created_after=created_after, next_token=next_token,
+				sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token,
 			)
 
 		return sales_orders
@@ -613,6 +657,6 @@ class AmazonRepository:
 	def get_catalog_items_instance(self) -> CatalogItems:
 		return CatalogItems(**self.instance_params)
 
-def get_orders(amz_setting_name, created_after) -> list:
+def get_orders(amz_setting_name, last_updated_after) -> list:
 	ar = AmazonRepository(amz_setting_name)
-	return ar.get_orders(created_after)
+	return ar.get_orders(last_updated_after)

@@ -229,3 +229,7 @@ override_whitelisted_methods = {
 # default_log_clearing_doctypes = {
 # 	"Logging DocType Name": 30  # days to retain logs
 # }
+
+# Fixtures
+
+fixtures = [{"dt":"Amazon State Mapping"}]
