@@ -298,7 +298,7 @@ class AmazonRepository:
 
 		create_item_price(amazon_item, item.item_code)
 
-		return item.item_code
+		return item.name
 
 	def get_item_code(self, order_item) -> str:
 		if frappe.db.exists('Item', { 'custom_amazon_item_code': order_item['SellerSKU']}):
@@ -466,6 +466,9 @@ class AmazonRepository:
 							charges = refund_item.get("ItemChargeAdjustmentList", [])
 							fees = refund_item.get("ItemFeeAdjustmentList", [])
 							seller_sku = refund_item.get("SellerSKU")
+							item_code = None
+							if frappe.db.exists('Item', { 'custom_amazon_item_code': seller_sku }):
+								item_code =  frappe.db.get_value('Item', { 'custom_amazon_item_code': seller_sku })
 
 							for charge in charges:
 								charge_type = charge.get("ChargeType")
@@ -484,7 +487,7 @@ class AmazonRepository:
 								else:
 									charges_and_fees.get("items").append(
 										{
-											"item_name": seller_sku,
+											"item_name": item_code,
 											"qty": refund_item.get("QuantityShipped"),
 											"refund_amount": charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
 										}
