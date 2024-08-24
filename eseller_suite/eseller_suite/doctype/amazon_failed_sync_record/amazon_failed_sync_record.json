@@ -6,7 +6,10 @@
  "engine": "InnoDB",
  "field_order": [
   "amazon_order_id",
-  "remarks"
+  "column_break_bmhr",
+  "remarks",
+  "section_break_vjkz",
+  "payload"
  ],
  "fields": [
   {
@@ -14,19 +17,33 @@
    "fieldtype": "Data",
    "in_list_view": 1,
    "in_standard_filter": 1,
-   "label": "Amazon Order ID"
+   "label": "Amazon Order ID",
+   "reqd": 1
   },
   {
    "fieldname": "remarks",
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Remarks"
+  },
+  {
+   "fieldname": "column_break_bmhr",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "section_break_vjkz",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "payload",
+   "fieldtype": "JSON",
+   "label": "Payload"
   }
  ],
  "in_create": 1,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-07-26 17:14:13.233721",
+ "modified": "2024-08-24 13:25:00.642489",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Failed Sync Record",
