@@ -90,14 +90,14 @@ class AmazonRepository:
 		financial_events_payload = self.call_sp_api_method(
 			sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
 		)
+
+		charges_and_fees = {"charges": [], "fees": [], "tds": [], "principal_amounts":{}, "additional_discount": 0}
   
 		if not (
 				financial_events_payload
 				and len(financial_events_payload.get("FinancialEvents", {}))
 			):
-				return []
-
-		charges_and_fees = {"charges": [], "fees": [], "tds": [], "pricipal_amount":0, "additional_discount": 0}
+				return charges_and_fees
 
 		while True:
 			shipment_event_list = financial_events_payload.get("FinancialEvents", {}).get(
@@ -107,21 +107,20 @@ class AmazonRepository:
 				"ServiceFeeEventList", []
 			)
 			next_token = financial_events_payload.get("NextToken")
-
+			principal_amounts = {}
+			promotion_discount = 0
 			for shipment_event in shipment_event_list:
 				if shipment_event:
 					for shipment_item in shipment_event.get("ShipmentItemList", []):
-						pricipal_amount = 0
-						promotion_discount = 0
+						promotion_list = shipment_item.get("PromotionList", [])
+						seller_sku = shipment_item.get("SellerSKU")
+						qty = shipment_item.get("QuantityShipped")
 						charges = shipment_item.get("ItemChargeList", [])
 						fees = shipment_item.get("ItemFeeList", [])
 						tds_list = shipment_item.get("ItemTaxWithheldList", [])
 						tdss = []
 						if tds_list:
 							tdss = tds_list[0].get("TaxesWithheld", [])
-						promotion_list = shipment_item.get("PromotionList", [])
-						seller_sku = shipment_item.get("SellerSKU")
-						qty = shipment_item.get("QuantityShipped")
 
 						for charge in charges:
 							charge_type = charge.get("ChargeType")
@@ -138,7 +137,7 @@ class AmazonRepository:
 									}
 								)
 							if charge_type == 'Principal':
-								pricipal_amount = round((float(amount)/qty), 2)
+								principal_amounts[seller_sku] = round((float(amount)/qty), 2)
 
 						for fee in fees:
 							fee_type = fee.get("FeeType")
@@ -173,8 +172,8 @@ class AmazonRepository:
 							amount = promotion.get("PromotionAmount", {}).get("CurrencyAmount", 0)
 							promotion_discount += float(amount)
 
-						charges_and_fees["pricipal_amount"] = pricipal_amount
-						charges_and_fees["additional_discount"] = promotion_discount
+			charges_and_fees["principal_amounts"] = principal_amounts
+			charges_and_fees["additional_discount"] = promotion_discount
 
 			for service_fee in service_fee_event_list:
 				if service_fee:
@@ -290,7 +289,7 @@ class AmazonRepository:
 		item.item_group = create_item_group(amazon_item)
 		item.brand = create_brand(amazon_item)
 		item.manufacturer = create_manufacturer(amazon_item)
-		item.custom_amazon_item_code = order_item["SellerSKU"]
+		item.amazon_item_code = order_item["SellerSKU"]
 		item.item_code = order_item["SellerSKU"]
 		item.item_name = order_item["SellerSKU"]
 		item.description = order_item["Title"]
@@ -301,8 +300,8 @@ class AmazonRepository:
 		return item.name
 
 	def get_item_code(self, order_item) -> str:
-		if frappe.db.exists('Item', { 'custom_amazon_item_code': order_item['SellerSKU']}):
-			return frappe.db.get_value('Item', { 'custom_amazon_item_code': order_item['SellerSKU']})
+		if frappe.db.exists('Item', { 'amazon_item_code': order_item['SellerSKU']}):
+			return frappe.db.get_value('Item', { 'amazon_item_code': order_item['SellerSKU']})
 
 		item_code = self.create_item(order_item)
 		return item_code
@@ -467,8 +466,8 @@ class AmazonRepository:
 							fees = refund_item.get("ItemFeeAdjustmentList", [])
 							seller_sku = refund_item.get("SellerSKU")
 							item_code = None
-							if frappe.db.exists('Item', { 'custom_amazon_item_code': seller_sku }):
-								item_code =  frappe.db.get_value('Item', { 'custom_amazon_item_code': seller_sku })
+							if frappe.db.exists('Item', { 'amazon_item_code': seller_sku }):
+								item_code =  frappe.db.get_value('Item', { 'amazon_item_code': seller_sku })
 
 							for charge in charges:
 								charge_type = charge.get("ChargeType")
@@ -487,9 +486,9 @@ class AmazonRepository:
 								else:
 									charges_and_fees.get("items").append(
 										{
-											"item_name": item_code,
+											"item_code": item_code,
 											"qty": refund_item.get("QuantityShipped"),
-											"refund_amount": charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
+											"amount": charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
 										}
 									)
 
@@ -528,6 +527,11 @@ class AmazonRepository:
 
 		if so:
 			refunds = get_refunds(self, order_id)
+			for refund in refunds:
+				note = frappe.new_doc('Refund Fail Record')
+				note.amazon_order_id = order_id
+				note.payload = refund
+				note.save()
 
 			for refund in refunds:
 				if not frappe.db.exists("Sales Invoice Item", {"sales_order":so}):
@@ -542,17 +546,17 @@ class AmazonRepository:
 				return_si.return_against = si
 				return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
 				for item in refund.get("items", []):
-					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item["item_name"], "refunded":1}):
+					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code'), "refunded":1}):
 						break
 					return_si.append("items", {
-						"item_code": item["item_name"],
-						"qty": -1 * item["qty"],
-						"rate": abs(item["refund_amount"]/item["qty"]),
+						"item_code": item.get('item_code'),
+						"qty": -1 * float(item.get('qty')),
+						"rate": abs(float(item.get('amount'))/float(item.get('qty'))),
 						"sales_order": so,
-						"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so}, "name")
+						"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so, "parent": si, "item_code": item.get('item_code')}, "name")
 					})
 
-				frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item["item_name"]}, "refunded", 1)
+				frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "refunded", 1)
 
 				for charge in refund.get("charges", []):
 					return_si.append("taxes", charge)
@@ -561,11 +565,10 @@ class AmazonRepository:
 					return_si.append("taxes", fee)
 
 				return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
+				return_si.disable_rounded_total = 1
 
 				return_si.insert(ignore_permissions=True)
 				return_si.submit()
-	
-			# update_sales_order(self, so)
 
 			return so
 
@@ -584,6 +587,7 @@ class AmazonRepository:
 			so = frappe.new_doc("Sales Order")
 			so.amazon_order_id = order_id
 			so.marketplace_id = order.get("MarketplaceId")
+			so.amazon_order_status = order.get("OrderStatus")
 			so.customer = customer_name
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
 			so.transaction_date = transaction_date
@@ -596,24 +600,29 @@ class AmazonRepository:
 
 			if taxes_and_charges:
 				charges_and_fees = self.get_charges_and_fees(order_id)
-				if charges_and_fees.get("pricipal_amount"):
-					pricipal_amount = float(charges_and_fees.get("pricipal_amount"))
-					rate = so.items[0].rate
-					qty = so.items[0].qty
-					if rate != pricipal_amount:
-						so.items[0].rate = pricipal_amount
-						so.items[0].base_rate = pricipal_amount
-						so.items[0].amount = pricipal_amount*qty
-						so.items[0].base_amount = pricipal_amount*qty
+				if charges_and_fees.get("principal_amounts"):
+					principal_amounts = charges_and_fees.get("principal_amounts")
+					for item_row in so.items:
+						if item_row.item_name and principal_amounts.get(item_row.item_name):
+							pricipal_amount = float(principal_amounts.get(item_row.item_name)) or 0
+							qty = item_row.qty
+							if pricipal_amount:
+								item_row.rate = pricipal_amount
+								item_row.base_rate = pricipal_amount
+								item_row.amount = pricipal_amount*qty
+								item_row.base_amount = pricipal_amount*qty
 
 				for charge in charges_and_fees.get("charges"):
-					so.append("taxes", charge)
+					if charge:
+						so.append("taxes", charge)
 
 				for fee in charges_and_fees.get("fees"):
-					so.append("taxes", fee)
+					if fee:
+						so.append("taxes", fee)
 
 				for tds in charges_and_fees.get("tds"):
-					so.append("taxes", tds)
+					if tds:
+						so.append("taxes", tds)
 
 				if charges_and_fees.get("additional_discount"):
 					so.discount_amount = float(charges_and_fees.get("additional_discount")) * -1
@@ -645,7 +654,7 @@ class AmazonRepository:
 
 			return so.name
 
-	def get_orders(self, last_updated_after) -> list:
+	def get_orders(self, last_updated_after, amazon_order_ids=None) -> list:
 		orders = self.get_orders_instance()
 		order_statuses = [
 			"Shipped",
@@ -654,14 +663,13 @@ class AmazonRepository:
 			"Unfulfillable",
 		]
 		fulfillment_channels = ["FBA", "SellerFulfilled"]
-
 		orders_payload = self.call_sp_api_method(
-			sp_api_method=orders.get_orders,
-			last_updated_after=last_updated_after,
-			order_statuses=order_statuses,
-			fulfillment_channels=fulfillment_channels,
-			max_results=50,
-		)
+            sp_api_method=orders.get_orders,
+            last_updated_after=last_updated_after,
+            order_statuses=order_statuses,
+            fulfillment_channels=fulfillment_channels,
+            max_results=50,
+        )
 
 		sales_orders = []
 
@@ -679,11 +687,37 @@ class AmazonRepository:
 
 			if not next_token:
 				break
+			if amazon_order_ids:
+				orders_payload = self.call_sp_api_method(
+                    sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token, amazon_order_ids=amazon_order_ids,
+                )
+			else:
+				orders_payload = self.call_sp_api_method(
+                    sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token,
+                )
 
+		return sales_orders
+
+	def get_order(self, amazon_order_ids) -> list:
+		orders = self.get_orders_instance()
+		fulfillment_channels = ["FBA", "SellerFulfilled"]
+		orders_payload = self.call_sp_api_method(
+            sp_api_method=orders.get_orders,
+            fulfillment_channels=fulfillment_channels,
+            amazon_order_ids=amazon_order_ids,
+        )
+
+		sales_orders = []
+
+		orders_list = orders_payload.get("Orders")
+		if orders_list:
+			for order in orders_list:
+				sales_order = self.create_sales_order(order)
+				if sales_order:
+					sales_orders.append(sales_order)
 			orders_payload = self.call_sp_api_method(
-				sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token,
-			)
-
+                sp_api_method=orders.get_orders, amazon_order_ids=amazon_order_ids,
+            )
 		return sales_orders
 
 	def get_catalog_items_instance(self) -> CatalogItems:
@@ -692,3 +726,8 @@ class AmazonRepository:
 def get_orders(amz_setting_name, last_updated_after) -> list:
 	ar = AmazonRepository(amz_setting_name)
 	return ar.get_orders(last_updated_after)
+
+@frappe.whitelist()
+def get_order(amz_setting_name, amazon_order_ids) -> list:
+	ar = AmazonRepository(amz_setting_name)
+	return ar.get_order(amazon_order_ids)

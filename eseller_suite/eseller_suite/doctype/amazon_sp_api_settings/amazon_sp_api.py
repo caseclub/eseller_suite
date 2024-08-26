@@ -171,7 +171,7 @@ class Orders(SPAPI):
 		max_results: int = 100,
 		easyship_shipment_statuses: list = None,
 		next_token: str = None,
-		amazon_order_ids: list = None,
+		amazon_order_ids: str = None,
 		actual_fulfillment_supply_source_id: str = None,
 		is_ispu: bool = False,
 		store_chain_store_id: str = None,
@@ -196,11 +196,14 @@ class Orders(SPAPI):
 		self.list_to_dict("FulfillmentChannels", fulfillment_channels, data)
 		self.list_to_dict("PaymentMethods", payment_methods, data)
 		self.list_to_dict("EasyShipShipmentStatuses", easyship_shipment_statuses, data)
-		self.list_to_dict("AmazonOrderIds", amazon_order_ids, data)
+		# self.list_to_dict("AmazonOrderIds", amazon_order_ids, data)
 
 		if not marketplace_ids:
 			marketplace_ids = [self.marketplace_id]
 			data["MarketplaceIds"] = marketplace_ids
+
+		if amazon_order_ids:
+			data['AmazonOrderIds'] = amazon_order_ids
 
 		return self.make_request(params=data)
 
