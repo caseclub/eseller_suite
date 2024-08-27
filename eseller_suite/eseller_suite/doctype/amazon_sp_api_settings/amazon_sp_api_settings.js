@@ -51,11 +51,22 @@ function hanlde_retry_btn(frm) {
             primary_action_label: 'Sync',
             primary_action(values) {
                 d.hide();
-                frappe.call('eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository.get_order', {
-                    amz_setting_name: values.sp_api_settings,
-                    amazon_order_ids: values.amazon_order_id
-                }).then(r => {
-                    console.log(r.message)
+                frappe.call({
+                    method: 'eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository.get_order',
+                    args: {
+                        amz_setting_name: values.sp_api_settings,
+                        amazon_order_ids: values.amazon_order_id
+                    },
+                    freeze: true,
+                    freeze_message: __("Syncing Sales Order.."),
+                    callback: (r) => {
+                        if (r && r.message) {
+                            frappe.show_alert({
+                                message: __('Sales Orders created successfully'),
+                                indicator: 'green'
+                            }, 5);
+                        }
+                    }
                 })
             }
         });

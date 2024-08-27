@@ -7,7 +7,7 @@ from datetime import datetime
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import add_days, today
+from frappe.utils import add_days, today, getdate
 
 
 class AmazonSPAPISettings(Document):
@@ -51,7 +51,7 @@ class AmazonSPAPISettings(Document):
 				method=get_orders,
 				amz_setting_name=self.name,
 				last_updated_after=self.after_date,
-				timeout=4000,
+				timeout=6000,
 				now=frappe.flags.in_test,
 			)
 
@@ -67,12 +67,14 @@ def schedule_get_order_details():
 	from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import (
 		get_orders,
 	)
+	current_date = getdate().strftime( "%Y-%m-%d")
+	# next_date = add_days(getdate(), 1).strftime( "%Y-%m-%d")
 
 	amz_settings = frappe.get_all(
 		"Amazon SP API Settings",
 		filters={"is_active": 1, "enable_sync": 1},
-		fields=["name", "after_date"],
+		fields=["name"],
 	)
 
 	for amz_setting in amz_settings:
-		get_orders(amz_setting_name=amz_setting.name, last_updated_after=amz_setting.after_date)
+		get_orders(amz_setting_name=amz_setting.name, last_updated_after=current_date)

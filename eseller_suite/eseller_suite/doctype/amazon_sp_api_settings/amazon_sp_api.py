@@ -2,7 +2,6 @@
 # For license information, please see license.txt
 
 from requests import request
-from requests.compat import urlparse
 
 __all__ = [
 	"SPAPIError",
