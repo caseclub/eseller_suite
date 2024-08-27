@@ -422,5 +422,37 @@
   "modified": "2024-08-24 13:12:06.102981",
   "name": "GA",
   "state": "Goa"
+ },
+ {
+  "amazon_state": "KL",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-27 12:17:07.036291",
+  "name": "KL",
+  "state": "Kerala"
+ },
+ {
+  "amazon_state": "TG",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-27 12:17:18.941039",
+  "name": "TG",
+  "state": "Telangana"
+ },
+ {
+  "amazon_state": "AS",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-27 21:26:24.543893",
+  "name": "AS",
+  "state": "Assam"
+ },
+ {
+  "amazon_state": "UT",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-08-27 21:28:03.995889",
+  "name": "UT",
+  "state": "Uttarakhand"
  }
 ]

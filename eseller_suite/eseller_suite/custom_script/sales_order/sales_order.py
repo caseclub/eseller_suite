@@ -44,7 +44,8 @@ class SalesOrderOverride(SalesOrder):
     def on_submit(self):
         super(SalesOrderOverride, self).on_submit()
         sales_invoice = make_sales_invoice(source_name=self.name, target_doc=None, ignore_permissions=True)
-        sales_invoice.flags.ignore_validate = True
+        sales_invoice.update_stock = 1
+        # sales_invoice.flags.ignore_validate = True
         sales_invoice.insert(ignore_permissions=True)
         sales_invoice.submit()
 
@@ -80,6 +81,7 @@ def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
 		target.set_posting_time = 1
 
 	def update_item(source, target, source_parent):
+		target.allow_zero_valuation_rate = 1
 		target.amount = flt(source.amount) - flt(source.billed_amt)
 		target.base_amount = target.amount * flt(source_parent.conversion_rate)
 		target.qty = (
