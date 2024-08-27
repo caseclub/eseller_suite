@@ -68,12 +68,13 @@ app_license = "mit"
 # ------------
 
 # before_install = "eseller_suite.install.before_install"
-# after_install = "eseller_suite.install.after_install"
+after_install = "eseller_suite.install.after_install"
+after_migrate = "eseller_suite.setup.after_migrate"
 
 # Uninstallation
 # ------------
 
-# before_uninstall = "eseller_suite.uninstall.before_uninstall"
+before_uninstall = "eseller_suite.setup.before_uninstall"
 # after_uninstall = "eseller_suite.uninstall.after_uninstall"
 
 # Integration Setup
