@@ -553,6 +553,7 @@ class AmazonRepository:
 					failed_sync_record.payload = refund
 					failed_sync_record.save(ignore_permissions=True)
 					break
+				return_created = False
 				si = frappe.db.get_value("Sales Invoice Item", {"sales_order":so}, "parent")
 				return_si = frappe.new_doc("Sales Invoice")
 				return_si.is_return = 1
@@ -560,15 +561,16 @@ class AmazonRepository:
 				return_si.return_against = si
 				return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
 				for item in refund.get("items", []):
-					return_si.append("items", {
-						"item_code": item.get('item_code'),
-						"qty": -1 * float(item.get('qty')),
-						"rate": abs(float(item.get('amount'))/float(item.get('qty'))),
-						"sales_order": so,
-						"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so, "parent": si, "item_code": item.get('item_code')}, "name")
-					})
-
-				# frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "refunded", 1)
+					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code'), "refunded":0 }):
+						return_si.append("items", {
+                            "item_code": item.get('item_code'),
+                            "qty": -1 * float(item.get('qty')),
+                            "rate": abs(float(item.get('amount'))/float(item.get('qty'))),
+                            "sales_order": so,
+                            "sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so, "parent": si, "item_code": item.get('item_code')}, "name")
+                        })
+						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "refunded", 1)
+						return_created = True
 
 				for charge in refund.get("charges", []):
 					return_si.append("taxes", charge)
@@ -580,8 +582,9 @@ class AmazonRepository:
 				return_si.disable_rounded_total = 1
 				return_si.update_outstanding_for_self = 0
 
-				return_si.insert(ignore_permissions=True)
-				return_si.save()
+				if return_created:
+					return_si.insert(ignore_permissions=True)
+					return_si.submit()
 
 			return so
 
