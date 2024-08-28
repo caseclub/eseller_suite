@@ -546,15 +546,24 @@ class AmazonRepository:
 		if so:
 			refunds = get_refunds(self, order_id)
 			for refund in refunds:
-				if not frappe.db.exists("Sales Invoice Item", {"sales_order":so}):
+				if frappe.db.get_value('Sales Order', so, 'docstatus') != 1:
 					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 					failed_sync_record.amazon_order_id = order_id
-					failed_sync_record.remarks = 'Failed to create return Sales Invoice, Sales Order {0} not found'.format(so)
+					failed_sync_record.remarks = 'Failed to create return invoice. Sales Order : {0} not submitted'.format(so)
 					failed_sync_record.payload = refund
 					failed_sync_record.save(ignore_permissions=True)
 					break
+
+				if not frappe.db.exists("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0 }):
+					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+					failed_sync_record.amazon_order_id = order_id
+					failed_sync_record.remarks = 'Failed to create return Sales Invoice, Not able to find any Sales Invoice with this Amazon Order ID. Sales Order ID : {0}'.format(so)
+					failed_sync_record.payload = refund
+					failed_sync_record.save(ignore_permissions=True)
+					break
+
 				return_created = False
-				si = frappe.db.get_value("Sales Invoice Item", {"sales_order":so}, "parent")
+				si = frappe.db.get_value("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0  })
 				return_si = frappe.new_doc("Sales Invoice")
 				return_si.is_return = 1
 				return_si.update_stock = 1
@@ -567,22 +576,21 @@ class AmazonRepository:
                             "qty": -1 * float(item.get('qty')),
                             "rate": abs(float(item.get('amount'))/float(item.get('qty'))),
                             "sales_order": so,
-                            "sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"sales_order":so, "parent": si, "item_code": item.get('item_code')}, "name")
+                            "sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "name")
                         })
 						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "refunded", 1)
 						return_created = True
 
-				for charge in refund.get("charges", []):
-					return_si.append("taxes", charge)
-
-				for fee in refund.get("fees", []):
-					return_si.append("taxes", fee)
-
-				return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
-				return_si.disable_rounded_total = 1
-				return_si.update_outstanding_for_self = 0
-
 				if return_created:
+					for charge in refund.get("charges", []):
+						return_si.append("taxes", charge)
+
+					for fee in refund.get("fees", []):
+						return_si.append("taxes", fee)
+
+					return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
+					return_si.disable_rounded_total = 1
+					return_si.update_outstanding_for_self = 0
 					return_si.insert(ignore_permissions=True)
 					return_si.submit()
 
