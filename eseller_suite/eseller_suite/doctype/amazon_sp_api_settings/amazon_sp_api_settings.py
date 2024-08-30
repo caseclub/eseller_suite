@@ -39,28 +39,27 @@ class AmazonSPAPISettings(Document):
 		from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import (
 			get_orders,
 		)
-		get_orders(amz_setting_name=self.name, last_updated_after=self.after_date)
 
-		# if self.is_active == 1:
-		# 	job_name = f"Get Amazon Orders - {self.name}"
+		if self.is_active == 1:
+			job_name = f"Get Amazon Orders - {self.name}"
 
-		# 	if frappe.db.get_all("RQ Job", {"job_name": job_name, "status": ["in", ["queued", "started"]]}):
-		# 		return frappe.msgprint(_("The order details are currently being fetched in the background."))
+			if frappe.db.get_all("RQ Job", {"job_name": job_name, "status": ["in", ["queued", "started"]]}):
+				return frappe.msgprint(_("The order details are currently being fetched in the background."))
 
-		# 	frappe.enqueue(
-		# 		job_name=job_name,
-		# 		method=get_orders,
-		# 		amz_setting_name=self.name,
-		# 		last_updated_after=self.after_date,
-		# 		timeout=6000,
-		# 		now=frappe.flags.in_test,
-		# 	)
+			frappe.enqueue(
+				job_name=job_name,
+				method=get_orders,
+				amz_setting_name=self.name,
+				last_updated_after=self.after_date,
+				timeout=6000,
+				now=frappe.flags.in_test,
+			)
 
-		# 	frappe.msgprint(_("Order details will be fetched in the background."))
-		# else:
-		# 	frappe.msgprint(
-		# 		_("Please enable the Amazon SP API Settings {0}.").format(frappe.bold(self.name))
-		# 	)
+			frappe.msgprint(_("Order details will be fetched in the background."))
+		else:
+			frappe.msgprint(
+				_("Please enable the Amazon SP API Settings {0}.").format(frappe.bold(self.name))
+			)
  
 
 # Called via a hook in every hour.
