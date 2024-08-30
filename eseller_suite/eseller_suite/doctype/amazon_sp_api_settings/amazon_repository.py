@@ -539,14 +539,21 @@ class AmazonRepository:
 			return refund_events
 
 		order_id = order.get("AmazonOrderId")
-		so_id = None
-		so_docstatus = 0
-		refunds = get_refunds(self, order_id)
+		so = None
 		if frappe.db.exists("Sales Order", {"amazon_order_id": order_id}):
-			so_id, so_docstatus = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname=["name", "docstatus"])
+			so = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname="name")
 
-		if so_id and refunds and so_docstatus:
+		if so:
+			refunds = get_refunds(self, order_id)
 			for refund in refunds:
+				if frappe.db.get_value('Sales Order', so, 'docstatus') != 1:
+					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+					failed_sync_record.amazon_order_id = order_id
+					failed_sync_record.remarks = 'Failed to create return invoice. Sales Order : {0} not submitted'.format(so)
+					failed_sync_record.payload = refund
+					failed_sync_record.save(ignore_permissions=True)
+					break
+
 				if not frappe.db.exists("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0 }):
 					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 					failed_sync_record.amazon_order_id = order_id
@@ -568,7 +575,7 @@ class AmazonRepository:
                             "item_code": item.get('item_code'),
                             "qty": -1 * float(item.get('qty')),
                             "rate": abs(float(item.get('amount'))/float(item.get('qty'))),
-                            "sales_order": so_id,
+                            "sales_order": so,
                             "sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "name")
                         })
 						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "refunded", 1)
@@ -587,22 +594,17 @@ class AmazonRepository:
 					return_si.insert(ignore_permissions=True)
 					return_si.submit()
 
-			return so_id
+			return so
 
 		else:
-			if so_docstatus:
-				return
-			if not so_id and refunds:
+			refunds = get_refunds(self, order_id)
+			if refunds:
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 				failed_sync_record.amazon_order_id = order_id
 				failed_sync_record.remarks = 'Failed to create Sales Order for Order ID : {0}. It has refund events in it.'.format(order_id)
 				failed_sync_record.payload = refunds[0]
 				failed_sync_record.save(ignore_permissions=True)
 				return
-			if not so_id:
-				so = frappe.new_doc("Sales Order")
-			else:
-				so = frappe.get_doc('Sales Order', so_id)
 
 			items = self.get_order_items(order_id)
 
@@ -615,6 +617,7 @@ class AmazonRepository:
 			delivery_date = dateutil.parser.parse(order.get("LatestShipDate")).strftime("%Y-%m-%d")
 			transaction_date = dateutil.parser.parse(order.get("PurchaseDate")).strftime("%Y-%m-%d")
 
+			so = frappe.new_doc("Sales Order")
 			so.amazon_order_id = order_id
 			so.marketplace_id = order.get("MarketplaceId")
 			so.amazon_order_status = order.get("OrderStatus")
@@ -622,9 +625,6 @@ class AmazonRepository:
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
 			so.transaction_date = transaction_date
 			so.company = self.amz_setting.company
-			so.items = []
-			so.taxes = []
-			so.taxes_and_charges = ''
 
 			for item in items:
 				so.append("items", item)
@@ -682,8 +682,7 @@ class AmazonRepository:
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 				failed_sync_record.amazon_order_id = order_id
 				failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
-				if not so_id:
-					failed_sync_record.payload = so.as_dict()
+				failed_sync_record.payload = so.as_dict()
 				failed_sync_record.save(ignore_permissions=True)
 
 			return so.name
