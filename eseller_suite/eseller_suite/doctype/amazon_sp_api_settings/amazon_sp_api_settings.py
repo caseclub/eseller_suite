@@ -39,7 +39,6 @@ class AmazonSPAPISettings(Document):
 		from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import (
 			get_orders,
 		)
-
 		if self.is_active == 1:
 			job_name = f"Get Amazon Orders - {self.name}"
 

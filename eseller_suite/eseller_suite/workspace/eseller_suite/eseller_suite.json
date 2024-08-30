@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"fgLuQOKLke\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Payment Extractor\",\"col\":3}},{\"id\":\"7J5AkQlv_E\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Flipkart Payment Extractor\",\"col\":3}},{\"id\":\"9mnGTTtFTk\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Seller Central Settings\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}}]",
+ "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"fgLuQOKLke\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Payment Extractor\",\"col\":3}},{\"id\":\"7J5AkQlv_E\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Flipkart Payment Extractor\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}},{\"id\":\"5y4xZn1tIg\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Order\",\"col\":3}}]",
  "creation": "2024-05-27 13:20:31.068773",
  "custom_blocks": [],
  "docstatus": 0,
@@ -13,7 +13,7 @@
  "is_hidden": 0,
  "label": "eSeller Suite",
  "links": [],
- "modified": "2024-07-26 16:54:26.521329",
+ "modified": "2024-08-30 11:45:26.703196",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Suite",
@@ -40,6 +40,14 @@
   {
    "color": "Grey",
    "doc_view": "List",
+   "label": "Sales Order",
+   "link_to": "Sales Order",
+   "stats_filter": "[]",
+   "type": "DocType"
+  },
+  {
+   "color": "Grey",
+   "doc_view": "List",
    "label": "eSeller Settings",
    "link_to": "eSeller Settings",
    "type": "DocType"
@@ -50,13 +58,6 @@
    "label": "Flipkart Payment Extractor",
    "link_to": "Flipkart Payment Extractor",
    "stats_filter": "[]",
-   "type": "DocType"
-  },
-  {
-   "color": "Grey",
-   "doc_view": "List",
-   "label": "Amazon Seller Central Settings",
-   "link_to": "Amazon Seller Central Settings",
    "type": "DocType"
   },
   {
