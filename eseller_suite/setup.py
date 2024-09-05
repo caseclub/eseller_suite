@@ -142,7 +142,7 @@ def get_sales_invoice_custom_fields():
 				"fieldtype": "Select",
 				"label": "Amazon Order Status",
 				"insert_after": "amazon_transaction_type",
-				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable",
+				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending",
 				"read_only": 1,
 				"no_copy": 1
 			},
