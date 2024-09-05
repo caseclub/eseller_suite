@@ -604,11 +604,6 @@ class AmazonRepository:
 			else:
 				so = frappe.get_doc('Sales Order', so_id)
 
-			items = self.get_order_items(order_id)
-
-			if not items:
-				return
-
 			customer_name = create_customer(order)
 			create_address(order, customer_name)
 
@@ -622,6 +617,30 @@ class AmazonRepository:
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
 			so.transaction_date = transaction_date
 			so.company = self.amz_setting.company
+			if order.get("IsBusinessOrder"):
+				so.amazon_customer_type = 'B2B'
+			else:
+				so.amazon_customer_type = 'B2C'
+
+			items = self.get_order_items(order_id)
+
+			if not items:
+				if not so_id:
+					return
+				else:
+					so.flags.ignore_mandatory = True
+					so.disable_rounded_total = 1
+					so.custom_validate()
+					if so.grand_total>=0:
+						so.save(ignore_permissions=True)
+					else:
+						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+						failed_sync_record.amazon_order_id = order_id
+						failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
+						failed_sync_record.payload = so.as_dict()
+						failed_sync_record.save(ignore_permissions=True)
+					return
+
 			so.items = []
 			so.taxes = []
 			so.taxes_and_charges = ''
