@@ -62,7 +62,7 @@ function hanlde_retry_btn(frm) {
                     callback: (r) => {
                         if (r && r.message) {
                             frappe.show_alert({
-                                message: __('Sales Orders created successfully'),
+                                message: __('Sales Orders created/updated successfully'),
                                 indicator: 'green'
                             }, 5);
                         }

@@ -87,9 +87,10 @@ def get_sales_order_custom_fields():
 			},
 			{
 				"fieldname": "amazon_order_status",
-				"fieldtype": "Data",
+				"fieldtype": "Select",
 				"label": "Amazon Order Status",
 				"insert_after": "amazon_transaction_type",
+				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable",
 				"read_only": 1,
 				"no_copy": 1
 			},
@@ -101,6 +102,15 @@ def get_sales_order_custom_fields():
 				"read_only": 1,
 				"no_copy": 1
 			},
+			{
+				"fieldname": "amazon_customer_type",
+				"fieldtype": "Select",
+				"label": "Customer Type",
+				"insert_after": "marketplace_id",
+				"read_only": 1,
+				"no_copy": 1,
+				"options": "\nB2B\nB2C"
+			}
 		]
 	}
 
@@ -129,12 +139,22 @@ def get_sales_invoice_custom_fields():
 			},
 			{
 				"fieldname": "amazon_order_status",
-				"fieldtype": "Data",
+				"fieldtype": "Select",
 				"label": "Amazon Order Status",
 				"insert_after": "amazon_transaction_type",
+				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable",
 				"read_only": 1,
 				"no_copy": 1
 			},
+			{
+				"fieldname": "amazon_customer_type",
+				"fieldtype": "Select",
+				"label": "Customer Type",
+				"insert_after": "amazon_order_status",
+				"read_only": 1,
+				"no_copy": 1,
+				"options": "\nB2B\nB2C"
+			}
 		],
 		"Sales Invoice Item": [
 			{
