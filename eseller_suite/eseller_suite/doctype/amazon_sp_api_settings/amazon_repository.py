@@ -638,6 +638,8 @@ class AmazonRepository:
 						failed_sync_record.amazon_order_id = order_id
 						failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 						failed_sync_record.payload = so.as_dict()
+						failed_sync_record.posting_date = so.transaction_date
+						failed_sync_record.grand_total = so.grand_total
 						failed_sync_record.save(ignore_permissions=True)
 					return
 
@@ -701,6 +703,8 @@ class AmazonRepository:
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 				failed_sync_record.amazon_order_id = order_id
 				failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
+				failed_sync_record.posting_date = so.transaction_date
+				failed_sync_record.grand_total = so.grand_total
 				if not so_id:
 					failed_sync_record.payload = so.as_dict()
 				failed_sync_record.save(ignore_permissions=True)
