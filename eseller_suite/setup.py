@@ -90,7 +90,7 @@ def get_sales_order_custom_fields():
 				"fieldtype": "Select",
 				"label": "Amazon Order Status",
 				"insert_after": "amazon_transaction_type",
-				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending",
+				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped",
 				"read_only": 1,
 				"no_copy": 1
 			},
@@ -110,6 +110,15 @@ def get_sales_order_custom_fields():
 				"read_only": 1,
 				"no_copy": 1,
 				"options": "\nB2B\nB2C"
+			},
+			{
+				"fieldname": "fulfillment_channel",
+				"fieldtype": "Select",
+				"label": "Fulfillment Channel",
+				"insert_after": "amazon_customer_type",
+				"read_only": 1,
+				"no_copy": 1,
+				"options": "\nAFN\nMFN"
 			}
 		]
 	}
@@ -142,7 +151,7 @@ def get_sales_invoice_custom_fields():
 				"fieldtype": "Select",
 				"label": "Amazon Order Status",
 				"insert_after": "amazon_transaction_type",
-				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending",
+				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped",
 				"read_only": 1,
 				"no_copy": 1
 			},
@@ -154,6 +163,15 @@ def get_sales_invoice_custom_fields():
 				"read_only": 1,
 				"no_copy": 1,
 				"options": "\nB2B\nB2C"
+			},
+            {
+				"fieldname": "fulfillment_channel",
+				"fieldtype": "Select",
+				"label": "Fulfillment Channel",
+				"insert_after": "amazon_customer_type",
+				"read_only": 1,
+				"no_copy": 1,
+				"options": "\nAFN\nMFN"
 			}
 		],
 		"Sales Invoice Item": [
