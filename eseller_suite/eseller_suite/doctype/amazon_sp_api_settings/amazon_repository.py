@@ -613,14 +613,20 @@ class AmazonRepository:
 			so.amazon_order_id = order_id
 			so.marketplace_id = order.get("MarketplaceId")
 			so.amazon_order_status = order.get("OrderStatus")
+			so.fulfillment_channel = order.get("FulfillmentChannel")
 			so.customer = customer_name
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
 			so.transaction_date = transaction_date
 			so.company = self.amz_setting.company
+			warehouse = self.amz_setting.warehouse
+			if so.fulfillment_channel:
+				if so.fulfillment_channel=='AFN':
+					warehouse = self.amz_setting.afn_warehouse
 			if order.get("IsBusinessOrder"):
 				so.amazon_customer_type = 'B2B'
 			else:
 				so.amazon_customer_type = 'B2C'
+			so.set_warehouse = warehouse
 
 			items = self.get_order_items(order_id)
 
@@ -648,6 +654,7 @@ class AmazonRepository:
 			so.taxes_and_charges = ''
 
 			for item in items:
+				item["warehouse"] = warehouse
 				so.append("items", item)
 
 			taxes_and_charges = self.amz_setting.taxes_charges

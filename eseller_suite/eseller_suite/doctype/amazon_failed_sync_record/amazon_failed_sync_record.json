@@ -44,6 +44,8 @@
   {
    "fieldname": "posting_date",
    "fieldtype": "Date",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
    "label": "Posting Date"
   },
   {
@@ -55,7 +57,7 @@
  "in_create": 1,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-09-06 13:40:17.915795",
+ "modified": "2024-09-09 16:32:22.553097",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Failed Sync Record",
