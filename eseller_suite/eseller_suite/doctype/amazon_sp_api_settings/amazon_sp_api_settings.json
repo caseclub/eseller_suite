@@ -212,7 +212,8 @@
    "fieldname": "afn_warehouse",
    "fieldtype": "Link",
    "label": "AFN Warehouse",
-   "options": "Warehouse"
+   "options": "Warehouse",
+   "reqd": 1
   }
  ],
  "links": [],
