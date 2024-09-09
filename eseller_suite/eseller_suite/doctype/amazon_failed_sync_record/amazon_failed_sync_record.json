@@ -6,7 +6,9 @@
  "engine": "InnoDB",
  "field_order": [
   "amazon_order_id",
+  "posting_date",
   "column_break_bmhr",
+  "grand_total",
   "remarks",
   "section_break_vjkz",
   "payload"
@@ -38,12 +40,22 @@
    "fieldname": "payload",
    "fieldtype": "JSON",
    "label": "Payload"
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "label": "Posting Date"
+  },
+  {
+   "fieldname": "grand_total",
+   "fieldtype": "Currency",
+   "label": "Grand Total"
   }
  ],
  "in_create": 1,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-08-24 13:25:00.642489",
+ "modified": "2024-09-06 13:40:17.915795",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Failed Sync Record",
