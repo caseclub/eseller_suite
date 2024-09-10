@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"fgLuQOKLke\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Payment Extractor\",\"col\":3}},{\"id\":\"7J5AkQlv_E\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Flipkart Payment Extractor\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}},{\"id\":\"5y4xZn1tIg\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Order\",\"col\":3}}]",
+ "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"fgLuQOKLke\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Payment Extractor\",\"col\":3}},{\"id\":\"7J5AkQlv_E\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Flipkart Payment Extractor\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}},{\"id\":\"5y4xZn1tIg\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Order\",\"col\":3}},{\"id\":\"-_4uhpK2Ay\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"v-nDIgvSfq\",\"type\":\"card\",\"data\":{\"card_name\":\"Reports\",\"col\":4}}]",
  "creation": "2024-05-27 13:20:31.068773",
  "custom_blocks": [],
  "docstatus": 0,
@@ -12,8 +12,58 @@
  "indicator_color": "blue",
  "is_hidden": 0,
  "label": "eSeller Suite",
- "links": [],
- "modified": "2024-08-30 11:45:26.703196",
+ "links": [
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Reports",
+   "link_count": 4,
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 1,
+   "label": "Sales Analytics",
+   "link_count": 0,
+   "link_to": "Sales Analytics",
+   "link_type": "Report",
+   "onboard": 1,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 1,
+   "label": "Sales Order Trends",
+   "link_count": 0,
+   "link_to": "Sales Order Trends",
+   "link_type": "Report",
+   "onboard": 1,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 1,
+   "label": "Sales Invoice Trends",
+   "link_count": 0,
+   "link_to": "Sales Invoice Trends",
+   "link_type": "Report",
+   "onboard": 1,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 1,
+   "label": "Amazon Sales Report",
+   "link_count": 0,
+   "link_to": "Amazon Sales Report",
+   "link_type": "Report",
+   "onboard": 1,
+   "type": "Link"
+  }
+ ],
+ "modified": "2024-09-10 10:30:37.964150",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Suite",
