@@ -1,5 +1,45 @@
 [
  {
+  "amazon_state": "Andhrapradesh",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-09-11 12:36:13.652103",
+  "name": "Andhrapradesh",
+  "state": "Andhra Pradesh"
+ },
+ {
+  "amazon_state": "new delhi",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-09-11 12:37:57.614758",
+  "name": "new delhi",
+  "state": "Delhi"
+ },
+ {
+  "amazon_state": "DAMAN & DIU",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-09-11 12:38:08.153412",
+  "name": "DAMAN & DIU",
+  "state": "Dadra and Nagar Haveli and Daman and Diu"
+ },
+ {
+  "amazon_state": "AP",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-09-11 12:38:22.421440",
+  "name": "AP",
+  "state": "Andhra Pradesh"
+ },
+ {
+  "amazon_state": "andrapradesh",
+  "docstatus": 0,
+  "doctype": "Amazon State Mapping",
+  "modified": "2024-09-11 12:38:37.774946",
+  "name": "andrapradesh",
+  "state": "Andhra Pradesh"
+ },
+ {
   "amazon_state": "ANDAMAN & NICOBAR ISLANDS",
   "docstatus": 0,
   "doctype": "Amazon State Mapping",

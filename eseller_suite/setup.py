@@ -115,10 +115,26 @@ def get_sales_order_custom_fields():
 				"fieldname": "fulfillment_channel",
 				"fieldtype": "Select",
 				"label": "Fulfillment Channel",
-				"insert_after": "amazon_customer_type",
+				"insert_after": "delivery_date",
 				"read_only": 1,
 				"no_copy": 1,
 				"options": "\nAFN\nMFN"
+			},
+			{
+				"fieldname": "replaced_order_id",
+				"fieldtype": "Data",
+				"label": "Replaced Order ID",
+				"insert_after": "is_export_with_gst",
+				"read_only": 1,
+				"no_copy": 1,
+			},
+			{
+				"fieldname": "amazon_order_amount",
+				"fieldtype": "Currency",
+				"label": "Amazon Order Amount",
+				"insert_after": "base_in_words",
+				"read_only": 1,
+				"no_copy": 1,
 			}
 		]
 	}
@@ -172,6 +188,22 @@ def get_sales_invoice_custom_fields():
 				"read_only": 1,
 				"no_copy": 1,
 				"options": "\nAFN\nMFN"
+			},
+			{
+				"fieldname": "replaced_order_id",
+				"fieldtype": "Data",
+				"label": "Replaced Order ID",
+				"insert_after": "is_return",
+				"read_only": 1,
+				"no_copy": 1,
+			},
+			{
+				"fieldname": "amazon_order_amount",
+				"fieldtype": "Currency",
+				"label": "Amazon Order Amount",
+				"insert_after": "base_in_words",
+				"read_only": 1,
+				"no_copy": 1,
 			}
 		],
 		"Sales Invoice Item": [
