@@ -8,6 +8,7 @@ import urllib
 import dateutil
 import frappe
 from frappe import _
+from datetime import datetime
 
 from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api import (
 	CatalogItems,
@@ -18,7 +19,7 @@ from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api im
 from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings import (
 	AmazonSPAPISettings,
 )
-from frappe.utils.data import getdate
+from frappe.utils import getdate, add_days, get_datetime
 
 
 class AmazonRepository:
@@ -552,12 +553,23 @@ class AmazonRepository:
 					failed_sync_record.amazon_order_id = order_id
 					failed_sync_record.remarks = 'Failed to create return Sales Invoice, Not able to find any Sales Invoice with this Amazon Order ID. Sales Order ID : {0}'.format(so)
 					failed_sync_record.payload = refund
+					if refund.get("posting_date"):
+						failed_sync_record.posting_date = dateutil.parser.parse(refund.get("posting_date")).strftime("%Y-%m-%d")
 					failed_sync_record.save(ignore_permissions=True)
 					break
 
 				return_created = False
 				si = frappe.db.get_value("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0  })
 				return_si = frappe.new_doc("Sales Invoice")
+				try:
+					posting_date = refund.get("posting_date") or ''
+					if posting_date:
+						posting_date = datetime.strptime(posting_date, "%Y-%m-%dT%H:%M:%SZ")
+						return_si.posting_date = get_datetime(posting_date).strftime("%Y-%m-%d")
+						return_si.posting_time = get_datetime(posting_date).strftime("%H:%M:%S")
+						return_si.set_posting_time = 1
+				except:
+					pass
 				return_si.is_return = 1
 				return_si.update_stock = 1
 				return_si.return_against = si
@@ -584,6 +596,7 @@ class AmazonRepository:
 					return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
 					return_si.disable_rounded_total = 1
 					return_si.update_outstanding_for_self = 0
+					return_si.update_billed_amount_in_sales_order = 1
 					return_si.insert(ignore_permissions=True)
 					return_si.submit()
 
@@ -593,10 +606,20 @@ class AmazonRepository:
 			if so_docstatus:
 				return
 			if not so_id and refunds:
+				grand_total = 0
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 				failed_sync_record.amazon_order_id = order_id
 				failed_sync_record.remarks = 'Failed to create Sales Order for Order ID : {0}. It has refund events in it.'.format(order_id)
 				failed_sync_record.payload = refunds[0]
+				if refunds[0].get("posting_date"):
+					failed_sync_record.posting_date = dateutil.parser.parse(refunds[0].get("posting_date")).strftime("%Y-%m-%d")
+				if refunds[0].get("items", []):
+					for row in refunds[0].get("items", []):
+						grand_total += float(row.get("amount", 0))
+				if refunds[0].get("charges", []):
+					for row in refunds[0].get("charges", []):
+						grand_total += float(row.get("tax_amount", 0))
+				failed_sync_record.grand_total = grand_total
 				failed_sync_record.save(ignore_permissions=True)
 				return
 			if not so_id:
@@ -614,6 +637,8 @@ class AmazonRepository:
 			so.marketplace_id = order.get("MarketplaceId")
 			so.amazon_order_status = order.get("OrderStatus")
 			so.fulfillment_channel = order.get("FulfillmentChannel")
+			so.replaced_order_id = order.get("ReplacedOrderId") or ''
+			so.amazon_order_amount = order.get("OrderTotal", {}).get("Amount", 0)
 			so.customer = customer_name
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
 			so.transaction_date = transaction_date
@@ -694,9 +719,8 @@ class AmazonRepository:
 			if so.grand_total>=0:
 				# so.flags.ignore_validate = True
 				so.save(ignore_permissions=True)
-
 				so.amazon_order_status = order.get("OrderStatus")
-	
+
 				order_statuses = [
 					"Shipped",
 					"InvoiceUnconfirmed",
@@ -718,7 +742,7 @@ class AmazonRepository:
 
 			return so.name
 
-	def get_orders(self, last_updated_after, amazon_order_ids=None) -> list:
+	def get_orders(self, last_updated_after, sync_selected_date_only=0) -> list:
 		orders = self.get_orders_instance()
 		order_statuses = [
 			"Shipped",
@@ -727,13 +751,24 @@ class AmazonRepository:
 			"Unfulfillable",
 		]
 		fulfillment_channels = ["FBA", "SellerFulfilled"]
-		orders_payload = self.call_sp_api_method(
-            sp_api_method=orders.get_orders,
-            last_updated_after=last_updated_after,
-            order_statuses=order_statuses,
-            fulfillment_channels=fulfillment_channels,
-            max_results=50,
-        )
+		if sync_selected_date_only:
+			last_updated_before = add_days(getdate(last_updated_after), 1).strftime( "%Y-%m-%d")
+			orders_payload = self.call_sp_api_method(
+                sp_api_method=orders.get_orders,
+                last_updated_after=last_updated_after,
+				last_updated_before=last_updated_before,
+                order_statuses=order_statuses,
+                fulfillment_channels=fulfillment_channels,
+                max_results=50,
+            )
+		else:
+			orders_payload = self.call_sp_api_method(
+                sp_api_method=orders.get_orders,
+                last_updated_after=last_updated_after,
+                order_statuses=order_statuses,
+                fulfillment_channels=fulfillment_channels,
+                max_results=50,
+            )
 
 		sales_orders = []
 
@@ -751,15 +786,10 @@ class AmazonRepository:
 
 			if not next_token:
 				break
-			if amazon_order_ids:
-				orders_payload = self.call_sp_api_method(
-                    sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token, amazon_order_ids=amazon_order_ids,
-                )
-			else:
-				orders_payload = self.call_sp_api_method(
+
+			orders_payload = self.call_sp_api_method(
                     sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token,
                 )
-
 		return sales_orders
 
 	def get_order(self, amazon_order_ids) -> list:
@@ -787,9 +817,9 @@ class AmazonRepository:
 	def get_catalog_items_instance(self) -> CatalogItems:
 		return CatalogItems(**self.instance_params)
 
-def get_orders(amz_setting_name, last_updated_after) -> list:
+def get_orders(amz_setting_name, last_updated_after, sync_selected_date_only=0) -> list:
 	ar = AmazonRepository(amz_setting_name)
-	return ar.get_orders(last_updated_after)
+	return ar.get_orders(last_updated_after, sync_selected_date_only)
 
 @frappe.whitelist()
 def get_order(amz_setting_name, amazon_order_ids) -> list:

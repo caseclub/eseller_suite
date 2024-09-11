@@ -50,6 +50,7 @@ class AmazonSPAPISettings(Document):
 				method=get_orders,
 				amz_setting_name=self.name,
 				last_updated_after=self.after_date,
+				sync_selected_date_only=self.sync_selected_date_only,
 				timeout=6000,
 				now=frappe.flags.in_test,
 			)

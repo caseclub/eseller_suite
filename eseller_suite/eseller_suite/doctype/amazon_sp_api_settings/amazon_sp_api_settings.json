@@ -26,6 +26,7 @@
   "section_break_3",
   "after_date",
   "taxes_charges",
+  "sync_selected_date_only",
   "sync_orders",
   "column_break_4",
   "enable_sync",
@@ -214,10 +215,16 @@
    "label": "AFN Warehouse",
    "options": "Warehouse",
    "reqd": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_selected_date_only",
+   "fieldtype": "Check",
+   "label": "Sync Selected Date Only"
   }
  ],
  "links": [],
- "modified": "2024-09-06 13:56:13.283262",
+ "modified": "2024-09-11 12:29:18.795711",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon SP API Settings",
