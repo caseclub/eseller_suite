@@ -438,7 +438,7 @@ class AmazonRepository:
 				make_address.address_type = "Shipping"
 				make_address.insert()
 
-		def get_refunds(self, order_id) -> dict:
+		def get_refunds(self, order_id, order_date, amazon_order_amount=0) -> dict:
 			finances = self.get_finances_instance()
 			financial_events_payload = self.call_sp_api_method(
 				sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
@@ -459,7 +459,7 @@ class AmazonRepository:
 				service_fee_event_list = financial_events_payload.get("FinancialEvents", {}).get("ServiceFeeEventList", [])
 				next_token = financial_events_payload.get("NextToken")
 
-				charges_and_fees = {"posting_date": "", "items":[], "charges": [], "fees": []}
+				charges_and_fees = {"posting_date": "", "items":[], "charges": [], "fees": [], "amazon_order_amount":amazon_order_amount, "order_date":order_date}
 
 				for refund_event in refund_event_list:
 					if refund_event:
@@ -519,10 +519,10 @@ class AmazonRepository:
 								fee_account = self.get_account(fee_type)
 								charges_and_fees.get("fees").append(
                                     {
-                                    "charge_type": "Actual",
-                                    "account_head": fee_account,
-                                    "tax_amount": amount,
-                                    "description": fee_type + " for " + seller_sku,
+                                        "charge_type": "Actual",
+                                        "account_head": fee_account,
+                                        "tax_amount": amount,
+                                        "description": fee_type + " for " + seller_sku,
                                     }
                                 )
 
@@ -540,9 +540,11 @@ class AmazonRepository:
 			return refund_events
 
 		order_id = order.get("AmazonOrderId")
+		order_date = order.get("PurchaseDate")
+		amazon_order_amount = order.get("OrderTotal", {}).get("Amount", 0)
 		so_id = None
 		so_docstatus = 0
-		refunds = get_refunds(self, order_id)
+		refunds = get_refunds(self, order_id, order_date, amazon_order_amount)
 		if frappe.db.exists("Sales Order", {"amazon_order_id": order_id}):
 			so_id, so_docstatus = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname=["name", "docstatus"])
 
@@ -555,6 +557,10 @@ class AmazonRepository:
 					failed_sync_record.payload = refund
 					if refund.get("posting_date"):
 						failed_sync_record.posting_date = dateutil.parser.parse(refund.get("posting_date")).strftime("%Y-%m-%d")
+					if refund.get("order_date"):
+						failed_sync_record.amazon_order_date = dateutil.parser.parse(refund.get("order_date")).strftime("%Y-%m-%d")
+					if refund.get("amazon_order_amount"):
+						failed_sync_record.amazon_order_amount = refund.get("amazon_order_amount")
 					failed_sync_record.save(ignore_permissions=True)
 					break
 
@@ -619,6 +625,10 @@ class AmazonRepository:
 				if refunds[0].get("charges", []):
 					for row in refunds[0].get("charges", []):
 						grand_total += float(row.get("tax_amount", 0))
+				if refunds[0].get("order_date"):
+					failed_sync_record.amazon_order_date = dateutil.parser.parse(refunds[0].get("order_date")).strftime("%Y-%m-%d")
+				if refunds[0].get("amazon_order_amount"):
+					failed_sync_record.amazon_order_amount = refunds[0].get("amazon_order_amount")
 				failed_sync_record.grand_total = grand_total
 				failed_sync_record.save(ignore_permissions=True)
 				return
@@ -639,6 +649,7 @@ class AmazonRepository:
 			so.fulfillment_channel = order.get("FulfillmentChannel")
 			so.replaced_order_id = order.get("ReplacedOrderId") or ''
 			so.amazon_order_amount = order.get("OrderTotal", {}).get("Amount", 0)
+			so.amazon_order_status = order.get("OrderStatus")
 			so.customer = customer_name
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
 			so.transaction_date = transaction_date
@@ -671,6 +682,7 @@ class AmazonRepository:
 						failed_sync_record.payload = so.as_dict()
 						failed_sync_record.posting_date = so.transaction_date
 						failed_sync_record.grand_total = so.grand_total
+						failed_sync_record.amazon_order_amount = so.amazon_order_amount
 						failed_sync_record.save(ignore_permissions=True)
 					return
 
@@ -719,7 +731,6 @@ class AmazonRepository:
 			if so.grand_total>=0:
 				# so.flags.ignore_validate = True
 				so.save(ignore_permissions=True)
-				so.amazon_order_status = order.get("OrderStatus")
 
 				order_statuses = [
 					"Shipped",
@@ -773,19 +784,17 @@ class AmazonRepository:
 		sales_orders = []
 
 		while True:
-			orders_list = orders_payload.get("Orders")
-			next_token = orders_payload.get("NextToken")
-
-			if not orders_list or len(orders_list) == 0:
-				break
-
-			for order in orders_list:
-				sales_order = self.create_sales_order(order)
-				if sales_order:
-					sales_orders.append(sales_order)
-
-			if not next_token:
-				break
+			if orders_payload:
+				orders_list = orders_payload.get("Orders")
+				next_token = orders_payload.get("NextToken")
+				if not orders_list or len(orders_list) == 0:
+					break
+				for order in orders_list:
+					sales_order = self.create_sales_order(order)
+					if sales_order:
+						sales_orders.append(sales_order)
+				if not next_token:
+					break
 
 			orders_payload = self.call_sp_api_method(
                     sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token,
