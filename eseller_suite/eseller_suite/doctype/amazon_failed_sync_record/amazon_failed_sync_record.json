@@ -6,9 +6,10 @@
  "engine": "InnoDB",
  "field_order": [
   "amazon_order_id",
-  "grand_total",
   "amazon_order_amount",
+  "grand_total",
   "column_break_bmhr",
+  "amazon_order_date",
   "posting_date",
   "remarks",
   "section_break_vjkz",
@@ -58,12 +59,17 @@
    "fieldname": "amazon_order_amount",
    "fieldtype": "Currency",
    "label": "Amazon Order Amount"
+  },
+  {
+   "fieldname": "amazon_order_date",
+   "fieldtype": "Date",
+   "label": "Amazon Order Date"
   }
  ],
  "in_create": 1,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-09-11 17:31:40.008055",
+ "modified": "2024-09-12 12:06:21.923152",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Failed Sync Record",
