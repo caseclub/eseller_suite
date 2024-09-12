@@ -115,7 +115,6 @@ def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
 					"amazon_order_status": "amazon_order_status",
 					"amazon_customer_type": "amazon_customer_type",
 					"fulfillment_channel": "fulfillment_channel",
-					"is_replacement_order": "is_replacement_order",
 					"replaced_order_id": "replaced_order_id",
 					"amazon_order_amount": "amazon_order_amount",
 				},
