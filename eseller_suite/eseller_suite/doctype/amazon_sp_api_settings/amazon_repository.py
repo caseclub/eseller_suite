@@ -443,6 +443,7 @@ class AmazonRepository:
 			financial_events_payload = self.call_sp_api_method(
 				sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
 			)
+
    
 			if not (
 				financial_events_payload
@@ -681,6 +682,7 @@ class AmazonRepository:
 						failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 						failed_sync_record.payload = so.as_dict()
 						failed_sync_record.posting_date = so.transaction_date
+						failed_sync_record.amazon_order_date = so.transaction_date
 						failed_sync_record.grand_total = so.grand_total
 						failed_sync_record.amazon_order_amount = so.amazon_order_amount
 						failed_sync_record.save(ignore_permissions=True)
@@ -746,7 +748,9 @@ class AmazonRepository:
 				failed_sync_record.amazon_order_id = order_id
 				failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 				failed_sync_record.posting_date = so.transaction_date
+				failed_sync_record.amazon_order_date = so.transaction_date
 				failed_sync_record.grand_total = so.grand_total
+				failed_sync_record.amazon_order_amount = so.amazon_order_amount
 				if not so_id:
 					failed_sync_record.payload = so.as_dict()
 				failed_sync_record.save(ignore_permissions=True)

@@ -54,6 +54,12 @@ def get_columns(filters):
         columns.extend(date_columns)
     columns_common = [
         {
+            "label": "Amazon Order Amount",
+            "fieldname": "amazon_order_amount",
+            "fieldtype": "Currency",
+            "width": 150
+        },
+        {
             "label": "Order Amount",
             "fieldname": "order_amount",
             "fieldtype": "Currency",
@@ -66,8 +72,14 @@ def get_columns(filters):
             "width": 150
         },
         {
-            "label": "Return/Cancellation",
-            "fieldname": "returns_and_cancels",
+            "label": "Return Amount",
+            "fieldname": "return_amount",
+            "fieldtype": "Currency",
+            "width": 180
+        },
+        {
+            "label": "Cancelled Amount",
+            "fieldname": "cancelled_amount",
             "fieldtype": "Currency",
             "width": 150
         },
@@ -101,6 +113,7 @@ def get_data(filters):
             amazon_customer_type as customer_type,
             amazon_order_status,
             fulfillment_channel,
+            SUM(amazon_order_amount) as amazon_order_amount,
             SUM(grand_total) as order_amount
         FROM
             `tabSales Order`
@@ -133,11 +146,13 @@ def get_data(filters):
         print("row : ", row)
         if group_based_on == 'amazon_order_id':
             row['invoice_amount'] = get_invoice_amount(amazon_order_id=row.get(group_based_on))
-            row['returns_and_cancels'] = get_returns_and_cancels(amazon_order_id=row.get(group_based_on))
+            row['return_amount'] = get_total_returns(amazon_order_id=row.get(group_based_on))
+            row['cancelled_amount'] = get_total_cancels(amazon_order_id=row.get(group_based_on))
         else:
             row['invoice_amount'] = get_invoice_amount(transaction_date=row.get(group_based_on))
-            row['returns_and_cancels'] = get_returns_and_cancels(transaction_date=row.get(group_based_on))
-        row['total_amount'] = row['order_amount'] - row['returns_and_cancels']
+            row['return_amount'] = get_total_returns(transaction_date=row.get(group_based_on))
+            row['cancelled_amount'] = get_total_cancels(transaction_date=row.get(group_based_on))
+        row['total_amount'] = row['order_amount'] - row['return_amount'] -  row['cancelled_amount']
         data.append(row)
     return data
 
@@ -179,7 +194,7 @@ def get_invoice_amount(amazon_order_id=None, transaction_date=None):
                 total_invoice_amount = output[0].get('total', 0)
     return total_invoice_amount
 
-def get_returns_and_cancels(amazon_order_id=None, transaction_date=None):
+def get_total_returns(amazon_order_id=None, transaction_date=None):
     '''
         Method to get Total Returns and Cancelled amount with Amazon Order ID or Date
     '''
@@ -213,6 +228,14 @@ def get_returns_and_cancels(amazon_order_id=None, transaction_date=None):
                 total_returns = output[0].get('total', 0)
         if total_returns<0:
             total_returns *= -1
+    return total_returns
+
+def get_total_cancels(amazon_order_id=None, transaction_date=None):
+    '''
+        Method to get Total Returns and Cancelled amount with Amazon Order ID or Date
+    '''
+    total_cancels = 0
+    if transaction_date or amazon_order_id:
         #Cancelled Orders
         query = '''
             SELECT
@@ -240,4 +263,4 @@ def get_returns_and_cancels(amazon_order_id=None, transaction_date=None):
                 total_cancels = output[0].get('total', 0)
         if total_cancels<0:
             total_cancels *= -1
-    return total_cancels+total_returns
+    return total_cancels
