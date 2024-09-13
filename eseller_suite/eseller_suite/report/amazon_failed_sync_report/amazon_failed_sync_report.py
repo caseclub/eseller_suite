@@ -56,33 +56,44 @@ def get_data(filters):
     from_date = getdate(filters.get("from_date"))
     to_date = getdate(filters.get("to_date"))
     group_based_on = filters.get("group_based_on")
-    if group_based_on == 'Order ID':
-        group_based_on = 'amazon_order_id'
-    else:
-        group_based_on = 'amazon_order_date'
-    so_query = '''
+    order_query = '''
         SELECT
-            distinct amazon_order_id,
+            DISTINCT amazon_order_id,
             name,
             amazon_order_date,
-            SUM(amazon_order_amount) as amazon_order_amount,
-            SUM(grand_total) as order_amount
+            amazon_order_amount,
+            grand_total as order_amount
         FROM
             `tabAmazon Failed Sync Record`
         WHERE
             amazon_order_date BETWEEN %(from_date)s AND %(to_date)s
-    '''
-    so_query += '''
         GROUP BY
-            {0}
+            amazon_order_id
         ORDER BY
             amazon_order_date
-    '''.format(group_based_on)
-    results = frappe.db.sql(so_query, {
-        'group_based_on':group_based_on,
-        'from_date':from_date,
-        'to_date':to_date,
-        'customer_type':filters.get("customer_type"),
-        'fulfillment_channel':filters.get("fulfillment_channel")
-    }, as_dict=True)
+    '''
+    so_query = '''
+        SELECT
+            amazon_order_id,
+            name,
+            amazon_order_date,
+            SUM(amazon_order_amount) as amazon_order_amount,
+            SUM(order_amount) as order_amount
+        FROM
+        (
+            {0}
+        ) AS distinct_orders
+        GROUP BY
+            amazon_order_date
+    '''.format(order_query)
+    if group_based_on == 'Order ID':
+         results = frappe.db.sql(order_query, {
+            'from_date':from_date,
+            'to_date':to_date
+        }, as_dict=True)
+    else:
+        results = frappe.db.sql(so_query, {
+            'from_date':from_date,
+            'to_date':to_date
+        }, as_dict=True)
     return results
