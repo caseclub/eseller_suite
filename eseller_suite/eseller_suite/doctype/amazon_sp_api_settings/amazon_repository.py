@@ -799,8 +799,7 @@ class AmazonRepository:
 						sales_orders.append(sales_order)
 				if not next_token:
 					break
-
-			orders_payload = self.call_sp_api_method(
+				orders_payload = self.call_sp_api_method(
                     sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token,
                 )
 		return sales_orders
