@@ -1,0 +1,84 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "AMZN-PAY-.#####",
+ "creation": "2024-09-13 12:06:58.759396",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "payment_file",
+  "payments_created",
+  "jv_created",
+  "started",
+  "payment_details_section",
+  "payment_details"
+ ],
+ "fields": [
+  {
+   "fieldname": "payment_file",
+   "fieldtype": "Attach",
+   "in_list_view": 1,
+   "label": "Payment File",
+   "read_only_depends_on": "started",
+   "reqd": 1
+  },
+  {
+   "fieldname": "payment_details_section",
+   "fieldtype": "Section Break",
+   "label": "Payment Details"
+  },
+  {
+   "fieldname": "payment_details",
+   "fieldtype": "Table",
+   "label": "Payment Details",
+   "options": "Amazon Payment Tool Item",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "payments_created",
+   "fieldtype": "Check",
+   "label": "Payments Created",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "jv_created",
+   "fieldtype": "Check",
+   "label": "JV Created",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "started",
+   "fieldtype": "Check",
+   "label": "Started",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2024-09-13 13:52:43.974106",
+ "modified_by": "Administrator",
+ "module": "eSeller Suite",
+ "name": "Amazon Payment Tool",
+ "naming_rule": "Expression (old style)",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
