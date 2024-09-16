@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"fgLuQOKLke\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Payment Extractor\",\"col\":3}},{\"id\":\"7J5AkQlv_E\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Flipkart Payment Extractor\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}},{\"id\":\"5y4xZn1tIg\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Order\",\"col\":3}},{\"id\":\"-_4uhpK2Ay\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"v-nDIgvSfq\",\"type\":\"card\",\"data\":{\"card_name\":\"Reports\",\"col\":4}}]",
+ "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}},{\"id\":\"5y4xZn1tIg\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Order\",\"col\":3}},{\"id\":\"YIlOhiTT0O\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Invoice\",\"col\":3}},{\"id\":\"-_4uhpK2Ay\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"hNZ7vc1_KH\",\"type\":\"card\",\"data\":{\"card_name\":\"Tools\",\"col\":4}},{\"id\":\"v-nDIgvSfq\",\"type\":\"card\",\"data\":{\"card_name\":\"Reports\",\"col\":4}}]",
  "creation": "2024-05-27 13:20:31.068773",
  "custom_blocks": [],
  "docstatus": 0,
@@ -61,9 +61,48 @@
    "link_type": "Report",
    "onboard": 1,
    "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Tools",
+   "link_count": 3,
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Amazon Payment Tool",
+   "link_count": 0,
+   "link_to": "Amazon Payment Tool",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Flipkart Payment Extractor",
+   "link_count": 0,
+   "link_to": "Flipkart Payment Extractor",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Amazon Payment Extractor",
+   "link_count": 0,
+   "link_to": "Amazon Payment Extractor",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
   }
  ],
- "modified": "2024-09-10 10:30:37.964150",
+ "modified": "2024-09-16 09:10:40.325549",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Suite",
@@ -90,6 +129,14 @@
   {
    "color": "Grey",
    "doc_view": "List",
+   "label": "Sales Invoice",
+   "link_to": "Sales Invoice",
+   "stats_filter": "[]",
+   "type": "DocType"
+  },
+  {
+   "color": "Grey",
+   "doc_view": "List",
    "label": "Sales Order",
    "link_to": "Sales Order",
    "stats_filter": "[]",
@@ -105,24 +152,8 @@
   {
    "color": "Grey",
    "doc_view": "List",
-   "label": "Flipkart Payment Extractor",
-   "link_to": "Flipkart Payment Extractor",
-   "stats_filter": "[]",
-   "type": "DocType"
-  },
-  {
-   "color": "Grey",
-   "doc_view": "List",
    "label": "Amazon SP API Settings",
    "link_to": "Amazon SP API Settings",
-   "stats_filter": "[]",
-   "type": "DocType"
-  },
-  {
-   "color": "Grey",
-   "doc_view": "List",
-   "label": "Amazon Payment Extractor",
-   "link_to": "Amazon Payment Extractor",
    "stats_filter": "[]",
    "type": "DocType"
   }

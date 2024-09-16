@@ -69,9 +69,42 @@ class AmazonPaymentTool(Document):
 		'''
             Method to Mark Payments against each Order IDs
 		'''
+		# Setting flag started as 1
+		if not self.started:
+			frappe.db.set_value(self.doctype, self.name, 'started', 1)
+		payment_entries = []
 		for row in self.payment_details:
 			if row.order_id and row.order_id != '---' and not row.payment_created:
-				create_payment_against_order_id(row.name)
+				payment_entry = create_payment_against_order_id(row.name)
+				if payment_entry:
+					payment_entries.append(payment_entry)
+		return payment_entries
+
+	@frappe.whitelist()
+	def create_journal__entries(self, credit_account, debit_account, transaction_type):
+		'''
+            Method to Mark Payments against each Order IDs
+		'''
+		# Setting flag started as 1
+		if not self.started:
+			frappe.db.set_value(self.doctype, self.name, 'started', 1)
+		journal__entries = []
+		for row in self.payment_details:
+			if row.transaction_type == transaction_type and row.order_id == '---' and not row.payment_created:
+				journal_entry = create_journal_entry(row.name, credit_account, debit_account)
+				if journal_entry:
+					journal__entries.append(journal_entry)
+		return journal__entries
+
+	def get_total_based_on_transaction_type(self, transaction_type):
+		'''
+            Method to get total amount based on transaction type
+		'''
+		total_amount = 0
+		for row in self.payment_details:
+			if row.transaction_type == transaction_type and row.order_id != '---' and not row.payment_created:
+				total_amount += row.total
+		return total_amount
 
 def create_payment_against_order_id(row_id):
 	'''
@@ -106,4 +139,34 @@ def create_payment_against_order_id(row_id):
 		pay_doc.set_missing_values()
 		pay_doc.submit()
 		frappe.db.set_value('Amazon Payment Tool Item', row_id, 'payment_created', 1)
-		frappe.msgprint("Payment Entry Created : {0}".format(pay_doc.name), alert=True, indicator='green')
+		frappe.db.set_value('Amazon Payment Tool Item', row_id, 'payment_entry', pay_doc.name)
+		return pay_doc.name
+	return None
+
+def create_journal_entry(row_id, credit_account, debit_account):
+	'''
+        Method to create Journal Entry against payment details table row
+	'''
+	amount, date = frappe.db.get_value('Amazon Payment Tool Item', row_id, fieldname=['total', 'date'])
+	posting_date = getdate(date)
+	payment_amount = float(amount)
+	if payment_amount<0:
+		payment_amount = -payment_amount
+	jv_doc = frappe.new_doc('Journal Entry')
+	jv_doc.voucher_type = 'Journal Entry'
+	jv_doc.posting_date = posting_date
+	#Credit Row
+	jv_doc.append('accounts', {
+		'account': credit_account,
+		'credit_in_account_currency': payment_amount
+    })
+	#Debit Row
+	jv_doc.append('accounts', {
+		'account': debit_account,
+		'debit_in_account_currency': payment_amount
+    })
+	jv_doc.save(ignore_permissions=True)
+	jv_doc.submit()
+	frappe.db.set_value('Amazon Payment Tool Item', row_id, 'payment_created', 1)
+	frappe.db.set_value('Amazon Payment Tool Item', row_id, 'journal_entry', jv_doc.name)
+	return jv_doc.name

@@ -7,8 +7,6 @@
  "engine": "InnoDB",
  "field_order": [
   "payment_file",
-  "payments_created",
-  "jv_created",
   "started",
   "payment_details_section",
   "payment_details"
@@ -36,29 +34,16 @@
   },
   {
    "default": "0",
-   "fieldname": "payments_created",
-   "fieldtype": "Check",
-   "label": "Payments Created",
-   "read_only": 1
-  },
-  {
-   "default": "0",
-   "fieldname": "jv_created",
-   "fieldtype": "Check",
-   "label": "JV Created",
-   "read_only": 1
-  },
-  {
-   "default": "0",
    "fieldname": "started",
    "fieldtype": "Check",
+   "hidden": 1,
    "label": "Started",
    "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-09-13 13:52:43.974106",
+ "modified": "2024-09-16 13:18:25.986287",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Tool",
