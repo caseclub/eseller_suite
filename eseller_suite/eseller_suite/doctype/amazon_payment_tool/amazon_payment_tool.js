@@ -105,15 +105,15 @@ function add_journal_entry_popup(frm) {
         ],
         primary_action_label: 'Create JV',
         primary_action(values) {
-            create_journal__entries(frm, values)
+            create_journal_entries(frm, values)
             d.hide();
         }
     });
     d.show();
 }
 
-function create_journal__entries(frm, values) {
-    frm.call('create_journal__entries', {
+function create_journal_entries(frm, values) {
+    frm.call('create_journal_entries', {
         'credit_account': values.credit_account,
         'debit_account': values.debit_account,
         'transaction_type': values.transaction_type
