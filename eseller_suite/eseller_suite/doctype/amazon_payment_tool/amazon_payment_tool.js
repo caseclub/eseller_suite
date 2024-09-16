@@ -26,14 +26,125 @@ function handle_custom_buttons(frm) {
 }
 
 function add_payments(frm) {
-    console.log("add_payments")
     frm.call('create_payments').then(r => {
         if (r.message) {
-            console.log(r.message);
+            if (r.message.length > 0) {
+                frappe.show_alert({
+                    message: __("Payment Entries Created: {0}", [
+                        r.message.map(function (d) {
+                            return repl(
+                                '<a href="/app/payment-entry/%(name)s">%(name)s</a>',
+                                { name: d }
+                            );
+                        }).join(", "),
+                    ]),
+                    indicator: "green",
+                });
+                frm.reload_doc();
+            }
+            else {
+                frappe.show_alert({
+                    message: __("Failed to Create Payments"),
+                    indicator: "red",
+                });
+            }
+        }
+        else {
+            frappe.show_alert({
+                message: __("Failed to Create Payments"),
+                indicator: "red",
+            });
         }
     })
 }
 
 function add_journal_entries(frm) {
-    console.log("add_journal_entries")
+    add_journal_entry_popup(frm);
+}
+
+function add_journal_entry_popup(frm) {
+    let d = new frappe.ui.Dialog({
+        title: 'Create Journal Entry',
+        fields: [
+            {
+                label: 'Transaction Type',
+                fieldname: 'transaction_type',
+                fieldtype: 'Select',
+                options: 'Service Fees',
+                default: 'Service Fees',
+                read_only: 1
+            },
+            {
+                label: 'Credit Account',
+                fieldname: 'credit_account',
+                fieldtype: 'Link',
+                options: 'Account',
+                only_select: 1,
+                get_query: function () {
+                    return {
+                        filters: {
+                            is_group: 0
+                        }
+                    }
+                },
+            },
+            {
+                label: 'Debit Account',
+                fieldname: 'debit_account',
+                fieldtype: 'Link',
+                options: 'Account',
+                only_select: 1,
+                get_query: function () {
+                    return {
+                        filters: {
+                            is_group: 0
+                        }
+                    }
+                },
+            }
+        ],
+        primary_action_label: 'Create JV',
+        primary_action(values) {
+            create_journal__entries(frm, values)
+            d.hide();
+        }
+    });
+    d.show();
+}
+
+function create_journal__entries(frm, values) {
+    frm.call('create_journal__entries', {
+        'credit_account': values.credit_account,
+        'debit_account': values.debit_account,
+        'transaction_type': values.transaction_type
+    }).then(r => {
+        if (r.message) {
+            if (r.message.length > 0) {
+                frappe.show_alert({
+                    message: __("Journal Entries Created: {0}", [
+                        r.message.map(function (d) {
+                            return repl(
+                                '<a href="/app/journal-entry/%(name)s">%(name)s</a>',
+                                { name: d }
+                            );
+                        }).join(", "),
+                    ]),
+                    indicator: "green",
+                });
+                frm.reload_doc();
+            }
+            else {
+                frappe.show_alert({
+                    message: __("Failed to Create Journal Entries"),
+                    indicator: "red",
+                });
+            }
+        }
+        else {
+            frappe.show_alert({
+                message: __("Failed to Create Journal Entries"),
+                indicator: "red",
+            });
+        }
+    })
 }

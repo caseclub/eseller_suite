@@ -8,10 +8,13 @@
  "field_order": [
   "date",
   "transaction_type",
-  "payment_created",
   "column_break_mcrh",
   "order_id",
-  "total"
+  "total",
+  "payment_created",
+  "references_section",
+  "payment_entry",
+  "journal_entry"
  ],
  "fields": [
   {
@@ -37,28 +40,49 @@
    "label": "Total (INR)"
   },
   {
-   "columns": 3,
+   "columns": 2,
    "fieldname": "transaction_type",
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Transaction Type"
   },
   {
+   "columns": 1,
    "default": "0",
    "fieldname": "payment_created",
    "fieldtype": "Check",
+   "in_list_view": 1,
    "label": "Payment Created",
    "read_only": 1
   },
   {
    "fieldname": "column_break_mcrh",
    "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "references_section",
+   "fieldtype": "Section Break",
+   "label": "References"
+  },
+  {
+   "fieldname": "journal_entry",
+   "fieldtype": "Link",
+   "label": "Journal Entry",
+   "options": "Journal Entry",
+   "read_only": 1
+  },
+  {
+   "fieldname": "payment_entry",
+   "fieldtype": "Link",
+   "label": "Payment Entry",
+   "options": "Payment Entry",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2024-09-13 17:39:32.788445",
+ "modified": "2024-09-16 13:21:34.220340",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Tool Item",
