@@ -81,7 +81,7 @@ class AmazonPaymentTool(Document):
 		return payment_entries
 
 	@frappe.whitelist()
-	def create_journal__entries(self, credit_account, debit_account, transaction_type):
+	def create_journal_entries(self, credit_account, debit_account, transaction_type):
 		'''
             Method to Mark Payments against each Order IDs
 		'''
