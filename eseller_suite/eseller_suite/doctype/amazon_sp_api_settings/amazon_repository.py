@@ -322,9 +322,12 @@ class AmazonRepository:
 			next_token = order_items_payload.get("NextToken")
 
 			for order_item in order_items_list:
-				if order_item.get("QuantityOrdered") > 0:
+				if order_item.get("QuantityOrdered") >= 0:
 					item_rate = order_item.get("ItemPrice", {}).get("Amount", 0)
 					item_qty = order_item.get("QuantityOrdered")
+					# In case of Cancelled orders Qty will be 0, Invoice will not get created
+					if not item_qty:
+						item_qty = 1
 					final_order_items.append(
 						{
 							"item_code": self.get_item_code(order_item),
@@ -739,7 +742,6 @@ class AmazonRepository:
 				order_statuses = [
 					"Shipped",
 					"InvoiceUnconfirmed",
-					"Canceled",
 					"Unfulfillable",
 				]
 
