@@ -110,6 +110,7 @@ def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
 					"party_account_currency": "party_account_currency",
 					"payment_terms_template": "payment_terms_template",
 					"transaction_date": "posting_date",
+					"transaction_time": "posting_time",
 					"delivery_date": "due_date",
 					"amazon_order_id": "amazon_order_id",
 					"amazon_order_status": "amazon_order_status",
