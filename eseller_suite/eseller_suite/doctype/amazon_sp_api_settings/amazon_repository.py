@@ -9,6 +9,7 @@ import dateutil
 import frappe
 from frappe import _
 from datetime import datetime
+from eseller_suite.eseller_suite.utils import foramt_date_time_to_ist
 
 from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api import (
 	CatalogItems,
@@ -464,7 +465,7 @@ class AmazonRepository:
 
 				for refund_event in refund_event_list:
 					if refund_event:
-						charges_and_fees["posting_date"] = refund_event.get("PostedDate")
+						charges_and_fees["posting_date"] = foramt_date_time_to_ist(refund_event.get("PostedDate"))
 						for refund_item in refund_event.get("ShipmentItemAdjustmentList", []):
 							charges = refund_item.get("ItemChargeAdjustmentList", [])
 							fees = refund_item.get("ItemFeeAdjustmentList", [])
@@ -541,7 +542,7 @@ class AmazonRepository:
 			return refund_events
 
 		order_id = order.get("AmazonOrderId")
-		order_date = order.get("PurchaseDate")
+		order_date = foramt_date_time_to_ist(order.get("PurchaseDate"))
 		amazon_order_amount = order.get("OrderTotal", {}).get("Amount", 0)
 		so_id = None
 		so_docstatus = 0
@@ -641,8 +642,8 @@ class AmazonRepository:
 			customer_name = create_customer(order)
 			create_address(order, customer_name)
 
-			delivery_date = dateutil.parser.parse(order.get("LatestShipDate")).strftime("%Y-%m-%d")
-			transaction_date = dateutil.parser.parse(order.get("PurchaseDate")).strftime("%Y-%m-%d")
+			delivery_date = foramt_date_time_to_ist(order.get("LatestShipDate"))
+			transaction_date = foramt_date_time_to_ist(order.get("PurchaseDate"))
 
 			so.amazon_order_id = order_id
 			so.marketplace_id = order.get("MarketplaceId")
@@ -653,7 +654,8 @@ class AmazonRepository:
 			so.amazon_order_status = order.get("OrderStatus")
 			so.customer = customer_name
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
-			so.transaction_date = transaction_date
+			so.transaction_date = get_datetime(transaction_date).strftime('%Y-%m-%d')
+			so.transaction_time = get_datetime(transaction_date).strftime('%H:%M:%S')
 			so.company = self.amz_setting.company
 			warehouse = self.amz_setting.warehouse
 			if so.fulfillment_channel:

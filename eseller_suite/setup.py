@@ -135,6 +135,13 @@ def get_sales_order_custom_fields():
 				"insert_after": "base_in_words",
 				"read_only": 1,
 				"no_copy": 1,
+			},
+			{
+				"fieldname": "transaction_time",
+				"fieldtype": "Time",
+				"label": "Transaction Time",
+				"insert_after": "transaction_date",
+				"no_copy": 1,
 			}
 		]
 	}
@@ -149,7 +156,7 @@ def get_sales_invoice_custom_fields():
 				"fieldname": "amazon_order_id",
 				"fieldtype": "Data",
 				"label": "Amazon Order ID",
-				"insert_after": "due_date",
+				"insert_after": "customer",
 				"in_standard_filter": 1,
 				"read_only": 1,
 				"no_copy": 1
