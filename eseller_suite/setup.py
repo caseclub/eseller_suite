@@ -90,7 +90,7 @@ def get_sales_order_custom_fields():
 				"fieldtype": "Select",
 				"label": "Amazon Order Status",
 				"insert_after": "amazon_transaction_type",
-				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped",
+				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped\nShipped - Picked Up",
 				"read_only": 1,
 				"no_copy": 1
 			},
@@ -143,7 +143,17 @@ def get_sales_order_custom_fields():
 				"insert_after": "transaction_date",
 				"no_copy": 1,
 			}
-		]
+		],
+		"Sales Order Item": [
+			{
+				"fieldname": "total_order_value",
+				"fieldtype": "Currency",
+				"label": "Total Order Value",
+				"insert_after": "amount",
+				"read_only": 1,
+				"no_copy": 1
+			}
+        ]
 	}
 
 def get_sales_invoice_custom_fields():
@@ -174,7 +184,7 @@ def get_sales_invoice_custom_fields():
 				"fieldtype": "Select",
 				"label": "Amazon Order Status",
 				"insert_after": "amazon_transaction_type",
-				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped",
+				"options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped\nShipped - Picked Up",
 				"read_only": 1,
 				"no_copy": 1
 			},
@@ -271,6 +281,14 @@ def get_sales_invoice_custom_fields():
 				"read_only": 1,
 				"no_copy": 1
 			},
+			{
+				"fieldname": "total_order_value",
+				"fieldtype": "Currency",
+				"label": "Total Order Value",
+				"insert_after": "total_inr",
+				"read_only": 1,
+				"no_copy": 1
+			}
 		]
 	}
 

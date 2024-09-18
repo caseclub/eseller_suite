@@ -32,6 +32,8 @@ class SalesOrderOverride(SalesOrder):
                 total_taxes_and_charges += float(tax_row.tax_amount)
 
         self.total = total
+        if self.amazon_order_status == 'Pending' and not self.amazon_order_amount:
+            self.amazon_order_amount = total
         self.total_qty = total_qty
         self.total_taxes_and_charges = total_taxes_and_charges
         self.grand_total = total + total_taxes_and_charges
