@@ -18,7 +18,7 @@ def get_columns(filters):
             "label": "Date",
             "fieldname": "transaction_date",
             "fieldtype": "Date",
-            "width": 150
+            "width": 110
         }
     ]
     if group_based_on != 'Date':
@@ -27,17 +27,17 @@ def get_columns(filters):
                 "label": "Order ID",
                 "fieldname": "amazon_order_id",
                 "fieldtype": "Data",
-                "width": 150
+                "width": 200
             },
             {
                 "label": "Customer Type",
                 "fieldname": "customer_type",
                 "fieldtype": "Select",
                 "options": "\nB2B\nB2C",
-                "width": 150
+                "width": 130
             },
             {
-                "label": "Amazon Order Status",
+                "label": "Amazon Status",
                 "fieldname": "amazon_order_status",
                 "fieldtype": "Select",
                 "options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped",
@@ -48,22 +48,22 @@ def get_columns(filters):
                 "fieldname": "fulfillment_channel",
                 "fieldtype": "Select",
                 "options": "\nAFN\nMFN",
-                "width": 150
+                "width": 160
             }
         ]
         columns.extend(date_columns)
     columns_common = [
         {
-            "label": "Amazon Order Amount",
+            "label": "Amazon Amount",
             "fieldname": "amazon_order_amount",
             "fieldtype": "Currency",
             "width": 150
         },
         {
-            "label": "Order Amount",
+            "label": "SO Amount",
             "fieldname": "order_amount",
             "fieldtype": "Currency",
-            "width": 150
+            "width": 120
         },
         {
             "label": "Invoice Amount",
@@ -75,7 +75,7 @@ def get_columns(filters):
             "label": "Return Amount",
             "fieldname": "return_amount",
             "fieldtype": "Currency",
-            "width": 180
+            "width": 150
         },
         {
             "label": "Cancelled Amount",
@@ -84,10 +84,16 @@ def get_columns(filters):
             "width": 150
         },
         {
-            "label": "Total Amount",
+            "label": "Total Invoice Amount",
             "fieldname": "total_amount",
             "fieldtype": "Currency",
-            "width": 150
+            "width": 180
+        },
+        {
+            "label": "Total Order Amount",
+            "fieldname": "total_order_amount",
+            "fieldtype": "Currency",
+            "width": 160
         }
     ]
     columns.extend(columns_common)
@@ -142,8 +148,6 @@ def get_data(filters):
         'fulfillment_channel':filters.get("fulfillment_channel")
     }, as_dict=True)
     for row in results:
-        print("\n group_based_on : ", group_based_on)
-        print("row : ", row)
         if group_based_on == 'amazon_order_id':
             row['invoice_amount'] = get_invoice_amount(amazon_order_id=row.get(group_based_on))
             row['return_amount'] = get_total_returns(amazon_order_id=row.get(group_based_on))
@@ -153,6 +157,9 @@ def get_data(filters):
             row['return_amount'] = get_total_returns(transaction_date=row.get(group_based_on))
             row['cancelled_amount'] = get_total_cancels(transaction_date=row.get(group_based_on))
         row['total_amount'] = row['order_amount'] - row['return_amount'] -  row['cancelled_amount']
+        row['total_order_amount'] = row.get('amazon_order_amount', 0)
+        if row.get('return_amount', 0) or row.get('cancelled_amount', 0):
+            row['total_order_amount'] = row.get('amazon_order_amount', 0) - row.get('return_amount', 0) - row.get('cancelled_amount', 0)
         data.append(row)
     return data
 
@@ -160,11 +167,6 @@ def get_invoice_amount(amazon_order_id=None, transaction_date=None):
     '''
         Method to get Total Invoiced amount with Amazon Order ID or Date
     '''
-    print("get_invoice_amount")
-    if amazon_order_id:
-        print("amazon_order_id : ", amazon_order_id)
-    if transaction_date:
-        print("transaction_date : ", transaction_date)
     total_invoice_amount = 0
     if transaction_date or amazon_order_id:
         query = '''
@@ -198,7 +200,6 @@ def get_total_returns(amazon_order_id=None, transaction_date=None):
     '''
         Method to get Total Returns and Cancelled amount with Amazon Order ID or Date
     '''
-    total_cancels = 0
     total_returns = 0
     if transaction_date or amazon_order_id:
         #Refunded Orders
