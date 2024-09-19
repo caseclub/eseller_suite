@@ -659,7 +659,8 @@ class AmazonRepository:
 			so.amazon_order_status = order.get("OrderStatus")
 			so.fulfillment_channel = order.get("FulfillmentChannel")
 			so.replaced_order_id = order.get("ReplacedOrderId") or ''
-			so.amazon_order_amount = order.get("OrderTotal", {}).get("Amount", 0)
+			if amazon_order_amount:
+				so.amazon_order_amount = amazon_order_amount
 			so.amazon_order_status = order.get("OrderStatus")
 			so.customer = customer_name
 			so.delivery_date = delivery_date if getdate(delivery_date) > getdate(transaction_date) else transaction_date
