@@ -39,9 +39,12 @@ class SalesOrderOverride(SalesOrder):
 
     def validate(self):
         self.custom_validate()
+        recall_order_prefixes = ['S']
         super(SalesOrderOverride, self).validate()
-        if self.amazon_order_status != 'Canceled' and not self.amazon_order_amount:
+        if self.amazon_order_status != 'Canceled' and not self.amazon_order_amount and self.amazon_order_id and self.amazon_order_id[0] not in recall_order_prefixes:
             self.amazon_order_amount = self.total
+        if self.amazon_order_id and self.amazon_order_id[0] in recall_order_prefixes:
+            self.amazon_order_amount =  0
 
     def on_submit(self):
         super(SalesOrderOverride, self).on_submit()
