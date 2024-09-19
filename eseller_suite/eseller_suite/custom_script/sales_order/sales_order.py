@@ -40,7 +40,7 @@ class SalesOrderOverride(SalesOrder):
     def validate(self):
         self.custom_validate()
         super(SalesOrderOverride, self).validate()
-        if self.amazon_order_status == 'Pending' and not self.amazon_order_amount:
+        if self.amazon_order_status != 'Canceled' and not self.amazon_order_amount:
             self.amazon_order_amount = self.total
 
     def on_submit(self):
