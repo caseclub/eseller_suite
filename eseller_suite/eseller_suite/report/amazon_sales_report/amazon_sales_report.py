@@ -148,18 +148,18 @@ def get_data(filters):
         'fulfillment_channel':filters.get("fulfillment_channel")
     }, as_dict=True)
     for row in results:
+        row['total_order_amount'] = row.get('amazon_order_amount', 0)
         if group_based_on == 'amazon_order_id':
             row['invoice_amount'] = get_invoice_amount(amazon_order_id=row.get(group_based_on))
             row['return_amount'] = get_total_returns(amazon_order_id=row.get(group_based_on))
             row['cancelled_amount'] = get_total_cancels(amazon_order_id=row.get(group_based_on))
+            if row.get('return_amount', 0) or row.get('cancelled_amount', 0):
+                row['total_order_amount'] = 0
         else:
             row['invoice_amount'] = get_invoice_amount(transaction_date=row.get(group_based_on))
             row['return_amount'] = get_total_returns(transaction_date=row.get(group_based_on))
             row['cancelled_amount'] = get_total_cancels(transaction_date=row.get(group_based_on))
         row['total_amount'] = row['order_amount'] - row['return_amount'] -  row['cancelled_amount']
-        row['total_order_amount'] = row.get('amazon_order_amount', 0)
-        if row.get('return_amount', 0) or row.get('cancelled_amount', 0):
-            row['total_order_amount'] = row.get('amazon_order_amount', 0) - row.get('return_amount', 0) - row.get('cancelled_amount', 0)
         data.append(row)
     return data
 
