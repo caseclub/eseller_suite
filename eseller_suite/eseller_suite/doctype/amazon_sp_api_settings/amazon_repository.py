@@ -325,9 +325,9 @@ class AmazonRepository:
 				if order_item.get("QuantityOrdered") >= 0:
 					item_amount = float(order_item.get("ItemPrice", {}).get("Amount", 0))
 					item_tax = float(order_item.get("ItemTax", {}).get("Amount", 0))
-					shipping_price = float(order_item.get("ShippingPrice", {}).get("Amount", 0))
-					shipping_discount = float(order_item.get("ShippingDiscount", {}).get("Amount", 0))
-					total_order_value = item_amount+item_tax+shipping_price-shipping_discount
+					# shipping_price = float(order_item.get("ShippingPrice", {}).get("Amount", 0))
+					# shipping_discount = float(order_item.get("ShippingDiscount", {}).get("Amount", 0))
+					total_order_value = item_amount+item_tax
 					item_qty = float(order_item.get("QuantityOrdered", 0))
 					# In case of Cancelled orders Qty will be 0, Invoice will not get created
 					if not item_qty:
