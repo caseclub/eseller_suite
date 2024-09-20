@@ -45,6 +45,8 @@ class SalesOrderOverride(SalesOrder):
             self.amazon_order_amount = self.total
         if self.amazon_order_id and self.amazon_order_id[0] in recall_order_prefixes:
             self.amazon_order_amount =  0
+        if self.amazon_order_status == 'Canceled' or self.replaced_order_id:
+            self.amazon_order_amount =  0
 
     def on_submit(self):
         super(SalesOrderOverride, self).on_submit()
