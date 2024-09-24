@@ -26,21 +26,31 @@ function handle_custom_buttons(frm) {
 }
 
 function add_payments(frm) {
-    frm.call('create_payments').then(r => {
-        if (r.message) {
-            if (r.message.length > 0) {
-                frappe.show_alert({
-                    message: __("Payment Entries Created: {0}", [
-                        r.message.map(function (d) {
-                            return repl(
-                                '<a href="/app/payment-entry/%(name)s">%(name)s</a>',
-                                { name: d }
-                            );
-                        }).join(", "),
-                    ]),
-                    indicator: "green",
-                });
-                frm.reload_doc();
+    frm.call({
+        method: "create_payments",
+        doc: frm.doc,
+        callback: function (r) {
+            if (r.message) {
+                if (r.message.length > 0) {
+                    frappe.show_alert({
+                        message: __("Payment Entries Created: {0}", [
+                            r.message.map(function (d) {
+                                return repl(
+                                    '<a href="/app/payment-entry/%(name)s">%(name)s</a>',
+                                    { name: d }
+                                );
+                            }).join(", "),
+                        ]),
+                        indicator: "green",
+                    });
+                    frm.reload_doc();
+                }
+                else {
+                    frappe.show_alert({
+                        message: __("Failed to Create Payments"),
+                        indicator: "red",
+                    });
+                }
             }
             else {
                 frappe.show_alert({
@@ -48,14 +58,10 @@ function add_payments(frm) {
                     indicator: "red",
                 });
             }
-        }
-        else {
-            frappe.show_alert({
-                message: __("Failed to Create Payments"),
-                indicator: "red",
-            });
-        }
-    })
+        },
+        freeze: true,
+        freeze_message: __('Creating Payment Entries...')
+    });
 }
 
 function add_journal_entries(frm) {
@@ -113,25 +119,36 @@ function add_journal_entry_popup(frm) {
 }
 
 function create_journal_entries(frm, values) {
-    frm.call('create_journal_entries', {
-        'credit_account': values.credit_account,
-        'debit_account': values.debit_account,
-        'transaction_type': values.transaction_type
-    }).then(r => {
-        if (r.message) {
-            if (r.message.length > 0) {
-                frappe.show_alert({
-                    message: __("Journal Entries Created: {0}", [
-                        r.message.map(function (d) {
-                            return repl(
-                                '<a href="/app/journal-entry/%(name)s">%(name)s</a>',
-                                { name: d }
-                            );
-                        }).join(", "),
-                    ]),
-                    indicator: "green",
-                });
-                frm.reload_doc();
+    frm.call({
+        method: "create_journal_entries",
+        doc: frm.doc,
+        args: {
+            'credit_account': values.credit_account,
+            'debit_account': values.debit_account,
+            'transaction_type': values.transaction_type,
+        },
+        callback: function (r) {
+            if (r.message) {
+                if (r.message.length > 0) {
+                    frappe.show_alert({
+                        message: __("Journal Entries Created: {0}", [
+                            r.message.map(function (d) {
+                                return repl(
+                                    '<a href="/app/journal-entry/%(name)s">%(name)s</a>',
+                                    { name: d }
+                                );
+                            }).join(", "),
+                        ]),
+                        indicator: "green",
+                    });
+                    frm.reload_doc();
+                }
+                else {
+                    frappe.show_alert({
+                        message: __("Failed to Create Journal Entries"),
+                        indicator: "red",
+                    });
+                }
             }
             else {
                 frappe.show_alert({
@@ -139,12 +156,8 @@ function create_journal_entries(frm, values) {
                     indicator: "red",
                 });
             }
-        }
-        else {
-            frappe.show_alert({
-                message: __("Failed to Create Journal Entries"),
-                indicator: "red",
-            });
-        }
-    })
+        },
+        freeze: true,
+        freeze_message: __('Creating Journal Entries...')
+    });
 }
