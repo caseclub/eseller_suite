@@ -44,11 +44,11 @@ class AmazonPaymentTool(Document):
 
 	def save_payment_details(self, row):
 		key_mapping = {
-        '\ufeff"Date"': "date",
-        'Transaction type': "transaction_type",
-        'Order ID': "order_id",
-        'Total (INR)': "total"
-        }
+		'\ufeff"Date"': "date",
+		'Transaction type': "transaction_type",
+		'Order ID': "order_id",
+		'Total (INR)': "total"
+		}
 		payment_detail = {}
 		for csv_key, internal_key in key_mapping.items():
 			value = row.get(csv_key)
@@ -57,17 +57,17 @@ class AmazonPaymentTool(Document):
 			payment_detail[internal_key] = value
 
 		if not any(
-            pd.transaction_type == payment_detail["transaction_type"] and
-            pd.order_id == payment_detail["order_id"]
-            for pd in self.payment_details
-        ):
+			pd.transaction_type == payment_detail["transaction_type"] and
+			pd.order_id == payment_detail["order_id"]
+			for pd in self.payment_details
+		):
 			if payment_detail.get('transaction_type'):
 				self.append("payment_details", payment_detail)
 
 	@frappe.whitelist()
 	def create_payments(self):
 		'''
-            Method to Mark Payments against each Order IDs
+			Method to Mark Payments against each Order IDs
 		'''
 		# Setting flag started as 1
 		if not self.started:
@@ -83,7 +83,7 @@ class AmazonPaymentTool(Document):
 	@frappe.whitelist()
 	def create_journal_entries(self, credit_account, debit_account, transaction_type):
 		'''
-            Method to Mark Payments against each Order IDs
+			Method to Mark Payments against each Order IDs
 		'''
 		# Setting flag started as 1
 		if not self.started:
@@ -98,7 +98,7 @@ class AmazonPaymentTool(Document):
 
 	def get_total_based_on_transaction_type(self, transaction_type):
 		'''
-            Method to get total amount based on transaction type
+			Method to get total amount based on transaction type
 		'''
 		total_amount = 0
 		for row in self.payment_details:
@@ -108,7 +108,7 @@ class AmazonPaymentTool(Document):
 
 def create_payment_against_order_id(row_id):
 	'''
-        Method to create payment entry against Order ID
+		Method to create payment entry against Order ID
 	'''
 	order_id, amount, date = frappe.db.get_value('Amazon Payment Tool Item', row_id, fieldname=['order_id', 'total', 'date'])
 	posting_date = getdate(date)
@@ -140,12 +140,46 @@ def create_payment_against_order_id(row_id):
 		pay_doc.submit()
 		frappe.db.set_value('Amazon Payment Tool Item', row_id, 'payment_created', 1)
 		frappe.db.set_value('Amazon Payment Tool Item', row_id, 'payment_entry', pay_doc.name)
+		try:
+			if pay_doc.payment_type == 'Receive':
+				party_account = pay_doc.paid_from
+			else:
+				party_account = pay_doc.paid_to
+			reconsile_doc = frappe.get_doc('Payment Reconciliation', 'Payment Reconciliation')
+			reconsile_doc.party_type = 'Customer'
+			reconsile_doc.party = customer
+			reconsile_doc.company = pay_doc.company
+			reconsile_doc.receivable_payable_account = party_account
+			reconsile_doc.get_unreconciled_entries()
+			invoices = []
+			for invoice in reconsile_doc.invoices:
+				invoices.append(invoice.as_dict())
+			payments = []
+			for payment in reconsile_doc.payments:
+				payments.append(payment.as_dict())
+			if payments and invoices:
+				args = { 'invoices':invoices, 'payments':payments }
+				reconsile_doc.allocate_entries(args=args)
+				reconsile_doc.reconcile()
+			else:
+				apr_log = frappe.new_doc('APR Log')
+				apr_log.amazon_order_id = order_id
+				apr_log.customer = customer
+				apr_log.payment_entry = pay_doc.name
+				apr_log.save(ignore_permissions=True)
+		except Exception as exception:
+			apr_log = frappe.new_doc('APR Log')
+			apr_log.amazon_order_id = order_id
+			apr_log.customer = customer
+			apr_log.payment_entry = pay_doc.name
+			apr_log.save(ignore_permissions=True)
+			frappe.log_error(frappe.get_traceback())
 		return pay_doc.name
 	return None
 
 def create_journal_entry(row_id, credit_account, debit_account):
 	'''
-        Method to create Journal Entry against payment details table row
+		Method to create Journal Entry against payment details table row
 	'''
 	amount, date = frappe.db.get_value('Amazon Payment Tool Item', row_id, fieldname=['total', 'date'])
 	posting_date = getdate(date)
@@ -159,12 +193,12 @@ def create_journal_entry(row_id, credit_account, debit_account):
 	jv_doc.append('accounts', {
 		'account': credit_account,
 		'credit_in_account_currency': payment_amount
-    })
+	})
 	#Debit Row
 	jv_doc.append('accounts', {
 		'account': debit_account,
 		'debit_in_account_currency': payment_amount
-    })
+	})
 	jv_doc.save(ignore_permissions=True)
 	jv_doc.submit()
 	frappe.db.set_value('Amazon Payment Tool Item', row_id, 'payment_created', 1)
