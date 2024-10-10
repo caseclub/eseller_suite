@@ -1,0 +1,138 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2024-09-13 12:09:18.384106",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "date",
+  "transaction_type",
+  "product_details",
+  "column_break_mcrh",
+  "order_id",
+  "total",
+  "ready_to_process",
+  "more_informations_section",
+  "customer",
+  "sales_invoice",
+  "jv_reference",
+  "column_break_dmbb",
+  "amazon_service_type",
+  "amazon_expense_account"
+ ],
+ "fields": [
+  {
+   "columns": 2,
+   "fieldname": "date",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Date",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "columns": 3,
+   "fieldname": "order_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Order ID",
+   "read_only": 1
+  },
+  {
+   "columns": 2,
+   "fieldname": "total",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Total (INR)",
+   "read_only": 1
+  },
+  {
+   "columns": 2,
+   "fieldname": "transaction_type",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Transaction Type",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_mcrh",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "product_details",
+   "fieldtype": "Data",
+   "label": "Product Details",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "amazon_service_type",
+   "fieldtype": "Link",
+   "label": "Amazon Service Type",
+   "options": "Amazon Service Type",
+   "read_only": 1
+  },
+  {
+   "fieldname": "more_informations_section",
+   "fieldtype": "Section Break",
+   "label": "More Informations"
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "options": "Customer",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "sales_invoice",
+   "fieldtype": "Link",
+   "label": "Sales Invoice",
+   "options": "Sales Invoice",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_dmbb",
+   "fieldtype": "Column Break"
+  },
+  {
+   "allow_on_submit": 1,
+   "fetch_from": "amazon_service_type.expense_account",
+   "fetch_if_empty": 1,
+   "fieldname": "amazon_expense_account",
+   "fieldtype": "Link",
+   "label": "Amazon Expense Account",
+   "options": "Account",
+   "read_only": 1
+  },
+  {
+   "fieldname": "jv_reference",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "JV Reference",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "ready_to_process",
+   "fieldtype": "Check",
+   "label": "Ready to Process",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2024-10-10 14:16:18.263010",
+ "modified_by": "Administrator",
+ "module": "eSeller Suite",
+ "name": "Amazon Payment Entry Item",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
