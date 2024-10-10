@@ -74,9 +74,9 @@
   {
    "hidden": 0,
    "is_query_report": 0,
-   "label": "Amazon Payment Tool",
+   "label": "Amazon Payment Entry",
    "link_count": 0,
-   "link_to": "Amazon Payment Tool",
+   "link_to": "Amazon Payment Entry",
    "link_type": "DocType",
    "onboard": 0,
    "type": "Link"
@@ -102,7 +102,7 @@
    "type": "Link"
   }
  ],
- "modified": "2024-09-16 09:10:40.325549",
+ "modified": "2024-10-10 11:32:37.538713",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Suite",
@@ -114,6 +114,9 @@
  "roles": [
   {
    "role": "Sales User"
+  },
+  {
+   "role": "Non Designated Partner"
   }
  ],
  "sequence_id": 2.0,
