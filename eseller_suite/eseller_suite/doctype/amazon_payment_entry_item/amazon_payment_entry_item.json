@@ -16,7 +16,8 @@
   "more_informations_section",
   "customer",
   "sales_invoice",
-  "jv_reference",
+  "return_sales_invoice",
+  "journal_entry",
   "column_break_dmbb",
   "amazon_service_type",
   "amazon_expense_account"
@@ -109,24 +110,33 @@
    "read_only": 1
   },
   {
-   "fieldname": "jv_reference",
-   "fieldtype": "Data",
-   "hidden": 1,
-   "label": "JV Reference",
-   "read_only": 1
-  },
-  {
    "default": "0",
    "fieldname": "ready_to_process",
    "fieldtype": "Check",
    "label": "Ready to Process",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "return_sales_invoice",
+   "fieldtype": "Link",
+   "label": "Return Sales Invoice",
+   "options": "Sales Invoice",
+   "read_only": 1
+  },
+  {
+   "allow_on_submit": 1,
+   "fieldname": "journal_entry",
+   "fieldtype": "Link",
+   "label": "Journal Entry",
+   "options": "Journal Entry",
    "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2024-10-10 14:16:18.263010",
+ "modified": "2024-10-28 14:55:11.100698",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Entry Item",

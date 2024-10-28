@@ -1,6 +1,6 @@
 {
  "charts": [],
- "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}},{\"id\":\"5y4xZn1tIg\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Order\",\"col\":3}},{\"id\":\"YIlOhiTT0O\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Invoice\",\"col\":3}},{\"id\":\"-_4uhpK2Ay\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"hNZ7vc1_KH\",\"type\":\"card\",\"data\":{\"card_name\":\"Tools\",\"col\":4}},{\"id\":\"v-nDIgvSfq\",\"type\":\"card\",\"data\":{\"card_name\":\"Reports\",\"col\":4}}]",
+ "content": "[{\"id\":\"YeQg3DXhTl\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\">eSeller Suite</span>\",\"col\":12}},{\"id\":\"56KcdtySH_\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"eSeller Settings\",\"col\":3}},{\"id\":\"BK-u5DBlc8\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon SP API Settings\",\"col\":3}},{\"id\":\"JBorTkeOWz\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Failed Sync Record\",\"col\":3}},{\"id\":\"y4No0yohmf\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Amazon Service Type\",\"col\":3}},{\"id\":\"5y4xZn1tIg\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Order\",\"col\":3}},{\"id\":\"YIlOhiTT0O\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Sales Invoice\",\"col\":3}},{\"id\":\"-_4uhpK2Ay\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"hNZ7vc1_KH\",\"type\":\"card\",\"data\":{\"card_name\":\"Tools\",\"col\":4}},{\"id\":\"v-nDIgvSfq\",\"type\":\"card\",\"data\":{\"card_name\":\"Reports\",\"col\":4}}]",
  "creation": "2024-05-27 13:20:31.068773",
  "custom_blocks": [],
  "docstatus": 0,
@@ -102,7 +102,7 @@
    "type": "Link"
   }
  ],
- "modified": "2024-10-10 11:32:37.538713",
+ "modified": "2024-10-14 15:15:08.147196",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Suite",
@@ -121,6 +121,14 @@
  ],
  "sequence_id": 2.0,
  "shortcuts": [
+  {
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "Amazon Service Type",
+   "link_to": "Amazon Service Type",
+   "stats_filter": "[]",
+   "type": "DocType"
+  },
   {
    "color": "Grey",
    "doc_view": "List",

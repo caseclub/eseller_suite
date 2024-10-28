@@ -7,13 +7,14 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
+  "payment_file",
   "mode_of_payment",
   "payment_account",
-  "payment_file",
   "column_break_isbj",
   "posting_date",
   "company",
   "default_receivable_account",
+  "amazon_reserve_fund_account",
   "payment_details_section",
   "payment_details",
   "amended_from"
@@ -91,12 +92,25 @@
    "label": "Default Receivable Account",
    "options": "Account",
    "read_only": 1
+  },
+  {
+   "fieldname": "amazon_reserve_fund_account",
+   "fieldtype": "Link",
+   "hidden": 1,
+   "label": "Amazon Reserve Fund Account",
+   "options": "Account",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
- "links": [],
- "modified": "2024-10-10 14:12:13.685874",
+ "links": [
+  {
+   "link_doctype": "Journal Entry",
+   "link_fieldname": "cheque_no"
+  }
+ ],
+ "modified": "2024-10-28 15:55:14.138035",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Entry",
