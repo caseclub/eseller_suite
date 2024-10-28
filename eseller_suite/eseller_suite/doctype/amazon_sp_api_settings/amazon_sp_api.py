@@ -69,7 +69,6 @@ class SPAPIError(Exception):
 		self.error_description = kwargs.get("error_description", "-")
 		super().__init__(*args)
 
-
 class SPAPI(object):
 	""" Base Amazon SP-API class """
 
@@ -135,7 +134,6 @@ class SPAPI(object):
 			for idx in range(len(values)):
 				data[f"{key}[{idx}]"] = values[idx]
 
-
 class Finances(SPAPI):
 	""" Amazon Finances API """
 
@@ -148,8 +146,6 @@ class Finances(SPAPI):
 		append_to_base_uri = f"orders/{order_id}/financialEvents"
 		data = dict(MaxResultsPerPage=max_results, NextToken=next_token)
 		return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
-
-
 class Orders(SPAPI):
 	""" Amazon Orders API """
 
@@ -212,6 +208,10 @@ class Orders(SPAPI):
 		data = dict(NextToken=next_token)
 		return self.make_request(append_to_base_uri=append_to_base_uri, params=data)
 
+	def get_order(self, order_id: str) -> dict:
+		""" Method to get a Particular Order """
+		append_to_base_uri = f"/{order_id}"
+		return self.make_request(append_to_base_uri=append_to_base_uri)
 
 class CatalogItems(SPAPI):
 	""" Amazon Catalog Items API """

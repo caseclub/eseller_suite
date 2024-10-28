@@ -6,6 +6,7 @@
  "engine": "InnoDB",
  "field_order": [
   "amazon_order_id",
+  "replaced_order_id",
   "amazon_order_amount",
   "grand_total",
   "column_break_bmhr",
@@ -13,7 +14,11 @@
   "posting_date",
   "remarks",
   "section_break_vjkz",
-  "payload"
+  "payload",
+  "references_section",
+  "replaced_so",
+  "column_break_jcoe",
+  "replaced_jv"
  ],
  "fields": [
   {
@@ -64,12 +69,39 @@
    "fieldname": "amazon_order_date",
    "fieldtype": "Date",
    "label": "Amazon Order Date"
+  },
+  {
+   "fieldname": "replaced_order_id",
+   "fieldtype": "Data",
+   "label": "Replaced Order ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "references_section",
+   "fieldtype": "Section Break",
+   "label": "References"
+  },
+  {
+   "fieldname": "replaced_so",
+   "fieldtype": "Link",
+   "label": "Replaced SO",
+   "options": "Sales Order"
+  },
+  {
+   "fieldname": "replaced_jv",
+   "fieldtype": "Link",
+   "label": "Replaced JV",
+   "options": "Journal Entry"
+  },
+  {
+   "fieldname": "column_break_jcoe",
+   "fieldtype": "Column Break"
   }
  ],
  "in_create": 1,
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-09-12 12:06:21.923152",
+ "modified": "2024-10-25 15:16:20.498254",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Failed Sync Record",
