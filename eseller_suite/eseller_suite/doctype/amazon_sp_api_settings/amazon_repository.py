@@ -111,6 +111,7 @@ class AmazonRepository:
 			next_token = financial_events_payload.get("NextToken")
 			principal_amounts = {}
 			promotion_discount = 0
+			seller_sku = ''
 			for shipment_event in shipment_event_list:
 				if shipment_event:
 					for shipment_item in shipment_event.get("ShipmentItemList", []):
