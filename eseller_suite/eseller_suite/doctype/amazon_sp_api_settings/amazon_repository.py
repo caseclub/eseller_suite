@@ -471,6 +471,7 @@ class AmazonRepository:
 
 				charges_and_fees = {"posting_date": "", "items":[], "charges": [], "fees": [], "tds":[], "amazon_order_amount":amazon_order_amount, "order_date":order_date}
 
+				seller_sku = ''
 				for refund_event in refund_event_list:
 					if refund_event:
 						charges_and_fees["posting_date"] = foramt_date_time_to_ist(refund_event.get("PostedDate"))
