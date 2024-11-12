@@ -22,6 +22,7 @@ class AmazonPaymentEntry(Document):
 				frappe.throw('Please configure the `Default Amazon Customer` in {0}'.format(get_link_to_form('eSeller Settings', 'eSeller Settings')))
 
 	def on_submit(self):
+		frappe.db.set_value(self.doctype, self.name, 'in_progress', 1)
 		self.create_journal_entry()
 
 	def process_payment_data(self):
@@ -125,6 +126,13 @@ class AmazonPaymentEntry(Document):
 							row.journal_entry = replaced_jv
 							row.ready_to_process = 1
 							has_changes = True
+				if row.transaction_type == 'Other' and row.product_details == 'FBA Inventory Reimbursement' and row.order_id == '---':
+					if float(row.total) < 0:
+						inventory_reimbursement_account = frappe.db.get_single_value('eSeller Settings', 'inventory_reimbursement_account')
+						if inventory_reimbursement_account:
+							row.ready_to_process = 1
+							row.amazon_expense_account = inventory_reimbursement_account
+							has_changes = True
 		if has_changes:
 			self.save()
 		return 1
@@ -134,7 +142,6 @@ class AmazonPaymentEntry(Document):
 		'''
 			Method to create Journal Entry against payment details table row
 		'''
-		# credit_types = ["Refund", "Fulfillment Fee Refund", "Order Payment", "Previous statement's unavailable balance"]
 		jv_doc = frappe.new_doc('Journal Entry')
 		jv_doc.voucher_type = 'Journal Entry'
 		jv_doc.posting_date = self.posting_date
@@ -172,7 +179,10 @@ class AmazonPaymentEntry(Document):
 					jv_row.reference_type = ''
 					jv_row.reference_name = ''
 				if row.amazon_expense_account:
-					jv_row.user_remark = row.amazon_service_type
+					if row.amazon_service_type:
+						jv_row.user_remark = row.amazon_service_type
+					else:
+						jv_row.user_remark = row.product_details
 					jv_row.account = row.amazon_expense_account
 
 				if float(row.total) > 0:
@@ -193,13 +203,14 @@ class AmazonPaymentEntry(Document):
 			jv_row.debit = abs(difference_amount)
 			jv_row.debit_in_account_currency = abs(difference_amount)
 		jv_doc.flags.ignore_mandatory = True
-		# jv_doc.flags.ignore_validate = True
 		jv_doc.save(ignore_permissions=True)
 		jv_doc.submit()
 		frappe.msgprint('Journal Entry Created: <a href="{0}">{1}</a>'.format(get_url_to_form(jv_doc.doctype, jv_doc.name), jv_doc.name), alert=True, indicator='green')
 
 	@frappe.whitelist()
 	def get_missing_sales_orders(self):
+		frappe.db.set_value(self.doctype, self.name, 'in_progress', 1)
+		frappe.db.commit()
 		if frappe.db.exists('Amazon SP API Settings', { 'is_active':1 }):
 			amz_setting_name = frappe.db.get_value('Amazon SP API Settings', { 'is_active':1 })
 			max_invoice_count = frappe.db.get_single_value('eSeller Settings', 'max_invoice_count') or 25
@@ -214,6 +225,7 @@ class AmazonPaymentEntry(Document):
 						get_order(amz_setting_name=amz_setting_name, amazon_order_ids=row.order_id)
 					except Exception as e:
 						print(e)
+		frappe.db.set_value(self.doctype, self.name, 'in_progress', 0)
 
 def get_invoice_details(amazon_order_id, is_return=0):
 	'''

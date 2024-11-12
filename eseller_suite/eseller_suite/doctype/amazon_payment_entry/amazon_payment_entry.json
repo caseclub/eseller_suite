@@ -10,6 +10,7 @@
   "payment_file",
   "mode_of_payment",
   "payment_account",
+  "in_progress",
   "column_break_isbj",
   "posting_date",
   "company",
@@ -100,6 +101,14 @@
    "label": "Amazon Reserve Fund Account",
    "options": "Account",
    "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "in_progress",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "In Progress",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
@@ -110,7 +119,7 @@
    "link_fieldname": "cheque_no"
   }
  ],
- "modified": "2024-10-28 15:55:14.138035",
+ "modified": "2024-11-12 11:38:43.448822",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Entry",

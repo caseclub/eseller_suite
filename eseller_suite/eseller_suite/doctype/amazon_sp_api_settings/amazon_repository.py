@@ -655,36 +655,13 @@ class AmazonRepository:
 					return_si.update_billed_amount_in_sales_order = 1
 					return_si.insert(ignore_permissions=True)
 					return_si.submit()
-					frappe.db.commit()
+					# frappe.db.commit()
 
 			return so_id
 
 		else:
 			if so_docstatus and so_id:
 				return so_id
-			#Commenting to Create invoice from Return Data instead of creating log
-			# if not so_id and refunds:
-				# for refund in refunds:
-					# grand_total = 0
-					# failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
-					# failed_sync_record.amazon_order_id = order_id
-					# failed_sync_record.remarks = 'Failed to create Sales Order for Order ID : {0}. It has refund events in it.'.format(order_id)
-					# failed_sync_record.payload = refund
-					# if refund.get("posting_date"):
-					# 	failed_sync_record.posting_date = dateutil.parser.parse(refund.get("posting_date")).strftime("%Y-%m-%d")
-					# if refund.get("items", []):
-					# 	for row in refund.get("items", []):
-					# 		grand_total += float(row.get("amount", 0))
-					# if refund.get("charges", []):
-					# 	for row in refund.get("charges", []):
-					# 		grand_total += float(row.get("tax_amount", 0))
-					# if refund.get("order_date"):
-					# 	failed_sync_record.amazon_order_date = dateutil.parser.parse(refund.get("order_date")).strftime("%Y-%m-%d")
-					# if refund.get("amazon_order_amount"):
-					# 	failed_sync_record.amazon_order_amount = refund.get("amazon_order_amount")
-					# failed_sync_record.grand_total = grand_total
-					# failed_sync_record.save(ignore_permissions=True)
-				# return
 			if not so_id:
 				so = frappe.new_doc("Sales Order")
 			else:
@@ -731,16 +708,18 @@ class AmazonRepository:
 					if so.grand_total>=0:
 						so.save(ignore_permissions=True)
 					else:
+						remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 						failed_sync_record.amazon_order_id = order_id
-						failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
+						failed_sync_record.remarks = remarks
 						failed_sync_record.payload = so.as_dict()
 						failed_sync_record.replaced_order_id = so.replaced_order_id
 						failed_sync_record.posting_date = so.transaction_date
 						failed_sync_record.amazon_order_date = so.transaction_date
 						failed_sync_record.grand_total = so.grand_total
 						failed_sync_record.amazon_order_amount = so.amazon_order_amount
-						failed_sync_record.save(ignore_permissions=True)
+						if not frappe.db.exists('Amazon Failed Sync Record', { 'amazon_order_id':order_id, 'remarks':remarks, 'grand_total':so.grand_total }):
+							failed_sync_record.save(ignore_permissions=True)
 					return
 
 			so.items = []
@@ -807,11 +786,12 @@ class AmazonRepository:
 
 				if order.get("OrderStatus") in order_statuses:
 					so.submit()
-					frappe.db.commit()
+					# frappe.db.commit()
 			else:
+				remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 				failed_sync_record.amazon_order_id = order_id
-				failed_sync_record.remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
+				failed_sync_record.remarks = remarks
 				failed_sync_record.replaced_order_id = so.replaced_order_id
 				failed_sync_record.posting_date = so.transaction_date
 				failed_sync_record.amazon_order_date = so.transaction_date
@@ -819,7 +799,8 @@ class AmazonRepository:
 				failed_sync_record.amazon_order_amount = so.amazon_order_amount
 				if not so_id:
 					failed_sync_record.payload = so.as_dict()
-				failed_sync_record.save(ignore_permissions=True)
+				if not frappe.db.exists('Amazon Failed Sync Record', { 'amazon_order_id':order_id, 'grand_total':so.grand_total, 'remarks':remarks }):
+					failed_sync_record.save(ignore_permissions=True)
 
 			return so.name
 
