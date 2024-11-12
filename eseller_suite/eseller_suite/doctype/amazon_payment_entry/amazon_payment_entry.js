@@ -10,14 +10,27 @@ frappe.ui.form.on("Amazon Payment Entry", {
         }
     },
     refresh(frm) {
-        if (!frm.is_new() && frm.doc.docstatus === 0) {
+        if (frm.doc.in_progress) {
+            frm.set_intro('Background syncing is in progress, Please wait and reload again', 'orange');
+            frm.disable_form();
+            frm.disable_save();
+        }
+        if (!frm.is_new() && frm.doc.docstatus === 0 && frm.doc.in_progress === 0) {
             handle_custom_buttons(frm);
         }
         frappe.realtime.on("fetch_invoice_details", (data) => {
-            frappe.show_progress('Fetching Invoice Details...', data.progress, data.total, __("Fetching {0} of {1} invoices", [data.progress, data.total]));
+            frappe.hide_msgprint(true);
+            frappe.show_progress('Fetching Invoice Details...', data.progress, data.total, __("Fetching {0} of {1} invoices", [data.progress, data.total]), true);
+            if (data.progress === data.total) {
+                frm.reload_doc();
+            }
         });
         frappe.realtime.on("get_missing_sales_orders", (data) => {
-            frappe.show_progress('Syncing Sales Order..', data.progress, data.total, __("Fetching {0} of {1} invoices", [data.progress, data.total]));
+            frappe.hide_msgprint(true);
+            frappe.show_progress('Syncing Sales Order..', data.progress, data.total, __("Fetching {0} of {1} invoices", [data.progress, data.total]), true);
+            if (data.progress === data.total) {
+                frm.reload_doc();
+            }
         });
     },
     mode_of_payment(frm) {
@@ -89,6 +102,7 @@ function fetch_invoice_details(frm) {
 }
 
 function get_missing_sales_orders(frm) {
+    frm.set_value('in_progress', 1);
     frm.call({
         method: "get_missing_sales_orders",
         doc: frm.doc,
@@ -101,6 +115,7 @@ function get_missing_sales_orders(frm) {
                     indicator: 'green'
                 }, 5);
             }
+            frm.reload_doc();
         }
     });
 }

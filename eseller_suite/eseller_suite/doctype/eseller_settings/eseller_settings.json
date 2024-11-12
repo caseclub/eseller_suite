@@ -11,6 +11,7 @@
   "default_amazon_customer",
   "column_break_lzak",
   "amazon_reserve_fund",
+  "inventory_reimbursement_account",
   "default_pos_profile",
   "flipkart_defaults_section",
   "default_flipkart_customer",
@@ -81,7 +82,7 @@
    "fieldname": "amazon_reserve_fund",
    "fieldtype": "Link",
    "in_list_view": 1,
-   "label": "Amazon Reserve Fund",
+   "label": "Amazon Reserve Fund Account",
    "options": "Account",
    "reqd": 1
   },
@@ -90,14 +91,24 @@
    "description": "Maximum count of Sales Invoices that will fetch from Payment",
    "fieldname": "max_invoice_count",
    "fieldtype": "Int",
-   "label": "Max Invoice Count"
+   "label": "Max Invoice Count",
+   "non_negative": 1,
+   "reqd": 1
+  },
+  {
+   "description": "This account will be used for FBA Inventory Reimbursement Charges",
+   "fieldname": "inventory_reimbursement_account",
+   "fieldtype": "Link",
+   "label": "Inventory Reimbursement Account",
+   "options": "Account",
+   "reqd": 1
   }
  ],
  "hide_toolbar": 1,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2024-10-28 10:53:11.963299",
+ "modified": "2024-11-07 11:04:08.789659",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Settings",
