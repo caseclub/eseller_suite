@@ -334,9 +334,13 @@ class AmazonRepository:
 					if not item_qty:
 						item_qty = 1
 					item_rate = item_amount/item_qty
+					item_code = self.get_item_code(order_item)
+					actual_item = frappe.db.get_value("Item", item_code, "actual_item")
+					if actual_item:
+						item_code = actual_item
 					final_order_items.append(
 						{
-							"item_code": self.get_item_code(order_item),
+							"item_code": item_code,
 							"item_name": order_item.get("SellerSKU"),
 							"description": order_item.get("Title"),
 							"rate": item_rate,
@@ -603,7 +607,7 @@ class AmazonRepository:
 				if not frappe.db.exists("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0 }):
 					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 					failed_sync_record.amazon_order_id = order_id
-					failed_sync_record.remarks = 'Failed to create return Sales Invoice, Not able to find any Sales Invoice with this Amazon Order ID. Sales Order ID : {0}'.format(so)
+					failed_sync_record.remarks = 'Failed to create return Sales Invoice, Not able to find any Sales Invoice with this Amazon Order ID. Sales Order ID : {0}'.format(so_id)
 					failed_sync_record.payload = refund
 					if refund.get("posting_date"):
 						failed_sync_record.posting_date = dateutil.parser.parse(refund.get("posting_date")).strftime("%Y-%m-%d")

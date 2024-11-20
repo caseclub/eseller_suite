@@ -60,6 +60,13 @@ def get_item_custom_fields():
 				"unique": 1,
 				"read_only": 1,
 				"no_copy": 1
+			},
+			{
+				"fieldname": "actual_item",
+				"fieldtype": "Link",
+				"options": "Item",
+				"label": "Actual Item",
+				"insert_after": "item_name",
 			}
 		]
 	}
