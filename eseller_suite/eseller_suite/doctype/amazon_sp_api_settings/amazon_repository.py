@@ -368,13 +368,7 @@ class AmazonRepository:
 
 	def create_sales_order(self, order) -> str | None:
 		def create_customer(order) -> str:
-			order_customer_name = ""
-			buyer_info = order.get("BuyerInfo")
-
-			if buyer_info and buyer_info.get("BuyerEmail"):
-				order_customer_name = buyer_info.get("BuyerEmail")
-			else:
-				order_customer_name = f"Buyer - {order.get('AmazonOrderId')}"
+			order_customer_name = order.get('AmazonOrderId', "")
 
 			existing_customer_name = frappe.db.get_value(
 				"Customer", filters={"name": order_customer_name}, fieldname="name"
