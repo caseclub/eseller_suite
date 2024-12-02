@@ -2,12 +2,12 @@
 # For license information, please see license.txt
 
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import add_days, today, getdate
+from frappe.utils import add_days, getdate, now_datetime, today
 
 
 class AmazonSPAPISettings(Document):
@@ -60,15 +60,25 @@ class AmazonSPAPISettings(Document):
 			frappe.msgprint(
 				_("Please enable the Amazon SP API Settings {0}.").format(frappe.bold(self.name))
 			)
- 
+
 
 # Called via a hook in every hour.
 def schedule_get_order_details():
+	current_datetime = now_datetime()
+
+	yesterday_23 = (current_datetime - timedelta(days=1)).replace(
+		hour=23, minute=0, second=0, microsecond=0
+	)
+	today_01 = current_datetime.replace(hour=1, minute=0, second=0, microsecond=0)
+
+	if yesterday_23 <= current_datetime < today_01: # Makes it so that the hourly scheduler won't work at midnight and the daily one will
+		return
+
 	from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import (
 		get_orders,
 	)
-	current_date = getdate().strftime( "%Y-%m-%d")
-	# next_date = add_days(getdate(), 1).strftime( "%Y-%m-%d")
+
+	current_date = getdate().strftime("%Y-%m-%d")
 
 	amz_settings = frappe.get_all(
 		"Amazon SP API Settings",
@@ -78,3 +88,21 @@ def schedule_get_order_details():
 
 	for amz_setting in amz_settings:
 		get_orders(amz_setting_name=amz_setting.name, last_updated_after=current_date)
+
+
+# Called via a hook every day to sync data of the previous day.
+def schedule_get_order_details_daily():
+	from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import (
+		get_orders,
+	)
+
+	from_date = add_days(getdate(), -1).strftime("%Y-%m-%d")
+
+	amz_settings = frappe.get_all(
+		"Amazon SP API Settings",
+		filters={"is_active": 1, "enable_sync": 1},
+		fields=["name"],
+	)
+
+	for amz_setting in amz_settings:
+		get_orders(amz_setting_name=amz_setting.name, last_updated_after=from_date)

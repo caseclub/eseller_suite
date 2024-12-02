@@ -314,6 +314,9 @@ class AmazonRepository:
 		order_items_payload = self.call_sp_api_method(
 			sp_api_method=orders.get_order_items, order_id=order_id
 		)
+  
+		if not order_items_payload:
+			return []
 
 		final_order_items = []
 		warehouse = self.amz_setting.warehouse
@@ -418,14 +421,17 @@ class AmazonRepository:
 				make_address.address_line1 = shipping_address.get("AddressLine1", "Not Provided")
 				make_address.city = shipping_address.get("City", "Not Provided")
 				amazon_state = shipping_address.get("StateOrRegion")
-				if frappe.db.exists("Amazon State Mapping", {"amazon_state": amazon_state}):
-					make_address.state = frappe.db.get_value("Amazon State Mapping", {"amazon_state": amazon_state}, "state")
+				if frappe.db.get_single_value("Amazon SP API Settings", "map_state_data"):
+					if frappe.db.exists("Amazon State Mapping", {"amazon_state": amazon_state}):
+						make_address.state = frappe.db.get_value("Amazon State Mapping", {"amazon_state": amazon_state}, "state")
+					else:
+						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+						failed_sync_record.amazon_order_id = order_id
+						failed_sync_record.remarks = 'No State Mapping found for {0}'.format(amazon_state)
+						failed_sync_record.save(ignore_permissions=True)
+						return
 				else:
-					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
-					failed_sync_record.amazon_order_id = order_id
-					failed_sync_record.remarks = 'No State Mapping found for {0}'.format(amazon_state)
-					failed_sync_record.save(ignore_permissions=True)
-					return
+					make_address.state = amazon_state
 				make_address.pincode = shipping_address.get("PostalCode")
 
 				filters = [
