@@ -143,7 +143,7 @@ scheduler_events = {
 # 	"all": [
 # 		"eseller_suite.tasks.all"
 # 	],
-	"daily": [
+	"daily_long": [
 		"eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.schedule_get_order_details_daily"
 	],
 	"hourly": [
