@@ -32,7 +32,8 @@
   "enable_sync",
   "max_retry_limit",
   "create_item_if_not_exists",
-  "is_old_data_migrated"
+  "is_old_data_migrated",
+  "map_state_data"
  ],
  "fields": [
   {
@@ -221,10 +222,16 @@
    "fieldname": "sync_selected_date_only",
    "fieldtype": "Check",
    "label": "Sync Selected Date Only"
+  },
+  {
+   "default": "0",
+   "fieldname": "map_state_data",
+   "fieldtype": "Check",
+   "label": "Map State Data"
   }
  ],
  "links": [],
- "modified": "2024-09-11 12:29:18.795711",
+ "modified": "2024-12-02 16:12:58.741537",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon SP API Settings",
