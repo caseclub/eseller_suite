@@ -8,6 +8,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.utils import add_days, getdate, now_datetime, today
+import pytz
 
 
 class AmazonSPAPISettings(Document):
@@ -78,7 +79,14 @@ def schedule_get_order_details():
 		get_orders,
 	)
 
-	current_date = getdate().strftime("%Y-%m-%d")
+	system_timezone = frappe.db.get_single_value("System Settings", "time_zone")
+
+	local_tz = pytz.timezone(system_timezone)
+	gmt_tz = pytz.timezone("GMT")
+
+	local_datetime = local_tz.localize(current_datetime)
+	gmt_datetime = local_datetime.astimezone(gmt_tz)
+	current_date = gmt_datetime.strftime("%Y-%m-%d")
 
 	amz_settings = frappe.get_all(
 		"Amazon SP API Settings",
