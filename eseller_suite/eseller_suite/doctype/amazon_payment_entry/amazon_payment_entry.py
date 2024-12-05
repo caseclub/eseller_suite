@@ -9,6 +9,7 @@ from datetime import datetime
 from frappe.model.document import Document
 from frappe.utils import get_link_to_form, get_url_to_form
 from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import get_order
+from charset_normalizer import from_path
 
 class AmazonPaymentEntry(Document):
 	def validate(self):
@@ -40,10 +41,16 @@ class AmazonPaymentEntry(Document):
 			self.payment_details = []
 
 	def process_csv(self, file_path):
-		with open(file_path, "r") as file:
-			csv_reader = csv.DictReader(file)
-			for row in csv_reader:
-				self.save_payment_details(row)
+		try:
+			detected = from_path(file_path).best()
+			encoding = detected.encoding
+
+			with open(file_path, "r", encoding=encoding) as file:
+				csv_reader = csv.DictReader(file)
+				for row in csv_reader:
+					self.save_payment_details(row)
+		except Exception as e:
+			frappe.throw("Error Processing the file: {0}".format(e))
 
 	def parse_date(self, date_str):
 		try:
