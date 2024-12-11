@@ -635,7 +635,22 @@ class AmazonRepository:
 				return_si.return_against = si
 				return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
 				for item in refund.get("items", []):
-					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code'), "refunded":0 }):
+					actual_item = frappe.db.get_value("Item", item.get('item_code'), "actual_item")
+					if not actual_item:
+						actual_item = item.get("item_code")
+					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": actual_item, "refunded":0 }):
+						print("actual item")
+						return_si.append("items", {
+							"item_code": actual_item,
+							"qty": -1 * float(item.get('qty')),
+							"rate": abs(float(item.get('amount'))/float(item.get('qty'))),
+							"sales_order": so_id,
+							"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "name")
+						})
+						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "refunded", 1)
+						return_created = True
+					elif frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code'), "refunded":0 }):
+						print("not actual item")
 						return_si.append("items", {
 							"item_code": item.get('item_code'),
 							"qty": -1 * float(item.get('qty')),
