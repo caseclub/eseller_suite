@@ -12,6 +12,9 @@
   "column_break_lzak",
   "amazon_reserve_fund",
   "inventory_reimbursement_account",
+  "use_reserve_lines_in_amazon_payment_entry",
+  "amazon_reserve_income_account",
+  "amazon_reserve_expense_account",
   "default_pos_profile",
   "flipkart_defaults_section",
   "default_flipkart_customer",
@@ -102,13 +105,35 @@
    "label": "Inventory Reimbursement Account",
    "options": "Account",
    "reqd": 1
+  },
+  {
+   "depends_on": "eval: doc.use_reserve_lines_in_amazon_payment_entry",
+   "fieldname": "amazon_reserve_income_account",
+   "fieldtype": "Link",
+   "label": "Amazon Reserve Income Account",
+   "mandatory_depends_on": "eval: doc.use_reserve_lines_in_amazon_payment_entry",
+   "options": "Account"
+  },
+  {
+   "depends_on": "eval: doc.use_reserve_lines_in_amazon_payment_entry",
+   "fieldname": "amazon_reserve_expense_account",
+   "fieldtype": "Link",
+   "label": "Amazon Reserve Expense Account",
+   "mandatory_depends_on": "eval: doc.use_reserve_lines_in_amazon_payment_entry",
+   "options": "Account"
+  },
+  {
+   "default": "0",
+   "fieldname": "use_reserve_lines_in_amazon_payment_entry",
+   "fieldtype": "Check",
+   "label": "Use Reserve Lines in Amazon Payment Entry"
   }
  ],
  "hide_toolbar": 1,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2024-11-07 11:04:08.789659",
+ "modified": "2024-12-12 10:10:00.016588",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Settings",

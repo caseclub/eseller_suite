@@ -200,6 +200,27 @@ class AmazonPaymentEntry(Document):
 					jv_row.debit = abs(float(row.total))
 					jv_row.debit_in_account_currency = abs(float(row.total))
 					total_debit += abs(float(row.total))
+			elif frappe.db.get_single_value("eSeller Settings", "use_reserve_lines_in_amazon_payment_entry"):
+				reserve_jv_row = jv_doc.append('accounts')
+				reserve_jv_row.user_remark = row.product_details
+				if float(row.total) > 0:
+					reserve_jv_row.account = frappe.db.get_single_value("eSeller Settings", "amazon_reserve_income_account")
+					reserve_jv_row.credit = abs(float(row.total))
+					reserve_jv_row.credit_in_account_currency = abs(float(row.total))
+					total_credit += abs(float(row.total))
+				else:
+					reserve_jv_row.account = frappe.db.get_single_value("eSeller Settings", "amazon_reserve_expense_account")
+					jv_row.debit = abs(float(row.total))
+					jv_row.debit_in_account_currency = abs(float(row.total))
+					total_debit += abs(float(row.total))
+				if row.order_id:
+					reserve_jv_row.amazon_order_id = row.order_id
+				if row.customer:
+					reserve_jv_row.party_type = 'Customer'
+					reserve_jv_row.party = row.customer
+
+
+
 		difference_amount = total_debit-total_credit
 		jv_row = jv_doc.append('accounts')
 		jv_row.account = self.payment_account

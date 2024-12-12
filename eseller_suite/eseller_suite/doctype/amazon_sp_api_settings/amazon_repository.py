@@ -635,15 +635,18 @@ class AmazonRepository:
 				return_si.return_against = si
 				return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
 				for item in refund.get("items", []):
-					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code'), "refunded":0 }):
+					actual_item = frappe.db.get_value("Item", item.get('item_code'), "actual_item")
+					if not actual_item:
+						actual_item = item.get("item_code")
+					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": actual_item, "refunded":0 }):
 						return_si.append("items", {
-							"item_code": item.get('item_code'),
+							"item_code": actual_item,
 							"qty": -1 * float(item.get('qty')),
 							"rate": abs(float(item.get('amount'))/float(item.get('qty'))),
 							"sales_order": so_id,
-							"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "name")
+							"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "name")
 						})
-						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "refunded", 1)
+						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "refunded", 1)
 						return_created = True
 
 				if return_created:
@@ -657,9 +660,11 @@ class AmazonRepository:
 					return_si.disable_rounded_total = 1
 					return_si.update_outstanding_for_self = 1
 					return_si.update_billed_amount_in_sales_order = 1
-					return_si.insert(ignore_permissions=True)
-					return_si.submit()
-					# frappe.db.commit()
+					try:
+						return_si.insert(ignore_permissions=True)
+						return_si.submit()
+					except Exception as e:
+						frappe.log_error("Error creating Return Invoice for {0}".format(return_si.amazon_order_id), e, "Sales Invoice")
 
 			return so_id
 
@@ -779,8 +784,10 @@ class AmazonRepository:
 			so.disable_rounded_total = 1
 			so.custom_validate()
 			if so.grand_total>=0:
-				# so.flags.ignore_validate = True
-				so.save(ignore_permissions=True)
+				try:
+					so.save(ignore_permissions=True)
+				except Exception as e:
+					frappe.log_error("Error saving Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
 
 				order_statuses = [
 					"Shipped",
@@ -789,8 +796,10 @@ class AmazonRepository:
 				]
 
 				if order.get("OrderStatus") in order_statuses:
-					so.submit()
-					# frappe.db.commit()
+					try:
+						so.submit()
+					except Exception as e:
+						frappe.log_error("Error submitting Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
 			else:
 				remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
