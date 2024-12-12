@@ -648,16 +648,6 @@ class AmazonRepository:
 						})
 						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "refunded", 1)
 						return_created = True
-					elif frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code'), "refunded":0 }):
-						return_si.append("items", {
-							"item_code": item.get('item_code'),
-							"qty": -1 * float(item.get('qty')),
-							"rate": abs(float(item.get('amount'))/float(item.get('qty'))),
-							"sales_order": so_id,
-							"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "name")
-						})
-						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": item.get('item_code')}, "refunded", 1)
-						return_created = True
 
 				if return_created:
 					for charge in refund.get("charges", []):
