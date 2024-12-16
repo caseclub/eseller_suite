@@ -125,16 +125,15 @@ override_doctype_class = {
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-	# 'Sales Invoice':{
-	# 	"before_submit": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.before_submit",
-    #     "on_submit": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.auto_create_return_sales_invoice"
-    # },
+doc_events = {
+	'Sales Invoice':{
+		"validate": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.validate",
+    },
 	# 'Sales Order':{
 	# 	"on_submit": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.on_submit",
 	# 	"after_insert": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.after_insert"
 	# }
-# }
+}
 
 # Scheduled Tasks
 # ---------------
