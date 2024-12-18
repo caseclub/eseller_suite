@@ -1,0 +1,197 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "field:serial_no",
+ "creation": "2024-12-18 11:49:14.665820",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "details",
+  "column_break0",
+  "serial_no",
+  "item_code",
+  "warehouse",
+  "purchase_rate",
+  "column_break1",
+  "status",
+  "item_name",
+  "description",
+  "item_group",
+  "brand",
+  "more_info",
+  "company",
+  "column_break_2cmm",
+  "purchase_document_no",
+  "purchase_date",
+  "transfer_document_no",
+  "transfer_date"
+ ],
+ "fields": [
+  {
+   "fieldname": "details",
+   "fieldtype": "Section Break",
+   "oldfieldtype": "Section Break"
+  },
+  {
+   "fieldname": "column_break0",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Item Code",
+   "oldfieldname": "item_code",
+   "oldfieldtype": "Link",
+   "options": "Item",
+   "reqd": 1
+  },
+  {
+   "fieldname": "warehouse",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Warehouse",
+   "options": "Warehouse",
+   "read_only": 1
+  },
+  {
+   "fieldname": "purchase_rate",
+   "fieldtype": "Float",
+   "label": "Incoming Rate",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "\nActive\nInactive\nTransferred\nExpired",
+   "read_only": 1
+  },
+  {
+   "fetch_from": "item_code.item_name",
+   "fetch_if_empty": 1,
+   "fieldname": "item_name",
+   "fieldtype": "Data",
+   "label": "Item Name",
+   "read_only": 1
+  },
+  {
+   "fetch_from": "item_code.description",
+   "fieldname": "description",
+   "fieldtype": "Text",
+   "label": "Description",
+   "oldfieldname": "description",
+   "oldfieldtype": "Text",
+   "read_only": 1,
+   "width": "300px"
+  },
+  {
+   "fieldname": "item_group",
+   "fieldtype": "Link",
+   "label": "Item Group",
+   "oldfieldname": "item_group",
+   "oldfieldtype": "Link",
+   "options": "Item Group",
+   "read_only": 1
+  },
+  {
+   "fieldname": "brand",
+   "fieldtype": "Link",
+   "label": "Brand",
+   "oldfieldname": "brand",
+   "oldfieldtype": "Link",
+   "options": "Brand",
+   "read_only": 1
+  },
+  {
+   "fieldname": "more_info",
+   "fieldtype": "Section Break",
+   "label": "More Information"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Company",
+   "options": "Company",
+   "remember_last_selected_value": 1,
+   "reqd": 1,
+   "search_index": 1,
+   "set_only_once": 1
+  },
+  {
+   "fieldname": "column_break_2cmm",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "purchase_document_no",
+   "fieldtype": "Link",
+   "label": "Purchase Document No",
+   "no_copy": 1,
+   "options": "Purchase Receipt",
+   "read_only": 1
+  },
+  {
+   "fieldname": "serial_no",
+   "fieldtype": "Data",
+   "label": "Serial No",
+   "no_copy": 1,
+   "oldfieldname": "serial_no",
+   "oldfieldtype": "Data",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "transfer_document_no",
+   "fieldtype": "Link",
+   "label": "Transfer Document No",
+   "options": "Stock Entry",
+   "read_only": 1
+  },
+  {
+   "fetch_from": "purchase_document_no.posting_date",
+   "fieldname": "purchase_date",
+   "fieldtype": "Date",
+   "label": "Purchase Date"
+  },
+  {
+   "fetch_from": "transfer_document_no.posting_date",
+   "fieldname": "transfer_date",
+   "fieldtype": "Date",
+   "label": "Transfer Date"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2024-12-18 16:19:45.157682",
+ "modified_by": "Administrator",
+ "module": "eSeller Suite",
+ "name": "eSeller Serial No",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
