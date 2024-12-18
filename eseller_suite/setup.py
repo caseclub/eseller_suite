@@ -8,6 +8,12 @@ def after_install():
 	create_custom_fields(get_sales_invoice_custom_fields(), ignore_validate=True)
 	create_custom_fields(get_purchase_invoice_custom_fields(), ignore_validate=True)
 	create_custom_fields(get_journal_entry_custom_fields(), ignore_validate=True)
+	create_custom_fields(get_purchase_receipt_custom_fields(), ignore_validate=True)
+	create_custom_fields(get_stock_entry_custom_fields(), ignore_validate=True)
+
+	# Creating Property setters
+	create_property_setters(get_purchase_receipt_item_property_setters())
+	create_property_setters(get_stock_entry_detail_property_setters())
 
 def after_migrate():
 	after_install()
@@ -18,6 +24,7 @@ def before_uninstall():
 	delete_custom_fields(get_sales_invoice_custom_fields())
 	delete_custom_fields(get_purchase_invoice_custom_fields())
 	delete_custom_fields(get_journal_entry_custom_fields())
+	delete_custom_fields(get_purchase_receipt_custom_fields())
 
 def delete_custom_fields(custom_fields: dict):
 	'''
@@ -440,6 +447,47 @@ def get_journal_entry_custom_fields():
 		]
 	}
 
+def get_purchase_receipt_custom_fields():
+    """eSeller Suite specific custom fields in Purchase Receipt"""
+    return {
+		"Purchase Receipt Item": [
+			{
+				"fieldname": "new_seral_section",
+				"fieldtype": "Section Break",
+				"label": "Serial Numbers",
+				"insert_after": "batch_no",
+				"hidden": 0,
+			},
+			{
+				"fieldname": "barcode_no",
+				"fieldtype": "Text",
+				"label": "Serial Nos",
+				"insert_after": "new_seral_section",
+				"description": "Barcode numbers should be seprated by line break",
+			}
+		]
+	}
+
+def get_stock_entry_custom_fields():
+    return {
+		"Stock Entry Detail": [
+			{
+				"fieldname": "new_seral_section",
+				"fieldtype": "Section Break",
+				"label": "Serial Numbers",
+				"insert_after": "batch_no",
+				"hidden": 0,
+			},
+			{
+				"fieldname": "barcode_no",
+				"fieldtype": "Text",
+				"label": "Serial Nos",
+				"insert_after": "new_seral_section",
+				"description": "Barcode numbers should be seprated by line break",
+			}
+		]
+	}
+
 def create_property_setters(property_setter_datas):
 	'''
 		Method to create custom property setters
@@ -453,3 +501,39 @@ def create_property_setters(property_setter_datas):
 		property_setter.update(property_setter_data)
 		property_setter.flags.ignore_permissions = True
 		property_setter.insert()
+
+def get_purchase_receipt_item_property_setters():
+    return [
+        {
+			"doctype_or_field": "DocField",
+			"doc_type": "Purchase Receipt Item",
+			"field_name": "section_break_45",
+			"property": "hidden",
+			"value": 1
+		},
+        {
+			"doctype_or_field": "DocField",
+			"doc_type": "Purchase Receipt Item",
+			"field_name": "section_break_3vxt",
+			"property": "hidden",
+			"value": 1
+		},
+    ]
+
+def get_stock_entry_detail_property_setters():
+    return [
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Stock Entry Detail",
+			"field_name": "serial_no_batch",
+			"property": "hidden",
+			"value": 1
+		},
+        {
+			"doctype_or_field": "DocField",
+			"doc_type": "Stock Entry Detail",
+			"field_name": "section_break_rdtg",
+			"property": "hidden",
+			"value": 1
+		},
+	]
