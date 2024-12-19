@@ -134,7 +134,6 @@ def activate_barcodes(doc, method=None):
                     alert=True,
                 )
 
-
 def find_duplicates(lst):
     seen = set()
     duplicates = set()
@@ -143,4 +142,5 @@ def find_duplicates(lst):
             duplicates.add(item)
         else:
             seen.add(item)
-    return list(duplicates)
+    cleaned_duplicates = [item for item in duplicates if item.strip()]
+    return cleaned_duplicates
