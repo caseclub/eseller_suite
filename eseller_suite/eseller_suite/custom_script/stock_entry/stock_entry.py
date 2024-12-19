@@ -23,7 +23,7 @@ def transfer_barcodes(doc, method=None):
                 serial_doc.warehouse = item.t_warehouse
                 serial_doc.transfer_document_no = doc.name
                 serial_doc.save()
-                frappe.msgprint(
-                    f"{existing_serial_no} of {item.item_code} is now Transferred",
-                    alert=True,
-                )
+    frappe.msgprint(
+        "Serial Numbers are now Transferred",
+        alert=True,
+    )

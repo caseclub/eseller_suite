@@ -96,15 +96,17 @@ def create_barcodes(doc, method=None):
                 serial_no.purchase_rate = item.basic_rate
             serial_no.insert(ignore_permissions=True)
 
-            frappe.msgprint(
-                msg=f"Serial No. {serial_no.name} created for Item {serial_no.item_code}.",
-                alert=True,
-            )
             qty += 1
 
         item.qty = qty
         if doc.doctype == "Purchase Receipt":
             item.received_qty = qty
+
+    frappe.msgprint(
+        msg="Serial Numbers Processed.",
+        alert=True,
+        indicator="green"
+    )
 
 
 def activate_barcodes(doc, method=None):
@@ -129,10 +131,11 @@ def activate_barcodes(doc, method=None):
                 serial_doc.status = "Active"
                 serial_doc.warehouse = item.warehouse
                 serial_doc.save()
-                frappe.msgprint(
-                    f"{existing_serial_no} of {item.item_code} is now Active",
-                    alert=True,
-                )
+    frappe.msgprint(
+        "Serial Numbers are now Active",
+        alert=True,
+    )
+
 
 def find_duplicates(lst):
     seen = set()
