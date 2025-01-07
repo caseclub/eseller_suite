@@ -210,8 +210,8 @@ class AmazonPaymentEntry(Document):
 					total_credit += abs(float(row.total))
 				else:
 					reserve_jv_row.account = frappe.db.get_single_value("eSeller Settings", "amazon_reserve_expense_account")
-					jv_row.debit = abs(float(row.total))
-					jv_row.debit_in_account_currency = abs(float(row.total))
+					reserve_jv_row.debit = abs(float(row.total))
+					reserve_jv_row.debit_in_account_currency = abs(float(row.total))
 					total_debit += abs(float(row.total))
 				if row.order_id:
 					reserve_jv_row.amazon_order_id = row.order_id
