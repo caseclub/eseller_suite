@@ -695,10 +695,7 @@ class AmazonRepository:
 			so.transaction_date = get_datetime(transaction_date).strftime('%Y-%m-%d')
 			so.transaction_time = get_datetime(transaction_date).strftime('%H:%M:%S')
 			so.company = self.amz_setting.company
-			warehouse = self.amz_setting.warehouse
-			if so.fulfillment_channel:
-				if so.fulfillment_channel=='AFN':
-					warehouse = self.amz_setting.afn_warehouse
+			warehouse = self.amz_setting.temporary_order_warehouse
 			if order.get("IsBusinessOrder"):
 				so.amazon_customer_type = 'B2B'
 			else:
@@ -785,6 +782,7 @@ class AmazonRepository:
 			so.custom_validate()
 			if so.grand_total>=0:
 				try:
+					self.create_temporary_stock_transfer(so)
 					so.save(ignore_permissions=True)
 				except Exception as e:
 					frappe.log_error("Error saving Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
@@ -882,6 +880,23 @@ class AmazonRepository:
 
 	def get_catalog_items_instance(self) -> CatalogItems:
 		return CatalogItems(**self.instance_params)
+
+	def create_temporary_stock_transfer(self, so):
+		temp_stock_entry = frappe.new_doc("Stock Entry")
+		temp_stock_entry.stock_entry_type = "Material Transfer"
+		warehouse = self.amz_setting.warehouse
+		if so.fulfillment_channel:
+			if so.fulfillment_channel=='AFN':
+				warehouse = self.amz_setting.afn_warehouse
+		for item in so.items:
+			temp_stock_entry.append("items", {
+				"s_warehouse": warehouse,
+				"t_warehouse": self.amz_setting.temporary_order_warehouse,
+				"item_code": item.item_code,
+				"qty": item.qty
+			})
+		temp_stock_entry.insert(ignore_permissions=True)
+		temp_stock_entry.submit()
 
 def get_orders(amz_setting_name, last_updated_after, sync_selected_date_only=0) -> list:
 	ar = AmazonRepository(amz_setting_name)

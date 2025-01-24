@@ -14,6 +14,7 @@
   "refresh_token",
   "section_break_2",
   "company",
+  "temporary_order_warehouse",
   "warehouse",
   "afn_warehouse",
   "parent_item_group",
@@ -228,10 +229,17 @@
    "fieldname": "map_state_data",
    "fieldtype": "Check",
    "label": "Map State Data"
+  },
+  {
+   "fieldname": "temporary_order_warehouse",
+   "fieldtype": "Link",
+   "label": "Temporary Order Warehouse",
+   "options": "Warehouse",
+   "reqd": 1
   }
  ],
  "links": [],
- "modified": "2024-12-02 16:12:58.741537",
+ "modified": "2025-01-23 16:20:56.305111",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon SP API Settings",
