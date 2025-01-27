@@ -4,264 +4,181 @@
 import frappe
 from frappe.utils import getdate
 
+
 def execute(filters=None):
-	columns, data = get_columns(filters), get_data(filters)
-	return columns, data
+    columns, data = get_columns(filters), get_data(filters)
+    return columns, data
+
 
 def get_columns(filters):
-    '''
-        Method to get columns for the report
-    '''
+    """
+    Method to get columns for the report.
+    """
     group_based_on = filters.get("group_based_on")
     columns = [
         {
             "label": "Date",
             "fieldname": "transaction_date",
             "fieldtype": "Date",
-            "width": 110
+            "width": 110,
         }
     ]
-    if group_based_on != 'Date':
+
+    if group_based_on != "Date":
         date_columns = [
             {
                 "label": "Order ID",
                 "fieldname": "amazon_order_id",
                 "fieldtype": "Data",
-                "width": 200
+                "width": 200,
             },
             {
                 "label": "Customer Type",
                 "fieldname": "customer_type",
                 "fieldtype": "Select",
                 "options": "\nB2B\nB2C",
-                "width": 130
+                "width": 130,
             },
             {
                 "label": "Amazon Status",
                 "fieldname": "amazon_order_status",
                 "fieldtype": "Select",
                 "options": "\nShipped\nInvoiceUnconfirmed\nCanceled\nUnfulfillable\nPending\nUnshipped",
-                "width": 150
+                "width": 150,
             },
             {
                 "label": "Fulfillment Channel",
                 "fieldname": "fulfillment_channel",
                 "fieldtype": "Select",
                 "options": "\nAFN\nMFN",
-                "width": 160
-            }
+                "width": 160,
+            },
         ]
         columns.extend(date_columns)
+
     columns_common = [
         {
             "label": "Amazon Amount",
             "fieldname": "amazon_order_amount",
             "fieldtype": "Currency",
-            "width": 150
+            "width": 150,
         },
         {
             "label": "SO Amount",
             "fieldname": "order_amount",
             "fieldtype": "Currency",
-            "width": 120
+            "width": 120,
         },
         {
             "label": "Invoice Amount",
             "fieldname": "invoice_amount",
             "fieldtype": "Currency",
-            "width": 150
+            "width": 150,
         },
         {
             "label": "Return Amount",
             "fieldname": "return_amount",
             "fieldtype": "Currency",
-            "width": 150
+            "width": 150,
         },
         {
             "label": "Cancelled Amount",
             "fieldname": "cancelled_amount",
             "fieldtype": "Currency",
-            "width": 150
+            "width": 150,
         },
         {
             "label": "Total Invoice Amount",
             "fieldname": "total_amount",
             "fieldtype": "Currency",
-            "width": 180
+            "width": 180,
         },
         {
             "label": "Total Order Amount",
             "fieldname": "total_order_amount",
             "fieldtype": "Currency",
-            "width": 160
-        }
+            "width": 160,
+        },
     ]
     columns.extend(columns_common)
     return columns
 
+
 def get_data(filters):
-    '''
-        Method to get data for report
-    '''
-    data  = []
+    """
+    Method to get data for the report.
+    """
+    data = []
     from_date = getdate(filters.get("from_date"))
     to_date = getdate(filters.get("to_date"))
-    group_based_on = filters.get("group_based_on")
-    if group_based_on == 'Order ID':
-        group_based_on = 'amazon_order_id'
+    group_based_on = filters.get("group_based_on", "transaction_date")
+
+    if group_based_on == "Order ID":
+        group_based_on = "amazon_order_id"
     else:
-        group_based_on = 'transaction_date'
-    so_query = '''
+        group_based_on = "transaction_date"
+
+    # Optimized query with joins for invoice, return, and cancel sums
+    so_query = """
         SELECT
-            name,
-            transaction_date,
-            amazon_order_id,
-            amazon_customer_type as customer_type,
-            amazon_order_status,
-            fulfillment_channel,
-            SUM(amazon_order_amount) as amazon_order_amount,
-            SUM(grand_total) as order_amount
+            s.name,
+            s.transaction_date,
+            s.amazon_order_id,
+            s.amazon_customer_type AS customer_type,
+            s.amazon_order_status,
+            s.fulfillment_channel,
+            SUM(s.amazon_order_amount) AS amazon_order_amount,
+            SUM(s.grand_total) AS order_amount,
+            IFNULL(SUM(i.grand_total), 0) AS invoice_amount,
+            IFNULL(SUM(r.grand_total), 0) AS return_amount,
+            IFNULL(SUM(c.grand_total), 0) AS cancelled_amount
         FROM
-            `tabSales Order`
+            `tabSales Order` s
+        LEFT JOIN
+            `tabSales Invoice` i ON i.amazon_order_id = s.amazon_order_id AND i.is_return = 0 AND i.docstatus != 2
+        LEFT JOIN
+            `tabSales Invoice` r ON r.amazon_order_id = s.amazon_order_id AND r.is_return = 1 AND r.docstatus != 2
+        LEFT JOIN
+            `tabSales Order` c ON c.amazon_order_id = s.amazon_order_id AND c.amazon_order_status = 'Canceled' AND c.docstatus != 2
         WHERE
-            transaction_date BETWEEN %(from_date)s AND %(to_date)s
-    '''
+            s.transaction_date BETWEEN %(from_date)s AND %(to_date)s
+    """
     if filters.get("customer_type"):
-        so_query += '''
-            AND amazon_customer_type = %(customer_type)s
-        '''
+        so_query += """
+            AND s.amazon_customer_type = %(customer_type)s
+        """
     if filters.get("fulfillment_channel"):
-        so_query += '''
-            AND fulfillment_channel = %(fulfillment_channel)s
-        '''
-    so_query += '''
+        so_query += """
+            AND s.fulfillment_channel = %(fulfillment_channel)s
+        """
+
+    so_query += """
         GROUP BY
             {0}
         ORDER BY
-            transaction_date
-    '''.format(group_based_on)
-    results = frappe.db.sql(so_query, {
-        'group_based_on':group_based_on,
-        'from_date':from_date,
-        'to_date':to_date,
-        'customer_type':filters.get("customer_type"),
-        'fulfillment_channel':filters.get("fulfillment_channel")
-    }, as_dict=True)
+            s.transaction_date
+    """.format(
+        group_based_on
+    )
+
+    results = frappe.db.sql(
+        so_query,
+        {
+            "from_date": from_date,
+            "to_date": to_date,
+            "customer_type": filters.get("customer_type"),
+            "fulfillment_channel": filters.get("fulfillment_channel"),
+        },
+        as_dict=True,
+    )
+
     for row in results:
-        row['total_order_amount'] = row.get('amazon_order_amount', 0)
-        if group_based_on == 'amazon_order_id':
-            row['invoice_amount'] = get_invoice_amount(amazon_order_id=row.get(group_based_on))
-            row['return_amount'] = get_total_returns(amazon_order_id=row.get(group_based_on))
-            row['cancelled_amount'] = get_total_cancels(amazon_order_id=row.get(group_based_on))
-            if row.get('return_amount', 0) or row.get('cancelled_amount', 0):
-                row['total_order_amount'] = 0
-        else:
-            row['invoice_amount'] = get_invoice_amount(transaction_date=row.get(group_based_on))
-            row['return_amount'] = get_total_returns(transaction_date=row.get(group_based_on))
-            row['cancelled_amount'] = get_total_cancels(transaction_date=row.get(group_based_on))
-        row['total_amount'] = row['order_amount'] - row['return_amount'] -  row['cancelled_amount']
+        row["total_order_amount"] = (
+            row["amazon_order_amount"] - row["return_amount"] - row["cancelled_amount"]
+        )
+        row["total_amount"] = (
+            row["order_amount"] - row["return_amount"] - row["cancelled_amount"]
+        )
         data.append(row)
+
     return data
-
-def get_invoice_amount(amazon_order_id=None, transaction_date=None):
-    '''
-        Method to get Total Invoiced amount with Amazon Order ID or Date
-    '''
-    total_invoice_amount = 0
-    if transaction_date or amazon_order_id:
-        query = '''
-            SELECT
-                IFNULL(SUM(grand_total), 0) as total
-            FROM
-                `tabSales Invoice`
-            WHERE
-                is_return = 0 AND
-                docstatus != 2
-        '''
-        if amazon_order_id:
-            query += '''
-                AND amazon_order_id = %(amazon_order_id)s
-            GROUP BY
-                amazon_order_id
-            '''
-        if transaction_date:
-            query += '''
-                AND posting_date = %(transaction_date)s
-            GROUP BY
-                posting_date
-            '''
-        output = frappe.db.sql(query, { 'transaction_date':transaction_date, 'amazon_order_id':amazon_order_id } ,as_dict=True)
-        if output:
-            if output[0] and output[0].get('total'):
-                total_invoice_amount = output[0].get('total', 0)
-    return total_invoice_amount
-
-def get_total_returns(amazon_order_id=None, transaction_date=None):
-    '''
-        Method to get Total Returns and Cancelled amount with Amazon Order ID or Date
-    '''
-    total_returns = 0
-    if transaction_date or amazon_order_id:
-        #Refunded Orders
-        query = '''
-            SELECT
-                IFNULL(SUM(grand_total), 0) as total
-            FROM
-                `tabSales Invoice`
-            WHERE
-                is_return = 1
-        '''
-        if amazon_order_id:
-            query += '''
-                AND amazon_order_id = %(amazon_order_id)s
-            GROUP BY
-                amazon_order_id
-            '''
-        if transaction_date:
-            query += '''
-                AND posting_date = %(transaction_date)s
-            GROUP BY
-                posting_date
-            '''
-        output = frappe.db.sql(query, { 'transaction_date':transaction_date, 'amazon_order_id':amazon_order_id } ,as_dict=True)
-        if output:
-            if output[0] and output[0].get('total'):
-                total_returns = output[0].get('total', 0)
-        if total_returns<0:
-            total_returns *= -1
-    return total_returns
-
-def get_total_cancels(amazon_order_id=None, transaction_date=None):
-    '''
-        Method to get Total Returns and Cancelled amount with Amazon Order ID or Date
-    '''
-    total_cancels = 0
-    if transaction_date or amazon_order_id:
-        #Cancelled Orders
-        query = '''
-            SELECT
-                IFNULL(SUM(grand_total), 0) as total
-            FROM
-                `tabSales Order`
-            WHERE
-                amazon_order_status = 'Canceled'
-        '''
-        if amazon_order_id:
-            query += '''
-                AND amazon_order_id = %(amazon_order_id)s
-            GROUP BY
-                amazon_order_id
-            '''
-        if transaction_date:
-            query += '''
-                AND transaction_date = %(transaction_date)s
-            GROUP BY
-                transaction_date
-            '''
-        output = frappe.db.sql(query, { 'transaction_date':transaction_date, 'amazon_order_id':amazon_order_id } ,as_dict=True)
-        if output:
-            if output[0] and output[0].get('total'):
-                total_cancels = output[0].get('total', 0)
-        if total_cancels<0:
-            total_cancels *= -1
-    return total_cancels
