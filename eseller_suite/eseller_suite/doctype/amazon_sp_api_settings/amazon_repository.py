@@ -695,10 +695,7 @@ class AmazonRepository:
 			so.transaction_date = get_datetime(transaction_date).strftime('%Y-%m-%d')
 			so.transaction_time = get_datetime(transaction_date).strftime('%H:%M:%S')
 			so.company = self.amz_setting.company
-			warehouse = self.amz_setting.warehouse
-			if so.fulfillment_channel:
-				if so.fulfillment_channel=='AFN':
-					warehouse = self.amz_setting.afn_warehouse
+			warehouse = self.amz_setting.temporary_order_warehouse
 			if order.get("IsBusinessOrder"):
 				so.amazon_customer_type = 'B2B'
 			else:
