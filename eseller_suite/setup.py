@@ -158,7 +158,17 @@ def get_sales_order_custom_fields():
 				"label": "Transaction Time",
 				"insert_after": "transaction_date",
 				"no_copy": 1,
-			}
+			},
+			{
+				"fieldname": "temporary_stock_tranfer_id",
+				"fieldtype": "Link",
+				"label": "Temporary Stock Transfer ID",
+				"insert_after": "fulfillment_channel",
+				"read_only": 1,
+				"no_copy": 1,
+				"options": "Stock Entry",
+				"depends_on": "eval:frappe.session.user=='Administrator'"
+			},
 		],
 		"Sales Order Item": [
 			{

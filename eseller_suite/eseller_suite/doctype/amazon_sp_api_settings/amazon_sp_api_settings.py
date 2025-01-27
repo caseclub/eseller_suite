@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import add_days, getdate, now_datetime, today
+from frappe.utils import add_days, getdate, now_datetime, today, get_date_str
 import pytz
 
 
@@ -31,7 +31,7 @@ class AmazonSPAPISettings(Document):
 
 	def validate_after_date(self):
 		if datetime.strptime(add_days(today(), -30), "%Y-%m-%d") > datetime.strptime(
-			self.after_date, "%Y-%m-%d"
+			get_date_str(self.after_date), "%Y-%m-%d"
 		):
 			frappe.throw(_("The date must be within the last 30 days."))
 

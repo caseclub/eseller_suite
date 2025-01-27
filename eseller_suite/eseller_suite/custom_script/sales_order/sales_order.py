@@ -10,51 +10,82 @@ from erpnext.accounts.party import get_party_account
 from frappe.utils import flt, cint
 
 class SalesOrderOverride(SalesOrder):
-    def custom_validate(self):
-        total_qty = 0
-        total = 0
-        total_taxes_and_charges = 0
-        for item in self.items:
-            qty = int(item.qty)
-            rate = float(item.rate)
-            amount = rate*qty
-            item.base_rate = rate
-            item.amount = amount
-            item.base_amount = amount
-            item.uom = item.stock_uom
-            if self.delivery_date:
-                item.delivery_date = self.delivery_date
-            total_qty += qty
-            total += amount
+	def custom_validate(self):
+		total_qty = 0
+		total = 0
+		total_taxes_and_charges = 0
+		for item in self.items:
+			qty = int(item.qty)
+			rate = float(item.rate)
+			amount = rate*qty
+			item.base_rate = rate
+			item.amount = amount
+			item.base_amount = amount
+			item.uom = item.stock_uom
+			if self.delivery_date:
+				item.delivery_date = self.delivery_date
+			total_qty += qty
+			total += amount
 
-        for tax_row in self.taxes:
-            if tax_row.tax_amount:
-                total_taxes_and_charges += float(tax_row.tax_amount)
+		for tax_row in self.taxes:
+			if tax_row.tax_amount:
+				total_taxes_and_charges += float(tax_row.tax_amount)
 
-        self.total = total
-        self.total_qty = total_qty
-        self.total_taxes_and_charges = total_taxes_and_charges
-        self.grand_total = total + total_taxes_and_charges
-        self.base_grand_total = total + total_taxes_and_charges
+		self.total = total
+		self.total_qty = total_qty
+		self.total_taxes_and_charges = total_taxes_and_charges
+		self.grand_total = total + total_taxes_and_charges
+		self.base_grand_total = total + total_taxes_and_charges
 
-    def validate(self):
-        self.custom_validate()
-        recall_order_prefixes = ['S']
-        super(SalesOrderOverride, self).validate()
-        if self.amazon_order_status != 'Canceled' and not self.amazon_order_amount and self.amazon_order_id and self.amazon_order_id[0] not in recall_order_prefixes:
-            self.amazon_order_amount = self.total
-        if self.amazon_order_id and self.amazon_order_id[0] in recall_order_prefixes:
-            self.amazon_order_amount =  0
-        if self.amazon_order_status == 'Canceled' or self.replaced_order_id:
-            self.amazon_order_amount =  0
+	def validate(self):
+		self.custom_validate()
+		recall_order_prefixes = ['S']
+		super(SalesOrderOverride, self).validate()
+		if self.amazon_order_status != 'Canceled' and not self.amazon_order_amount and self.amazon_order_id and self.amazon_order_id[0] not in recall_order_prefixes:
+			self.amazon_order_amount = self.total
+		if self.amazon_order_id and self.amazon_order_id[0] in recall_order_prefixes:
+			self.amazon_order_amount =  0
+		if self.amazon_order_status == 'Canceled' or self.replaced_order_id:
+			self.amazon_order_amount =  0
 
-    def on_submit(self):
-        super(SalesOrderOverride, self).on_submit()
-        sales_invoice = make_sales_invoice(source_name=self.name, target_doc=None, ignore_permissions=True)
-        sales_invoice.update_stock = 1
-        # sales_invoice.flags.ignore_validate = True
-        sales_invoice.insert(ignore_permissions=True)
-        sales_invoice.submit()
+	def on_submit(self):
+		super(SalesOrderOverride, self).on_submit()
+		sales_invoice = make_sales_invoice(source_name=self.name, target_doc=None, ignore_permissions=True)
+		sales_invoice.update_stock = 1
+		# sales_invoice.flags.ignore_validate = True
+		sales_invoice.insert(ignore_permissions=True)
+		sales_invoice.submit()
+
+	def on_update(self):
+		if self.amazon_order_status == "Canceled" and self.temporary_stock_tranfer_id:
+			if frappe.db.exists("Stock Entry", {"name":self.temporary_stock_tranfer_id, "docstatus":["!=", 2]}):
+				temp_stock_transfer_doc = frappe.get_doc("Stock Entry", self.temporary_stock_tranfer_id)
+				temp_stock_transfer_doc.cancel()
+
+	def after_insert(self):
+		if self.amazon_order_id:
+			self.create_temporary_stock_transfer()
+
+	def create_temporary_stock_transfer(self):
+		"""method creates a stock entry to the temporary warehoue when a sales order is screated
+		"""
+		temp_stock_entry = frappe.new_doc("Stock Entry")
+		temp_stock_entry.stock_entry_type = "Material Transfer"
+		amz_setting = frappe.db.exists("Amazon SP API Settings", {"is_active":1})
+		warehouse = frappe.db.get_value("Amazon SP API Settings", amz_setting, "warehouse")
+		if self.fulfillment_channel:
+			if self.fulfillment_channel=='AFN':
+				warehouse = frappe.db.get_value("Amazon SP API Settings", amz_setting, "afn_warehouse")
+		for item in self.items:
+			temp_stock_entry.append("items", {
+				"s_warehouse": warehouse,
+				"t_warehouse": frappe.db.get_value("Amazon SP API Settings", amz_setting, "temporary_order_warehouse"),
+				"item_code": item.item_code,
+				"qty": item.qty
+			})
+		temp_stock_entry.insert(ignore_permissions=True)
+		temp_stock_entry.submit()
+		frappe.db.set_value("Sales Order", self.name, "temporary_stock_tranfer_id", temp_stock_entry.name)
 
 @frappe.whitelist()
 def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
