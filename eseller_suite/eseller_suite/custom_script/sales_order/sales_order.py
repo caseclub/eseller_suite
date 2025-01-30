@@ -62,7 +62,7 @@ class SalesOrderOverride(SalesOrder):
 				temp_stock_transfer_doc = frappe.get_doc("Stock Entry", self.temporary_stock_tranfer_id)
 				temp_stock_transfer_doc.cancel()
 
-	def after_insert(self):
+	def before_insert(self):
 		if self.amazon_order_id:
 			self.create_temporary_stock_transfer()
 
@@ -85,7 +85,7 @@ class SalesOrderOverride(SalesOrder):
 			})
 		temp_stock_entry.insert(ignore_permissions=True)
 		temp_stock_entry.submit()
-		frappe.db.set_value("Sales Order", self.name, "temporary_stock_tranfer_id", temp_stock_entry.name)
+		self.temporary_stock_tranfer_id = temp_stock_entry
 
 @frappe.whitelist()
 def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
@@ -127,6 +127,7 @@ def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
 			if (source.rate and source.billed_amt)
 			else source.qty - source.returned_qty
 		)
+		target.total_order_value = source.total_order_value
 
 		if source_parent.project:
 			target.cost_center = frappe.db.get_value("Project", source_parent.project, "cost_center")

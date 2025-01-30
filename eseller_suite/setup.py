@@ -174,10 +174,11 @@ def get_sales_order_custom_fields():
 			{
 				"fieldname": "total_order_value",
 				"fieldtype": "Currency",
-				"label": "Total Order Value",
+				"label": "Amazon Rate",
 				"insert_after": "amount",
 				"read_only": 1,
-				"no_copy": 1
+				"no_copy": 1,
+				"in_list_view":1
 			}
         ]
 	}
@@ -310,10 +311,11 @@ def get_sales_invoice_custom_fields():
 			{
 				"fieldname": "total_order_value",
 				"fieldtype": "Currency",
-				"label": "Total Order Value",
+				"label": "Amazon Rate",
 				"insert_after": "total_inr",
 				"read_only": 1,
-				"no_copy": 1
+				"no_copy": 1,
+				"in_list_view":1
 			}
 		]
 	}
