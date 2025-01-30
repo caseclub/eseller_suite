@@ -742,6 +742,12 @@ class AmazonRepository:
 				so.amazon_order_amount = total_order_value
 
 			taxes_and_charges = self.amz_setting.taxes_charges
+   
+			item_lookup = {item["item_code"]: item.get('total_order_value', 0) for item in items}
+			for row in so.items:
+				total_value = item_lookup.get(row.item_code)
+				if total_value:
+					row.total_order_value = total_value
 
 			if taxes_and_charges:
 				charges_and_fees = self.get_charges_and_fees(order_id)
