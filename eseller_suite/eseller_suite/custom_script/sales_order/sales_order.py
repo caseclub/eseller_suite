@@ -1,13 +1,14 @@
 import frappe
-from frappe.model.mapper import get_mapped_doc
+from erpnext.accounts.party import get_party_account
 from erpnext.selling.doctype.sales_order.sales_order import SalesOrder
 from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
 from erpnext.stock.doctype.item.item import get_item_defaults
 from frappe.contacts.doctype.address.address import get_company_address
 from frappe.model.mapper import get_mapped_doc
 from frappe.model.utils import get_fetch_values
-from erpnext.accounts.party import get_party_account
-from frappe.utils import flt, cint
+from frappe.utils import cint, flt
+from erpnext.stock.stock_ledger import get_stock_balance
+
 
 class SalesOrderOverride(SalesOrder):
 	def custom_validate(self):
@@ -50,11 +51,13 @@ class SalesOrderOverride(SalesOrder):
 
 	def on_submit(self):
 		super(SalesOrderOverride, self).on_submit()
+		
 		sales_invoice = make_sales_invoice(source_name=self.name, target_doc=None, ignore_permissions=True)
 		sales_invoice.update_stock = 1
-		# sales_invoice.flags.ignore_validate = True
 		sales_invoice.insert(ignore_permissions=True)
-		sales_invoice.submit()
+
+		frappe.enqueue("eseller_suite.eseller_suite.custom_script.sales_order.sales_order.enq_si_submit", sales_invoice=sales_invoice)
+
 
 	def on_update(self):
 		if self.amazon_order_status == "Canceled" and self.temporary_stock_tranfer_id:
@@ -63,7 +66,8 @@ class SalesOrderOverride(SalesOrder):
 				temp_stock_transfer_doc.cancel()
 
 	def before_insert(self):
-		if self.amazon_order_id:
+		amz_setting = frappe.get_last_doc("Amazon SP API Settings", {"is_active":1})
+		if amz_setting.temporary_stock_transfer_required and self.amazon_order_id:
 			self.create_temporary_stock_transfer()
 
 	def create_temporary_stock_transfer(self):
@@ -186,3 +190,30 @@ def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
 		doclist.set_payment_schedule()
 
 	return doclist
+
+def enq_si_submit(sales_invoice):
+	insufficient_stock = False
+	error_records = []
+
+	# Collect stock levels for all items first (Assumption: Bulk fetching is possible)
+	stock_levels = {item.item_code: get_stock_balance(item.item_code, item.warehouse, sales_invoice.posting_date)
+					for item in sales_invoice.items}
+
+	for item in sales_invoice.items:
+		stock_qty = stock_levels.get(item.item_code, 0)
+		if item.qty > stock_qty:
+			insufficient_stock = True
+			error_records.append({
+				"doctype": "Amazon Failed Invoice Record",
+				"invoice_id": sales_invoice.name,
+				"error": f"Insufficient stock for item {item.item_code} as of {sales_invoice.posting_date}. "
+						f"Available: {stock_qty}, Required: {item.qty}"
+			})
+
+	# Insert all error records in batch
+	if error_records:
+		for record in error_records:
+			frappe.get_doc(record).insert()
+
+	if not insufficient_stock:
+		sales_invoice.submit()
