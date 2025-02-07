@@ -1,0 +1,70 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "format:AMZ-FINVR-{invoice_id}-{##}",
+ "creation": "2025-02-06 13:07:42.352357",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "invoice_id",
+  "column_break_jafl",
+  "amazon_order_id",
+  "section_break_irbw",
+  "error"
+ ],
+ "fields": [
+  {
+   "fieldname": "invoice_id",
+   "fieldtype": "Link",
+   "label": "Invoice ID",
+   "options": "Sales Invoice",
+   "read_only": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "column_break_jafl",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "amazon_order_id",
+   "fieldtype": "Data",
+   "label": "Amazon Order ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_irbw",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "error",
+   "fieldtype": "Code",
+   "label": "Error",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2025-02-07 13:31:40.412566",
+ "modified_by": "Administrator",
+ "module": "eSeller Suite",
+ "name": "Amazon Failed Invoice Record",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
