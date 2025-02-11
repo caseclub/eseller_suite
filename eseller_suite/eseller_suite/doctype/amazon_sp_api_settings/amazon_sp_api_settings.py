@@ -96,7 +96,7 @@ def schedule_get_order_details():
 
 	for amz_setting in amz_settings:
 		get_orders(amz_setting_name=amz_setting.name, last_updated_after=current_date)
-		frappe.enqueue("eseller_suite.eseller_suite.custom_script.sales_order.sales_order.enq_si_submit")
+		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit")
 
 
 # Called via a hook every day to sync data of the previous day.
@@ -115,7 +115,7 @@ def schedule_get_order_details_daily():
 
 	for amz_setting in amz_settings:
 		get_orders(amz_setting_name=amz_setting.name, last_updated_after=from_date)
-		frappe.enqueue("eseller_suite.eseller_suite.custom_script.sales_order.sales_order.enq_si_submit")
+		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit")
 
 def enq_si_submit():
 	sales_invoices = frappe.db.get_all("Sales Invoice", {"docstatus":0, "amazon_order_id":["is", "set"]}, pluck="name")
