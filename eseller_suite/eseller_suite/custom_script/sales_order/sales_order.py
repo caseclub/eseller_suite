@@ -216,4 +216,5 @@ def enq_si_submit(sales_invoice):
 			frappe.get_doc(record).insert()
 
 	if not insufficient_stock:
+		sales_invoice.flags.ignore_links = True
 		sales_invoice.submit()
