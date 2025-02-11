@@ -18,8 +18,7 @@
    "fieldtype": "Link",
    "label": "Invoice ID",
    "options": "Sales Invoice",
-   "read_only": 1,
-   "unique": 1
+   "read_only": 1
   },
   {
    "fieldname": "column_break_jafl",
@@ -44,7 +43,7 @@
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2025-02-07 13:31:40.412566",
+ "modified": "2025-02-11 14:14:00.616848",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Failed Invoice Record",

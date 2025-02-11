@@ -56,7 +56,7 @@ class SalesOrderOverride(SalesOrder):
 		sales_invoice.update_stock = 1
 		sales_invoice.insert(ignore_permissions=True)
 
-		frappe.enqueue("eseller_suite.eseller_suite.custom_script.sales_order.sales_order.enq_si_submit", sales_invoice=sales_invoice)
+		# frappe.enqueue("eseller_suite.eseller_suite.custom_script.sales_order.sales_order.enq_si_submit", sales_invoice=sales_invoice)
 
 
 	def on_update(self):
