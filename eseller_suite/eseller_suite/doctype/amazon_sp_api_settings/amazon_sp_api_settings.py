@@ -121,7 +121,10 @@ def enq_si_submit():
 	sales_invoices = frappe.db.get_all("Sales Invoice", {"docstatus":0, "amazon_order_id":["is", "set"]}, pluck="name")
 	for sales_invoice in sales_invoices:
 		sales_invoice = frappe.get_doc("Sales Invoice", sales_invoice)
+		frappe.db.savepoint("before_testing_si_submit")
 		try:
 			sales_invoice.submit()
-		except Exception:
-			frappe.get_doc({"doctype":"Amazon Failed Invoice Record", "invoice_id":sales_invoice.name, "error":"test"}).insert()
+		except Exception as e:
+			frappe.db.rollback(save_point="before_testing_si_submit")
+			if not frappe.db.exists("Amazon Failed Invoice Record", {"invoice_id":sales_invoice.name}):
+				frappe.get_doc({"doctype":"Amazon Failed Invoice Record", "invoice_id":sales_invoice.name, "error":e}).insert()
