@@ -870,7 +870,7 @@ class AmazonRepository:
 				orders_payload = self.call_sp_api_method(
 					sp_api_method=orders.get_orders, last_updated_after=last_updated_after, next_token=next_token,
 				)
-		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit")
+		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit", sales_orders=sales_orders)
 		return sales_orders
 
 	def get_order(self, amazon_order_ids) -> list:
@@ -887,7 +887,7 @@ class AmazonRepository:
 					sales_orders.append(sales_order)
 			except:
 				pass
-		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit")
+		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit", sales_orders=sales_orders)
 		return sales_orders
 
 	def get_catalog_items_instance(self) -> CatalogItems:
