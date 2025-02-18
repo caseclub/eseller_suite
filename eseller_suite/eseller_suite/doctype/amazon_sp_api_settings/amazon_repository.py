@@ -622,10 +622,9 @@ class AmazonRepository:
 				si = frappe.db.get_value("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0  })
 				return_si = frappe.new_doc("Sales Invoice")
 				try:
-					posting_date = refund.get("posting_date") or ''
-					if posting_date:
-						posting_date = datetime.strptime(posting_date, "%Y-%m-%dT%H:%M:%SZ")
-						return_si.posting_date = get_datetime(posting_date).strftime("%Y-%m-%d")
+					if refund.get("posting_date"):
+						posting_date = refund.get("posting_date")
+						return_si.posting_date = getdate(posting_date)
 						return_si.posting_time = get_datetime(posting_date).strftime("%H:%M:%S")
 						return_si.set_posting_time = 1
 				except:
@@ -634,6 +633,7 @@ class AmazonRepository:
 				return_si.update_stock = 1
 				return_si.return_against = si
 				return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
+				return_si.set_warehouse = frappe.db.get_value("Sales Invoice", si, "set_warehouse")
 				for item in refund.get("items", []):
 					actual_item = frappe.db.get_value("Item", item.get('item_code'), "actual_item")
 					if not actual_item:
