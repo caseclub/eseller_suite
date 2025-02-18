@@ -17,9 +17,18 @@ def validate(doc, method):
 				serial_nos = get_serial_nos(item.warehouse, item.item_code, item.qty)
 				item.serial_no = "\n".join(serial_nos)
 
+def on_cancel(doc, method):
+	'''
+		Method which get trgiggered in on_cancel event
+	'''
+	if doc.is_return:
+		for item in doc.items:
+			if item.sales_invoice_item and frappe.db.exists('Sales Invoice Item', item.sales_invoice_item):
+				frappe.db.set_value('Sales Invoice Item', item.sales_invoice_item, 'refunded', 0)
+
 def get_serial_nos(warehouse, item_code, qty):
 	"""
-	Fetch serial numbers using FIFO for the given item and quantity.
+		Fetch serial numbers using FIFO for the given item and quantity.
 	"""
 	serial_no_list = frappe.get_all("Serial No",
 									filters={
