@@ -14,6 +14,7 @@ def after_install():
 	# Creating Property setters
 	create_property_setters(get_purchase_receipt_item_property_setters())
 	create_property_setters(get_stock_entry_detail_property_setters())
+	create_property_setters(get_stock_entry_property_setters())
 
 def after_migrate():
 	after_install()
@@ -548,4 +549,22 @@ def get_stock_entry_detail_property_setters():
 			"property": "hidden",
 			"value": 1
 		},
+	]
+
+def get_stock_entry_property_setters():
+    return [
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Stock Entry",
+			"field_name": "sales_invoice_no",
+			"property": "depends_on",
+			"value": ""
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Stock Entry",
+			"field_name": "sales_invoice_no",
+			"property": "read_only",
+			"value": 1
+		}
 	]
