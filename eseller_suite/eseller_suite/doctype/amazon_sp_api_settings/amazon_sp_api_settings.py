@@ -33,7 +33,7 @@ class AmazonSPAPISettings(Document):
 		if datetime.strptime(add_days(today(), -30), "%Y-%m-%d") > datetime.strptime(
 			get_date_str(self.after_date), "%Y-%m-%d"
 		):
-			frappe.throw(_("The date must be within the last 30 days."))
+			frappe.throw(_("The date must be within the last 60 days."))
 
 	@frappe.whitelist()
 	def get_order_details(self):
