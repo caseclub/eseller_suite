@@ -30,7 +30,7 @@ class AmazonSPAPISettings(Document):
 		# 	self.db_set("is_old_data_migrated", 1)
 
 	def validate_after_date(self):
-		if datetime.strptime(add_days(today(), -30), "%Y-%m-%d") > datetime.strptime(
+		if datetime.strptime(add_days(today(), -60), "%Y-%m-%d") > datetime.strptime(
 			get_date_str(self.after_date), "%Y-%m-%d"
 		):
 			frappe.throw(_("The date must be within the last 60 days."))
