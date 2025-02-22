@@ -498,6 +498,15 @@ def get_stock_entry_custom_fields():
 				"insert_after": "new_seral_section",
 				"description": "Barcode numbers should be seprated by line break",
 			}
+		],
+		"Stock Entry": [
+			{
+				"fieldname": "from_return_invoice",
+				"fieldtype": "Check",
+				"label": "From Return Invoice",
+				"insert_after": "sales_invoice_no",
+				"read_only": 1
+			},
 		]
 	}
 

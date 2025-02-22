@@ -623,6 +623,7 @@ class AmazonRepository:
 									"posting_date": ghost_stock_si_doc.posting_date,
 									"posting_time": ghost_stock_si_doc.posting_time,
 									"sales_invoice_no": ghost_stock_si_doc.name,
+									"from_return_invoice": 1,
 									"remarks": f"Stock updated to reflect return for Amazon Order {ghost_stock_si_doc.amazon_order_id}",
 									"to_warehouse": ghost_stock_si_doc.set_warehouse
 								})
