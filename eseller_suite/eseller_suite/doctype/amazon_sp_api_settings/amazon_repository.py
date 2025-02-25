@@ -629,7 +629,7 @@ class AmazonRepository:
 								})
 
 								for item in ghost_stock_si_doc.items:
-									ghost_stock.append("items", {"item_code": item.item_code, "qty": item.qty})
+									ghost_stock.append("items", {"item_code": item.item_code, "qty": item.qty, "allow_zero_valuation_rate":1})
 
 								# Savepoint for rollback safety
 								frappe.db.savepoint("ghost_stocking")
@@ -647,7 +647,8 @@ class AmazonRepository:
 										"invoice_id": ghost_stock_si_doc.name,
 										"error": str(e),
 									}).insert()
-					else:
+
+					if not return_created:
 						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 						failed_sync_record.amazon_order_id = order_id
 						failed_sync_record.remarks = 'Failed to create return Sales Invoice, Not able to find any Sales Invoice with this Amazon Order ID. Sales Order ID : {0}'.format(so_id)
