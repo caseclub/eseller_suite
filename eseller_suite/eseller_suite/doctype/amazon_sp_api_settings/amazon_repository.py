@@ -9,7 +9,7 @@ import dateutil
 import frappe
 from frappe import _
 from datetime import datetime
-from eseller_suite.eseller_suite.utils import foramt_date_time_to_ist
+from eseller_suite.eseller_suite.utils import format_date_time_to_ist
 
 from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api import (
 	CatalogItems,
@@ -479,7 +479,7 @@ class AmazonRepository:
 				seller_sku = ''
 				for refund_event in refund_event_list:
 					if refund_event:
-						charges_and_fees["posting_date"] = foramt_date_time_to_ist(refund_event.get("PostedDate"))
+						charges_and_fees["posting_date"] = format_date_time_to_ist(refund_event.get("PostedDate"))
 						for refund_item in refund_event.get("ShipmentItemAdjustmentList", []):
 							charges = refund_item.get("ItemChargeAdjustmentList", [])
 							fees = refund_item.get("ItemFeeAdjustmentList", [])
@@ -593,7 +593,7 @@ class AmazonRepository:
 			return refund_events
 
 		order_id = order.get("AmazonOrderId")
-		order_date = foramt_date_time_to_ist(order.get("PurchaseDate"))
+		order_date = format_date_time_to_ist(order.get("PurchaseDate"))
 		amazon_order_amount = order.get("OrderTotal", {}).get("Amount", 0)
 		so_id = None
 		so_docstatus = 0
@@ -609,44 +609,18 @@ class AmazonRepository:
 					# Stock Ghosting Process: "Ghosting" refers to adjusting stock for an invoice that lacks sufficient stock, not creating phantom stock.
 					if self.amz_setting.adjust_stock_for_returns:
 						ghost_stock_si = frappe.db.exists("Sales Invoice", {"amazon_order_id": order_id, "is_return": 0})
-
 						if ghost_stock_si:
 							ghost_stock_si_doc = frappe.get_doc("Sales Invoice", ghost_stock_si)
 
 							if ghost_stock_si_doc.posting_date < self.amz_setting.return_invoice_stock_adjustment_before:
 
 								# Create Stock Entry
-								ghost_stock = frappe.new_doc("Stock Entry")
-								ghost_stock.update({
-									"stock_entry_type": "Material Receipt",
-									"set_posting_time": 1,
-									"posting_date": ghost_stock_si_doc.posting_date,
-									"posting_time": ghost_stock_si_doc.posting_time,
-									"sales_invoice_no": ghost_stock_si_doc.name,
-									"from_return_invoice": 1,
-									"remarks": f"Stock updated to reflect return for Amazon Order {ghost_stock_si_doc.amazon_order_id}",
-									"to_warehouse": ghost_stock_si_doc.set_warehouse
-								})
-
-								for item in ghost_stock_si_doc.items:
-									ghost_stock.append("items", {"item_code": item.item_code, "qty": item.qty, "allow_zero_valuation_rate":1})
-
-								# Savepoint for rollback safety
-								frappe.db.savepoint("ghost_stocking")
-
-								try:
-									ghost_stock.insert(ignore_permissions=True)
-									ghost_stock.submit()
-									ghost_stock_si_doc.submit()
-									return_created = True
-								except Exception as e:
-									return_created = False
-									frappe.db.rollback(save_point="ghost_stocking")
-									frappe.get_doc({
-										"doctype": "Amazon Failed Invoice Record",
-										"invoice_id": ghost_stock_si_doc.name,
-										"error": str(e),
-									}).insert()
+								return_created = create_stock_entry(ghost_stock_si)
+								if return_created and ghost_stock_si_doc.docstatus == 0:
+									try:
+										ghost_stock_si_doc.submit()
+									except:
+										pass
 
 					if not return_created:
 						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
@@ -722,8 +696,8 @@ class AmazonRepository:
 			customer_name = create_customer(order)
 			create_address(order, customer_name)
 
-			delivery_date = foramt_date_time_to_ist(order.get("LatestShipDate"))
-			transaction_date = foramt_date_time_to_ist(order.get("PurchaseDate"))
+			delivery_date = format_date_time_to_ist(order.get("LatestShipDate"))
+			transaction_date = format_date_time_to_ist(order.get("PurchaseDate"))
 
 			so.amazon_order_id = order_id
 			so.marketplace_id = order.get("MarketplaceId")
@@ -944,3 +918,46 @@ def get_orders(amz_setting_name, last_updated_after, sync_selected_date_only=0) 
 def get_order(amz_setting_name, amazon_order_ids) -> list:
 	ar = AmazonRepository(amz_setting_name)
 	return ar.get_order(amazon_order_ids)
+
+def create_stock_entry(sales_invoice):
+	'''
+		Method to create Stock entry for Returns and Replaced Orders
+	'''
+	stock_entry_created = False
+	if frappe.db.exists('Sales Invoice', sales_invoice):
+		si_doc = frappe.get_doc('Sales Invoice', sales_invoice)
+		stock_entry = frappe.new_doc('Stock Entry')
+		stock_entry.update({
+			"stock_entry_type": "Material Receipt",
+			"set_posting_time": 1,
+			"posting_date": si_doc.posting_date,
+			"posting_time": si_doc.posting_time,
+			"sales_invoice_no": si_doc.name,
+			"from_return_invoice": 1,
+			"remarks": "Stock updated to reflect return/replacement for Amazon Order {0}".format(si_doc.amazon_order_id),
+			"to_warehouse": si_doc.set_warehouse
+		})
+
+		#Setting Items
+		for item in si_doc.items:
+			stock_entry.append("items", {
+				"item_code": item.item_code,
+				"qty": item.qty,
+				"allow_zero_valuation_rate":1
+			})
+
+		# Savepoint for rollback safety
+		frappe.db.savepoint("ghost_stocking")
+		try:
+			stock_entry.insert(ignore_permissions=True)
+			stock_entry.submit()
+			stock_entry_created = True
+		except Exception as e:
+			stock_entry_created = False
+			frappe.db.rollback(save_point="ghost_stocking")
+			frappe.get_doc({
+				"doctype": "Amazon Failed Invoice Record",
+				"invoice_id": sales_invoice,
+				"error": str(e),
+			}).insert()
+	return stock_entry_created

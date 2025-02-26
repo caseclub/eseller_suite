@@ -1,7 +1,7 @@
 from datetime import datetime
 from pytz import timezone
 
-def foramt_date_time_to_ist(utc_time_str):
+def format_date_time_to_ist(utc_time_str):
     # Parse the UTC time string
     utc_time = datetime.strptime(utc_time_str, '%Y-%m-%dT%H:%M:%SZ')
 

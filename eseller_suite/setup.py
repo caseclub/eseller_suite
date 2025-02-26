@@ -503,7 +503,7 @@ def get_stock_entry_custom_fields():
 			{
 				"fieldname": "from_return_invoice",
 				"fieldtype": "Check",
-				"label": "From Return Invoice",
+				"label": "From Return/Replaced Order",
 				"insert_after": "sales_invoice_no",
 				"read_only": 1
 			},
@@ -567,13 +567,20 @@ def get_stock_entry_property_setters():
 			"doc_type": "Stock Entry",
 			"field_name": "sales_invoice_no",
 			"property": "depends_on",
-			"value": ""
+			"value": "from_return_invoice"
 		},
 		{
 			"doctype_or_field": "DocField",
 			"doc_type": "Stock Entry",
 			"field_name": "sales_invoice_no",
 			"property": "read_only",
+			"value": 1
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Stock Entry",
+			"field_name": "sales_invoice_no",
+			"property": "allow_on_submit",
 			"value": 1
 		}
 	]
