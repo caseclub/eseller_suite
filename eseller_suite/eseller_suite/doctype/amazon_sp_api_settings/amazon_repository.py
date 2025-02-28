@@ -619,8 +619,8 @@ class AmazonRepository:
 								if return_created and ghost_stock_si_doc.docstatus == 0:
 									try:
 										ghost_stock_si_doc.submit()
-									except:
-										pass
+									except Exception as e:
+										frappe.log_error("Error submiting Invoice {0} for Order ID {1}".format(ghost_stock_si, order_id), str(e), "Sales Invoice")
 
 					if not return_created:
 						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
@@ -904,7 +904,7 @@ class AmazonRepository:
 					sales_orders.append(sales_order)
 			except:
 				pass
-		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit", sales_orders=sales_orders)
+		# frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit", sales_orders=sales_orders)
 		return sales_orders
 
 	def get_catalog_items_instance(self) -> CatalogItems:
