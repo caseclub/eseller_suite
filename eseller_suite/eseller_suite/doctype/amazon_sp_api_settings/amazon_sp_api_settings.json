@@ -35,7 +35,9 @@
   "max_retry_limit",
   "create_item_if_not_exists",
   "is_old_data_migrated",
-  "map_state_data"
+  "map_state_data",
+  "adjust_stock_for_returns",
+  "return_invoice_stock_adjustment_before"
  ],
  "fields": [
   {
@@ -244,10 +246,24 @@
    "fieldname": "temporary_stock_transfer_required",
    "fieldtype": "Check",
    "label": "Temporary Stock Transfer Required?"
+  },
+  {
+   "default": "0",
+   "description": "Use to Add stock for an item that was purchased before any stock was added into the system",
+   "fieldname": "adjust_stock_for_returns",
+   "fieldtype": "Check",
+   "label": "Adjust Stock for Returns?"
+  },
+  {
+   "depends_on": "eval: doc.adjust_stock_for_returns",
+   "fieldname": "return_invoice_stock_adjustment_before",
+   "fieldtype": "Date",
+   "label": "Return Invoice Stock Adjustment Before",
+   "mandatory_depends_on": "eval: doc.adjust_stock_for_returns"
   }
  ],
  "links": [],
- "modified": "2025-02-06 09:29:01.234479",
+ "modified": "2025-02-20 11:47:42.068266",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon SP API Settings",

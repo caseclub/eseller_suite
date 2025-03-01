@@ -30,10 +30,10 @@ class AmazonSPAPISettings(Document):
 		# 	self.db_set("is_old_data_migrated", 1)
 
 	def validate_after_date(self):
-		if datetime.strptime(add_days(today(), -30), "%Y-%m-%d") > datetime.strptime(
+		if datetime.strptime(add_days(today(), -60), "%Y-%m-%d") > datetime.strptime(
 			get_date_str(self.after_date), "%Y-%m-%d"
 		):
-			frappe.throw(_("The date must be within the last 30 days."))
+			frappe.throw(_("The date must be within the last 60 days."))
 
 	@frappe.whitelist()
 	def get_order_details(self):
@@ -97,7 +97,6 @@ def schedule_get_order_details():
 	for amz_setting in amz_settings:
 		get_orders(amz_setting_name=amz_setting.name, last_updated_after=current_date)
 
-
 # Called via a hook every day to sync data of the previous day.
 def schedule_get_order_details_daily():
 	from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import (
@@ -114,3 +113,19 @@ def schedule_get_order_details_daily():
 
 	for amz_setting in amz_settings:
 		get_orders(amz_setting_name=amz_setting.name, last_updated_after=from_date)
+		frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit", queue="long")
+
+def enq_si_submit(sales_orders = []):
+	if not sales_orders:
+		sales_invoices = frappe.db.get_all("Sales Invoice", {"docstatus":0, "amazon_order_id":["is", "set"]}, pluck="name")
+	else:
+		sales_invoices = frappe.db.get_all("Sales Invoice Item", {"sales_order":["in", sales_orders]}, pluck="parent")
+	for sales_invoice in sales_invoices:
+		sales_invoice = frappe.get_doc("Sales Invoice", sales_invoice)
+		frappe.db.savepoint("before_testing_si_submit")
+		try:
+			sales_invoice.submit()
+		except Exception as e:
+			frappe.db.rollback(save_point="before_testing_si_submit")
+			if not frappe.db.exists("Amazon Failed Invoice Record", {"invoice_id":sales_invoice.name}):
+				frappe.get_doc({"doctype":"Amazon Failed Invoice Record", "invoice_id":sales_invoice.name, "error":e}).insert()

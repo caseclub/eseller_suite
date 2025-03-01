@@ -128,6 +128,8 @@ override_doctype_class = {
 doc_events = {
 	'Sales Invoice':{
 		"validate": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.validate",
+		"before_submit": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.before_submit",
+		"on_cancel": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.on_cancel",
     },
 	'Purchase Receipt':{
 		"before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
