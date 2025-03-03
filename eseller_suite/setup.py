@@ -15,6 +15,7 @@ def after_install():
 	create_property_setters(get_purchase_receipt_item_property_setters())
 	create_property_setters(get_stock_entry_detail_property_setters())
 	create_property_setters(get_stock_entry_property_setters())
+	create_property_setters(get_item_property_setters())
 
 def after_migrate():
 	after_install()
@@ -56,7 +57,7 @@ def get_item_custom_fields():
 				"insert_after": "item_code",
 				"in_standard_filter": 1,
 				"unique": 1,
-				"read_only": 1,
+				"read_only": 0,
 				"no_copy": 1
 			},
 			{
@@ -75,6 +76,14 @@ def get_item_custom_fields():
 				"options": "Item",
 				"label": "Actual Item",
 				"insert_after": "item_name",
+				"depends_on": "eval: !doc.is_actual_item;"
+			},
+			{
+				"fieldname": "is_actual_item",
+				"fieldtype": "Check",
+				"label": "Is Actual Item",
+				"insert_after": "allow_alternative_item",
+				"depends_on": "eval: !doc.actual_item;"
 			}
 		]
 	}
@@ -582,5 +591,72 @@ def get_stock_entry_property_setters():
 			"field_name": "sales_invoice_no",
 			"property": "allow_on_submit",
 			"value": 1
+		}
+	]
+
+def get_item_property_setters():
+    return [
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "is_stock_item",
+			"property": "depends_on",
+			"value": "is_actual_item"
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "is_stock_item",
+			"property": "default",
+			"value": 0
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "is_sales_item",
+			"property": "depends_on",
+			"value": "is_actual_item"
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "is_sales_item",
+			"property": "default",
+			"value": 0
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "is_purchase_item",
+			"property": "depends_on",
+			"value": "is_actual_item"
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "is_purchase_item",
+			"property": "default",
+			"value": 0
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "has_variants",
+			"property": "depends_on",
+			"value": "is_actual_item"
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "has_batch_no",
+			"property": "depends_on",
+			"value": "is_actual_item"
+		},
+		{
+			"doctype_or_field": "DocField",
+			"doc_type": "Item",
+			"field_name": "has_serial_no",
+			"property": "depends_on",
+			"value": "is_actual_item"
 		}
 	]
