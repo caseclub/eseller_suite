@@ -615,8 +615,8 @@ class AmazonRepository:
 							if ghost_stock_si_doc.posting_date < self.amz_setting.return_invoice_stock_adjustment_before:
 
 								# Create Stock Entry
-								return_created = create_stock_entry(ghost_stock_si)
-								if return_created and ghost_stock_si_doc.docstatus == 0:
+								stock_for_return_created = create_stock_entry(ghost_stock_si)
+								if stock_for_return_created and ghost_stock_si_doc.docstatus == 0:
 									try:
 										ghost_stock_si_doc.submit()
 									except Exception as e:
@@ -637,51 +637,60 @@ class AmazonRepository:
 						break
 
 				si = frappe.db.get_value("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0  })
-				return_si = frappe.new_doc("Sales Invoice")
-				try:
-					if refund.get("posting_date"):
-						posting_date = refund.get("posting_date")
-						return_si.posting_date = getdate(posting_date)
-						return_si.posting_time = get_datetime(posting_date).strftime("%H:%M:%S")
-						return_si.set_posting_time = 1
-				except:
-					pass
-				return_si.is_return = 1
-				return_si.update_stock = 1
-				return_si.return_against = si
-				return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
-				return_si.set_warehouse = frappe.db.get_value("Sales Invoice", si, "set_warehouse")
+
+				existing_returns = tuple(frappe.db.get_all("Sales Invoice", {"return_against":si}, pluck="name"))
 				for item in refund.get("items", []):
+
+					return_si = frappe.new_doc("Sales Invoice")
+					try:
+						if refund.get("posting_date"):
+							posting_date = refund.get("posting_date")
+							return_si.posting_date = getdate(posting_date)
+							return_si.posting_time = get_datetime(posting_date).strftime("%H:%M:%S")
+							return_si.set_posting_time = 1
+					except:
+						pass
+					return_si.is_return = 1
+					return_si.update_stock = 1
+					return_si.return_against = si
+					return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
+					return_si.set_warehouse = frappe.db.get_value("Sales Invoice", si, "set_warehouse")
+
 					actual_item = frappe.db.get_value("Item", item.get('item_code'), "actual_item")
 					if not actual_item:
 						actual_item = item.get("item_code")
-					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": actual_item, "refunded":0 }):
-						return_si.append("items", {
-							"item_code": actual_item,
-							"qty": -1 * float(item.get('qty')),
-							"rate": abs(float(item.get('amount'))/float(item.get('qty'))),
-							"sales_order": so_id,
-							"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "name")
-						})
-						frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "refunded", 1)
-						return_created = True
+					returned_qty = 0
+					for returned_si in existing_returns:
+						existing_returned_qty = frappe.db.get_value("Sales Invoice Item", {"parent": returned_si, "item_code": actual_item}, "qty") or 0
+						returned_qty += existing_returned_qty
+					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": actual_item}):
+						if frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "qty") >= (returned_qty + float(item.get('qty'))):
+							return_si.append("items", {
+								"item_code": actual_item,
+								"qty": -1 * float(item.get('qty')),
+								"rate": abs(float(item.get('amount'))/float(item.get('qty'))),
+								"sales_order": so_id,
+								"sales_invoice_item": frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "name")
+							})
+							frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "refunded", 1)
+							return_created = True
 
-				if return_created:
-					for charge in refund.get("charges", []):
-						return_si.append("taxes", charge)
+							if return_created:
+								for charge in refund.get("charges", []):
+									return_si.append("taxes", charge)
 
-					for fee in refund.get("fees", []):
-						return_si.append("taxes", fee)
+								for fee in refund.get("fees", []):
+									return_si.append("taxes", fee)
 
-					return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
-					return_si.disable_rounded_total = 1
-					return_si.update_outstanding_for_self = 1
-					return_si.update_billed_amount_in_sales_order = 1
-					try:
-						return_si.insert(ignore_permissions=True)
-						return_si.submit()
-					except Exception as e:
-						frappe.log_error("Error creating Return Invoice for {0}".format(return_si.amazon_order_id), e, "Sales Invoice")
+								return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
+								return_si.disable_rounded_total = 1
+								return_si.update_outstanding_for_self = 1
+								return_si.update_billed_amount_in_sales_order = 1
+								try:
+									return_si.insert(ignore_permissions=True)
+									return_si.submit()
+								except Exception as e:
+									frappe.log_error("Error creating Return Invoice for {0}".format(return_si.amazon_order_id), e, "Sales Invoice")
 
 			return so_id
 
