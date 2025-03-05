@@ -2,6 +2,7 @@
 # For license information, please see license.txt
 
 
+import json
 import time
 import urllib
 
@@ -928,6 +929,7 @@ def get_order(amz_setting_name, amazon_order_ids) -> list:
 	ar = AmazonRepository(amz_setting_name)
 	return ar.get_order(amazon_order_ids)
 
+@frappe.whitelist()
 def create_stock_entry(sales_invoice):
 	'''
 		Method to create Stock entry for Returns and Replaced Orders
@@ -970,3 +972,11 @@ def create_stock_entry(sales_invoice):
 				"error": str(e),
 			}).insert()
 	return stock_entry_created
+
+@frappe.whitelist()
+def create_stock_entries_for_sis(names):
+	"""method to bulk create stock entries for draft sales invoices
+	"""
+	names = json.loads(names)
+	for name in names:
+		create_stock_entry(name)
