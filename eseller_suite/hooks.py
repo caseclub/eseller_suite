@@ -119,7 +119,8 @@ before_uninstall = "eseller_suite.setup.before_uninstall"
 # Override standard doctype classes
 
 override_doctype_class = {
-	"Sales Order": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.SalesOrderOverride"
+	"Sales Order": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.SalesOrderOverride",
+	"Journal Entry": "eseller_suite.eseller_suite.custom_script.journal_entry.journal_entry.JournalEntryOverride"
 }
 
 # Document Events

@@ -133,12 +133,19 @@ class AmazonPaymentEntry(Document):
 							row.journal_entry = replaced_jv
 							row.ready_to_process = 1
 							has_changes = True
-				if row.transaction_type == 'Other' and row.product_details == 'FBA Inventory Reimbursement' and row.order_id == '---':
+				if row.transaction_type in ['Other', 'Inventory Reimbursement'] and row.product_details in ['FBA Inventory Reimbursement', 'FBA Reversed Reimbursement'] and row.order_id == '---':
 					if float(row.total) < 0:
 						inventory_reimbursement_account = frappe.db.get_single_value('eSeller Settings', 'inventory_reimbursement_account')
 						if inventory_reimbursement_account:
 							row.ready_to_process = 1
 							row.amazon_expense_account = inventory_reimbursement_account
+							has_changes = True
+				if row.transaction_type == 'Inventory Reimbursement' and row.product_details == 'FBA Inventory Reimbursement' and row.order_id:
+					if float(row.total) > 0:
+						inventory_reimbursement_income_account = frappe.db.get_single_value('eSeller Settings', 'inventory_reimbursement_income_account')
+						if inventory_reimbursement_income_account:
+							row.ready_to_process = 1
+							row.amazon_expense_account = inventory_reimbursement_income_account
 							has_changes = True
 		if has_changes:
 			self.save()
