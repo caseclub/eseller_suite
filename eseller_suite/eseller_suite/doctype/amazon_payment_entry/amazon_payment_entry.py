@@ -140,12 +140,25 @@ class AmazonPaymentEntry(Document):
 							row.ready_to_process = 1
 							row.amazon_expense_account = inventory_reimbursement_account
 							has_changes = True
+					elif float(row.total) > 0:
+						inventory_reimbursement_income_account = frappe.db.get_single_value('eSeller Settings', 'inventory_reimbursement_income_account')
+						if inventory_reimbursement_income_account:
+							row.ready_to_process = 1
+							row.amazon_expense_account = inventory_reimbursement_income_account
+							has_changes = True
 				if row.transaction_type == 'Inventory Reimbursement' and row.product_details == 'FBA Inventory Reimbursement' and row.order_id:
 					if float(row.total) > 0:
 						inventory_reimbursement_income_account = frappe.db.get_single_value('eSeller Settings', 'inventory_reimbursement_income_account')
 						if inventory_reimbursement_income_account:
 							row.ready_to_process = 1
 							row.amazon_expense_account = inventory_reimbursement_income_account
+							has_changes = True
+				if row.transaction_type == 'Other' and row.product_details == 'Others' and row.order_id == '---':
+					if float(row.total) < 0:
+						other_expenses_account = frappe.db.get_single_value('eSeller Settings', 'other_expenses_account')
+						if other_expenses_account:
+							row.ready_to_process = 1
+							row.amazon_expense_account = other_expenses_account
 							has_changes = True
 		if has_changes:
 			self.save()

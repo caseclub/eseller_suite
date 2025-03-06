@@ -13,6 +13,7 @@
   "amazon_reserve_fund",
   "inventory_reimbursement_account",
   "inventory_reimbursement_income_account",
+  "other_expenses_account",
   "use_reserve_lines_in_amazon_payment_entry",
   "amazon_reserve_income_account",
   "amazon_reserve_expense_account",
@@ -136,13 +137,21 @@
    "label": "Inventory Reimbursement Income Account",
    "options": "Account",
    "reqd": 1
+  },
+  {
+   "description": "This account will be used for Other Expenses",
+   "fieldname": "other_expenses_account",
+   "fieldtype": "Link",
+   "label": "Other Expenses Account",
+   "options": "Account",
+   "reqd": 1
   }
  ],
  "hide_toolbar": 1,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2025-03-06 09:51:08.827373",
+ "modified": "2025-03-06 15:44:02.827689",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "eSeller Settings",
