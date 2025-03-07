@@ -8,6 +8,7 @@ frappe.ui.form.on("Amazon Payment Entry", {
                 frm.set_value('mode_of_payment', default_mode_of_payment);
             });
         }
+        frm.set_df_property('payment_details', 'cannot_add_rows', true)
     },
     refresh(frm) {
         if (frm.doc.in_progress) {
