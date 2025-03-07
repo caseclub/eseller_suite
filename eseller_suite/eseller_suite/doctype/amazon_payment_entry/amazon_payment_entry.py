@@ -160,6 +160,19 @@ class AmazonPaymentEntry(Document):
 							row.ready_to_process = 1
 							row.amazon_expense_account = other_expenses_account
 							has_changes = True
+					elif float(row.total) > 0:
+						other_income_account = frappe.db.get_single_value('eSeller Settings', 'other_income_account')
+						if other_income_account:
+							row.ready_to_process = 1
+							row.amazon_expense_account = other_income_account
+							has_changes = True
+				if row.transaction_type.strip() == 'Cancellation' and row.product_details == 'Order Cancellation Charge' and row.total and row.order_id:
+					if float(row.total) < 0:
+						order_cancellation_account = frappe.db.get_single_value('eSeller Settings', 'order_cancellation_account')
+						if order_cancellation_account:
+							row.ready_to_process = 1
+							row.amazon_expense_account = order_cancellation_account
+							has_changes = True
 		if has_changes:
 			self.save()
 		return 1

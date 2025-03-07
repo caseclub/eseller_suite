@@ -38,8 +38,7 @@
    "fieldname": "payment_details",
    "fieldtype": "Table",
    "label": "Payment Details",
-   "options": "Amazon Payment Entry Item",
-   "read_only": 1
+   "options": "Amazon Payment Entry Item"
   },
   {
    "fieldname": "column_break_isbj",
@@ -119,7 +118,7 @@
    "link_fieldname": "cheque_no"
   }
  ],
- "modified": "2024-11-12 11:38:43.448822",
+ "modified": "2025-03-07 12:15:51.305353",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Entry",
