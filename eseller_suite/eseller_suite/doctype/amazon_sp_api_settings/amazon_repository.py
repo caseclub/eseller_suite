@@ -830,7 +830,7 @@ class AmazonRepository:
 					"Unfulfillable",
 				]
 
-				if order.get("OrderStatus") in order_statuses:
+				if order.get("OrderStatus") in order_statuses and len(so.taxes):
 					try:
 						so.submit()
 					except Exception as e:
