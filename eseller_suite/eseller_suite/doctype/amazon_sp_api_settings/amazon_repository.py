@@ -745,7 +745,7 @@ class AmazonRepository:
 					so.custom_validate()
 					if so.grand_total>=0:
 						so.save(ignore_permissions=True)
-					else:
+					elif not frappe.db.exists("Amazon Failed Sync Record", {"amazon_order_id":order_id}):
 						remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 						failed_sync_record.amazon_order_id = order_id
@@ -835,7 +835,7 @@ class AmazonRepository:
 						so.submit()
 					except Exception as e:
 						frappe.log_error("Error submitting Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
-			else:
+			elif not frappe.db.exists("Amazon Failed Sync Record", {"amazon_order_id":order_id}):
 				remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
 				failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
 				failed_sync_record.amazon_order_id = order_id
