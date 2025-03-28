@@ -468,6 +468,7 @@ class AmazonRepository:
 				return []
    
 			refund_events = []
+			processed_items = set()
 
 			while True:
 				shipment_event_list = financial_events_payload.get("FinancialEvents", {}).get("ShipmentEventList", [])
@@ -475,22 +476,41 @@ class AmazonRepository:
 				service_fee_event_list = financial_events_payload.get("FinancialEvents", {}).get("ServiceFeeEventList", [])
 				next_token = financial_events_payload.get("NextToken")
 
-
 				seller_sku = ''
 				for refund_event in refund_event_list:
 					if refund_event:
-
-						charges_and_fees = {"posting_date": "", "items":[], "charges": [], "fees": [], "tds":[], "amazon_order_amount":amazon_order_amount, "order_date":order_date}
+						charges_and_fees = {
+							"posting_date": "", 
+							"items": [], 
+							"charges": [], 
+							"fees": [], 
+							"tds": [], 
+							"amazon_order_amount": amazon_order_amount, 
+							"order_date": order_date
+						}
 
 						charges_and_fees["posting_date"] = format_date_time_to_ist(refund_event.get("PostedDate"))
+						
 						for refund_item in refund_event.get("ShipmentItemAdjustmentList", []):
+							# Create a unique key to prevent duplicate processing
+							item_key = (
+								refund_item.get("SellerSKU"), 
+								refund_item.get("OrderAdjustmentItemId")
+							)
+
+							# Skip if this item has already been processed
+							if item_key in processed_items:
+								continue
+							processed_items.add(item_key)
+
 							charges = refund_item.get("ItemChargeAdjustmentList", [])
 							fees = refund_item.get("ItemFeeAdjustmentList", [])
 							promotions = refund_item.get("PromotionAdjustmentList", [])
 							seller_sku = refund_item.get("SellerSKU")
+							
 							item_code = None
-							if frappe.db.exists('Item', { 'amazon_item_code': seller_sku }):
-								item_code =  frappe.db.get_value('Item', { 'amazon_item_code': seller_sku })
+							if frappe.db.exists('Item', {'amazon_item_code': seller_sku}):
+								item_code = frappe.db.get_value('Item', {'amazon_item_code': seller_sku})
 
 							for charge in charges:
 								charge_type = charge.get("ChargeType")
@@ -498,22 +518,18 @@ class AmazonRepository:
 
 								if charge_type != "Principal" and float(amount) != 0:
 									charge_account = self.get_account(charge_type)
-									charges_and_fees.get("charges").append(
-										{
-											"charge_type": "Actual",
-											"account_head": charge_account,
-											"tax_amount": amount,
-											"description": charge_type + " refund for " + seller_sku,
-										}
-									)
+									charges_and_fees["charges"].append({
+										"charge_type": "Actual",
+										"account_head": charge_account,
+										"tax_amount": amount,
+										"description": charge_type + " refund for " + seller_sku,
+									})
 								else:
-									charges_and_fees.get("items").append(
-										{
-											"item_code": item_code,
-											"qty": refund_item.get("QuantityShipped"),
-											"amount": charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
-										}
-									)
+									charges_and_fees["items"].append({
+										"item_code": item_code,
+										"qty": refund_item.get("QuantityShipped"),
+										"amount": charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
+									})
 
 							for fee in fees:
 								fee_type = fee.get("FeeType")
@@ -521,14 +537,12 @@ class AmazonRepository:
 
 								if float(amount) != 0:
 									fee_account = self.get_account(fee_type)
-									charges_and_fees.get("fees").append(
-										{
-											"charge_type": "Actual",
-											"account_head": fee_account,
-											"tax_amount": amount,
-											"description": fee_type + " refund for " + seller_sku,
-										}
-									)
+									charges_and_fees["fees"].append({
+										"charge_type": "Actual",
+										"account_head": fee_account,
+										"tax_amount": amount,
+										"description": fee_type + " refund for " + seller_sku,
+									})
 
 							for promotion in promotions:
 								promotion_type = promotion.get("PromotionType")
@@ -536,62 +550,76 @@ class AmazonRepository:
 
 								if float(amount) != 0:
 									promotion_account = self.get_account(promotion_type)
-									charges_and_fees.get("fees").append(
-										{
-											"charge_type": "Actual",
-											"account_head": promotion_account,
-											"tax_amount": amount,
-											"description": promotion_type + " refund for " + seller_sku,
-										}
-									)
+									charges_and_fees["fees"].append({
+										"charge_type": "Actual",
+										"account_head": promotion_account,
+										"tax_amount": amount,
+										"description": promotion_type + " refund for " + seller_sku,
+									})
 
 						refund_events.append(charges_and_fees)			
 
 				for service_fee in service_fee_event_list:
 					if service_fee:
-
-						charges_and_fees = {"posting_date": "", "items":[], "charges": [], "fees": [], "tds":[], "amazon_order_amount":amazon_order_amount, "order_date":order_date}
+						charges_and_fees = {
+							"posting_date": "", 
+							"items": [], 
+							"charges": [], 
+							"fees": [], 
+							"tds": [], 
+							"amazon_order_amount": amazon_order_amount, 
+							"order_date": order_date
+						}
 
 						for service_fee_item in service_fee.get("FeeList", []):
 							fee_type = service_fee_item.get("FeeType")
 							amount = service_fee_item.get("FeeAmount", {}).get("CurrencyAmount", 0)
+							
 							if float(amount) != 0:
 								fee_account = self.get_account(fee_type)
-								charges_and_fees.get("fees").append(
-									{
-										"charge_type": "Actual",
-										"account_head": fee_account,
-										"tax_amount": amount,
-										"description": fee_type + " for " + seller_sku,
-									}
-								)
+								charges_and_fees["fees"].append({
+									"charge_type": "Actual",
+									"account_head": fee_account,
+									"tax_amount": amount,
+									"description": fee_type + " for " + seller_sku,
+								})
+						
 						refund_events.append(charges_and_fees)		
 				
 				tdss = []
 				for shipment_event in shipment_event_list:
 					if shipment_event:
-
-						charges_and_fees = {"posting_date": "", "items":[], "charges": [], "fees": [], "tds":[], "amazon_order_amount":amazon_order_amount, "order_date":order_date}
+						charges_and_fees = {
+							"posting_date": "", 
+							"items": [], 
+							"charges": [], 
+							"fees": [], 
+							"tds": [], 
+							"amazon_order_amount": amazon_order_amount, 
+							"order_date": order_date
+						}
 
 						for shipment_item in shipment_event.get("ShipmentItemList", []):
 							tds_list = shipment_item.get("ItemTaxWithheldList", [])
 							if tds_list:
 								tdss = tds_list[0].get("TaxesWithheld", [])
+							
 							for tds in tdss:
 								tds_type = tds.get("ChargeType")
 								amount = tds.get("ChargeAmount", {}).get("CurrencyAmount", 0)
+								
 								if float(amount) != 0:
 									tds_account = self.get_account(tds_type)
-									charges_and_fees.get("tds").append(
-										{
-											"charge_type": "Actual",
-											"account_head": tds_account,
-											"tax_amount": amount,
-											"description": tds_type + " for " + seller_sku,
-										}
-									)
+									charges_and_fees["tds"].append({
+										"charge_type": "Actual",
+										"account_head": tds_account,
+										"tax_amount": amount,
+										"description": tds_type + " for " + seller_sku,
+									})
+						
 						refund_events.append(charges_and_fees)			
 
+				# Remove the redundant line that was causing duplicate appending
 				refund_events.append(charges_and_fees)
 
 				if not next_token:
@@ -679,6 +707,8 @@ class AmazonRepository:
 						returned_qty += existing_returned_qty
 					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": actual_item}):
 						if frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "qty") >= (returned_qty + float(item.get('qty'))):
+							if frappe.db.exists("Sales Invoice Item", {"item_code":actual_item, "parent":["in", frappe.db.get_all("Sales Invoice", {"is_return":1, "return_against":si})]}):
+								continue
 							return_si.append("items", {
 								"item_code": actual_item,
 								"qty": -1 * float(item.get('qty')),
