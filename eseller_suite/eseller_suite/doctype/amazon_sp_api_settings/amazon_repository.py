@@ -479,29 +479,17 @@ class AmazonRepository:
 				seller_sku = ''
 				for refund_event in refund_event_list:
 					if refund_event:
-						charges_and_fees = {
-							"posting_date": "", 
-							"items": [], 
-							"charges": [], 
-							"fees": [], 
-							"tds": [], 
-							"amazon_order_amount": amazon_order_amount, 
-							"order_date": order_date
-						}
-
-						charges_and_fees["posting_date"] = format_date_time_to_ist(refund_event.get("PostedDate"))
-						
 						for refund_item in refund_event.get("ShipmentItemAdjustmentList", []):
-							# Create a unique key to prevent duplicate processing
-							item_key = (
-								refund_item.get("SellerSKU"), 
-								refund_item.get("OrderAdjustmentItemId")
-							)
-
-							# Skip if this item has already been processed
-							if item_key in processed_items:
-								continue
-							processed_items.add(item_key)
+							charges_and_fees = {
+								"posting_date": "",
+								"items": [],
+								"charges": [],
+								"fees": [],
+								"tds": [],
+								"amazon_order_amount": amazon_order_amount,
+								"order_date": order_date
+							}
+							charges_and_fees["posting_date"] = format_date_time_to_ist(refund_event.get("PostedDate"))
 
 							charges = refund_item.get("ItemChargeAdjustmentList", [])
 							fees = refund_item.get("ItemFeeAdjustmentList", [])
@@ -557,7 +545,7 @@ class AmazonRepository:
 										"description": promotion_type + " refund for " + seller_sku,
 									})
 
-						refund_events.append(charges_and_fees)			
+							refund_events.append(charges_and_fees)
 
 				for service_fee in service_fee_event_list:
 					if service_fee:
@@ -707,8 +695,6 @@ class AmazonRepository:
 						returned_qty += existing_returned_qty
 					if frappe.db.exists("Sales Invoice Item", {"parent": si, "item_code": actual_item}):
 						if frappe.db.get_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "qty") >= (returned_qty + float(item.get('qty'))):
-							if frappe.db.exists("Sales Invoice Item", {"item_code":actual_item, "parent":["in", frappe.db.get_all("Sales Invoice", {"is_return":1, "return_against":si})]}):
-								continue
 							return_si.append("items", {
 								"item_code": actual_item,
 								"qty": -1 * float(item.get('qty')),
