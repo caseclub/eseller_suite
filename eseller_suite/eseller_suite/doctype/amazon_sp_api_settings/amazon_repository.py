@@ -633,8 +633,19 @@ class AmazonRepository:
 			so_id, so_docstatus = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname=["name", "docstatus"])
 
 		if so_id and refunds and so_docstatus:
+			si = frappe.db.exists("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0})
+			existing_return_si = frappe.db.exists("Sales Invoice", {"amazon_order_id": order_id, "docstatus": 1, "is_return": 1, "return_against": si})
+			if existing_return_si:
+				try:
+					frappe.get_doc("Sales Invoice", existing_return_si).cancel()
+				except Exception as e:
+					frappe.log_error("Error cancelling Return Invoice for {0}".format(existing_return_si), e, "Sales Invoice", so_id)
+					return so_id
+			return_si = frappe.new_doc("Sales Invoice")
+			if existing_return_si:
+				return_si.amended_from = existing_return_si
+			return_created = False
 			for refund in refunds:
-				return_created = False
 				if not frappe.db.exists("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0 }):
 					# Stock Ghosting Process: "Ghosting" refers to adjusting stock for an invoice that lacks sufficient stock, not creating phantom stock.
 					if self.amz_setting.adjust_stock_for_returns:
@@ -652,26 +663,12 @@ class AmazonRepository:
 									except Exception as e:
 										frappe.log_error("Error submiting Invoice {0} for Order ID {1}".format(ghost_stock_si, order_id), str(e), "Sales Invoice")
 
-					if not return_created:
-						failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
-						failed_sync_record.amazon_order_id = order_id
-						failed_sync_record.remarks = 'Failed to create return Sales Invoice, Not able to find any Sales Invoice with this Amazon Order ID. Sales Order ID : {0}'.format(so_id)
-						failed_sync_record.payload = refund
-						if refund.get("posting_date"):
-							failed_sync_record.posting_date = dateutil.parser.parse(refund.get("posting_date")).strftime("%Y-%m-%d")
-						if refund.get("order_date"):
-							failed_sync_record.amazon_order_date = dateutil.parser.parse(refund.get("order_date")).strftime("%Y-%m-%d")
-						if refund.get("amazon_order_amount"):
-							failed_sync_record.amazon_order_amount = refund.get("amazon_order_amount")
-						failed_sync_record.save(ignore_permissions=True)
-						break
 
 				si = frappe.db.get_value("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0  })
 
 				existing_returns = tuple(frappe.db.get_all("Sales Invoice", {"return_against":si}, pluck="name"))
 				for item in refund.get("items", []):
 
-					return_si = frappe.new_doc("Sales Invoice")
 					try:
 						if refund.get("posting_date"):
 							posting_date = refund.get("posting_date")
@@ -705,22 +702,35 @@ class AmazonRepository:
 							frappe.db.set_value("Sales Invoice Item", {"parent": si, "item_code": actual_item}, "refunded", 1)
 							return_created = True
 
-							if return_created:
-								for charge in refund.get("charges", []):
-									return_si.append("taxes", charge)
+				if return_created:
+					for charge in refund.get("charges", []):
+						return_si.append("taxes", charge)
 
-								for fee in refund.get("fees", []):
-									return_si.append("taxes", fee)
+					for fee in refund.get("fees", []):
+						return_si.append("taxes", fee)
 
-								return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
-								return_si.disable_rounded_total = 1
-								return_si.update_outstanding_for_self = 1
-								return_si.update_billed_amount_in_sales_order = 1
-								try:
-									return_si.insert(ignore_permissions=True)
-									return_si.submit()
-								except Exception as e:
-									frappe.log_error("Error creating Return Invoice for {0}".format(return_si.amazon_order_id), e, "Sales Invoice")
+					return_si.amazon_order_id = frappe.db.get_value("Sales Invoice", si, "amazon_order_id")
+					return_si.disable_rounded_total = 1
+					return_si.update_outstanding_for_self = 1
+					return_si.update_billed_amount_in_sales_order = 1
+				else:
+					failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
+					failed_sync_record.amazon_order_id = order_id
+					failed_sync_record.remarks = 'Failed to create return Sales Invoice, Not able to find any Sales Invoice with this Amazon Order ID. Sales Order ID : {0}'.format(so_id)
+					failed_sync_record.payload = refund
+					if refund.get("posting_date"):
+						failed_sync_record.posting_date = dateutil.parser.parse(refund.get("posting_date")).strftime("%Y-%m-%d")
+					if refund.get("order_date"):
+						failed_sync_record.amazon_order_date = dateutil.parser.parse(refund.get("order_date")).strftime("%Y-%m-%d")
+					if refund.get("amazon_order_amount"):
+						failed_sync_record.amazon_order_amount = refund.get("amazon_order_amount")
+					failed_sync_record.save(ignore_permissions=True)
+					break
+			try:
+				return_si.insert(ignore_permissions=True)
+				return_si.submit()
+			except Exception as e:
+				frappe.log_error("Error creating Return Invoice for {0}".format(return_si.amazon_order_id), e, "Sales Invoice")
 
 			return so_id
 
