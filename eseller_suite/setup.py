@@ -179,6 +179,15 @@ def get_sales_order_custom_fields():
 				"options": "Stock Entry",
 				"depends_on": "eval:frappe.session.user=='Administrator'"
 			},
+			{
+				"fieldname": "cancelled_items",
+				"fieldtype": "Table",
+				"label": "Cancelled Items",
+				"insert_after": "items",
+				"read_only": 1,
+				"no_copy": 1,
+				"options": "Cancelled Order Items",
+			}
 		],
 		"Sales Order Item": [
 			{
