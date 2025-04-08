@@ -98,7 +98,7 @@ class AmazonPaymentEntry(Document):
 					invoice_details = get_invoice_details(row.order_id, is_return=0)
 					return_invoice_details = None
 					is_return = False
-					if row.transaction_type in ['Fulfillment Fee Refund', 'Refund']:
+					if row.transaction_type in ['Fulfillment Fee Refund', 'Refund'] or row.product_details == 'Weight Handling Fees Reversal':
 						is_return = True
 						return_invoice_details = get_invoice_details(row.order_id, is_return=1)
 					if invoice_details.get('sales_invoice'):

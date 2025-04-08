@@ -327,6 +327,8 @@ class AmazonRepository:
 			next_token = order_items_payload.get("NextToken")
 
 			for order_item in order_items_list:
+				zero_qty_flag = False
+				actual_qty = 0
 				if order_item.get("QuantityOrdered") >= 0:
 					item_amount = float(order_item.get("ItemPrice", {}).get("Amount", 0))
 					item_tax = float(order_item.get("ItemTax", {}).get("Amount", 0))
@@ -337,6 +339,8 @@ class AmazonRepository:
 					# In case of Cancelled orders Qty will be 0, Invoice will not get created
 					if not item_qty:
 						item_qty = 1
+						zero_qty_flag = True
+						actual_qty = order_item.get("ProductInfo").get("NumberOfItems")
 					item_rate = item_amount/item_qty
 					item_code = self.get_item_code(order_item)
 					actual_item = frappe.db.get_value("Item", item_code, "actual_item")
@@ -357,7 +361,9 @@ class AmazonRepository:
 							"warehouse": warehouse,
 							"conversion_factor": 1.0,
 							"allow_zero_valuation_rate": 1,
-							"total_order_value": total_order_value
+							"total_order_value": total_order_value,
+							"zero_qty_flag": zero_qty_flag,
+							"actual_qty": actual_qty
 						}
 					)
 
@@ -804,10 +810,27 @@ class AmazonRepository:
 			so.taxes_and_charges = ''
 			total_order_value = 0
 
+			# Check if all items are zero-qty
+			all_zero_qty = all(item.get("zero_qty_flag", False) for item in items)
+			zero_qty_items = []
+
 			for item in items:
+				print("item", item)
+				if not all_zero_qty and item.get("zero_qty_flag", True):
+					zero_qty_items.append(item)
+					continue
+
 				total_order_value += item.get('total_order_value', 0)
 				item["warehouse"] = warehouse
 				so.append("items", item)
+
+			if len(zero_qty_items) > 0:
+				so.cancelled_items = []
+				for zero_item in zero_qty_items:
+					so.append("cancelled_items", {
+						"cancelled_item_code": zero_item.get("item_code"),
+						"cancelled_item_qty": zero_item.get("actual_qty")
+					})
 
 			if total_order_value:
 				so.amazon_order_amount = total_order_value
