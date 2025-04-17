@@ -147,3 +147,23 @@ def find_duplicates(lst):
             seen.add(item)
     cleaned_duplicates = [item for item in duplicates if item.strip()]
     return cleaned_duplicates
+
+def delete_barcodes(doc, method=None):
+    """
+    Delete barcodes from the purchase receipt.
+    """
+    for item in doc.items:
+        if not item.barcode_no:
+            continue
+
+        barcodes = item.barcode_no.split("\n")
+        for barcode in barcodes:
+            if not barcode:
+                continue
+            existing_serial_no = frappe.db.exists(
+                "eSeller Serial No",
+                {"serial_no": barcode, "purchase_document_no": doc.name},
+            )
+            if existing_serial_no:
+                serial_doc = frappe.get_doc("eSeller Serial No", existing_serial_no)
+                serial_doc.delete()
