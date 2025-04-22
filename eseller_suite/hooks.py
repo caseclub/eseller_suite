@@ -136,6 +136,7 @@ doc_events = {
 	'Purchase Receipt':{
 		"before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
 		"before_submit": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.activate_barcodes",
+		"on_cancel": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.delete_barcodes",
 	},
 	'Stock Entry':{
 		"before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
