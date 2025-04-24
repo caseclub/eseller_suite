@@ -64,7 +64,7 @@ class SalesOrderOverride(SalesOrder):
 
 	def before_insert(self):
 		amz_setting = frappe.get_last_doc("Amazon SP API Settings", {"is_active":1})
-		if amz_setting.temporary_stock_transfer_required and self.amazon_order_id:
+		if amz_setting.temporary_stock_transfer_required and self.amazon_order_id and self.amazon_order_status != "Canceled":
 			self.create_temporary_stock_transfer()
 
 	def create_temporary_stock_transfer(self):
@@ -72,6 +72,9 @@ class SalesOrderOverride(SalesOrder):
 		"""
 		temp_stock_entry = frappe.new_doc("Stock Entry")
 		temp_stock_entry.stock_entry_type = "Material Transfer"
+		temp_stock_entry.set_posting_time = 1
+		temp_stock_entry.posting_date = self.transaction_date
+		temp_stock_entry.posting_time = self.transaction_time
 		amz_setting = frappe.db.exists("Amazon SP API Settings", {"is_active":1})
 		warehouse = frappe.db.get_value("Amazon SP API Settings", amz_setting, "warehouse")
 		if self.fulfillment_channel:
@@ -86,7 +89,7 @@ class SalesOrderOverride(SalesOrder):
 			})
 		temp_stock_entry.insert(ignore_permissions=True)
 		temp_stock_entry.submit()
-		self.temporary_stock_tranfer_id = temp_stock_entry
+		self.temporary_stock_tranfer_id = temp_stock_entry.name
 
 @frappe.whitelist()
 def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
