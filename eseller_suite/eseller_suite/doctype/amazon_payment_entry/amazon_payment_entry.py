@@ -293,8 +293,8 @@ def get_invoice_details(amazon_order_id, is_return=0):
 		This method will return the Invoice ID and Customer
 	'''
 	invoice_details = {}
-	if frappe.db.exists('Sales Invoice', { 'amazon_order_id':amazon_order_id, 'is_return':is_return }):
-		si = frappe.db.get_value('Sales Invoice', { 'amazon_order_id':amazon_order_id, 'is_return':is_return })
+	si = frappe.db.exists('Sales Invoice', {'amazon_order_id':amazon_order_id, 'is_return':is_return, 'docstatus':1})
+	if si:
 		customer = frappe.db.get_value('Sales Invoice', si, 'customer')
 		invoice_details['sales_invoice'] = si
 		invoice_details['customer'] = customer
