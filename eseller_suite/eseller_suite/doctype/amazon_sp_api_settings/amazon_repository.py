@@ -642,6 +642,9 @@ class AmazonRepository:
 			si = frappe.db.exists("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0})
 			existing_return_si = frappe.db.exists("Sales Invoice", {"amazon_order_id": order_id, "docstatus": 1, "is_return": 1, "return_against": si})
 			if existing_return_si:
+				existing_return_si_jv = frappe.db.exists("Journal Entry Account", {"reference_name": existing_return_si, "reference_type": "Sales Invoice"})
+				if existing_return_si_jv:
+					return so_id
 				try:
 					frappe.get_doc("Sales Invoice", existing_return_si).cancel()
 				except Exception as e:
@@ -815,7 +818,6 @@ class AmazonRepository:
 			zero_qty_items = []
 
 			for item in items:
-				print("item", item)
 				if not all_zero_qty and item.get("zero_qty_flag", True):
 					zero_qty_items.append(item)
 					continue
