@@ -62,8 +62,6 @@ class JournalEntryOverride(JournalEntry):
                         self.reference_totals[d.reference_name] + flt(d.get(dr_or_cr)),
                         2,
                     )
-                    if d.reference_name == "ACC-SINV-2025-09583":
-                        print(d.get(dr_or_cr))
 
                 self.reference_types[d.reference_name] = d.reference_type
                 self.reference_accounts[d.reference_name] = d.account
