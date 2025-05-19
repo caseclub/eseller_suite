@@ -38,6 +38,7 @@
    "fieldname": "payment_details",
    "fieldtype": "Table",
    "label": "Payment Details",
+   "no_copy": 1,
    "options": "Amazon Payment Entry Item"
   },
   {
@@ -107,9 +108,11 @@
    "fieldtype": "Check",
    "hidden": 1,
    "label": "In Progress",
+   "no_copy": 1,
    "read_only": 1
   }
  ],
+ "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "is_submittable": 1,
  "links": [
@@ -118,7 +121,7 @@
    "link_fieldname": "cheque_no"
   }
  ],
- "modified": "2025-03-07 12:15:51.305353",
+ "modified": "2025-05-19 13:00:51.221508",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Entry",
@@ -138,6 +141,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "modified",
  "sort_order": "DESC",
  "states": []
