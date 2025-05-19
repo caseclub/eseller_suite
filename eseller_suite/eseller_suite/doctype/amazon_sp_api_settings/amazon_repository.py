@@ -690,7 +690,14 @@ class AmazonRepository:
 					return_si.update_stock = 1
 					return_si.return_against = si
 					return_si.customer = frappe.db.get_value("Sales Invoice", si, "customer")
-					return_si.set_warehouse = frappe.db.get_value("Sales Invoice", si, "set_warehouse")
+					return_warehouse = frappe.db.get_value("Sales Invoice", si, "set_warehouse")
+					if self.amz_setting.temporary_stock_transfer_required:
+						return_warehouse = self.amz_setting.warehouse
+						si_fulfilement_channel = frappe.db.get_value("Sales Invoice", si, "fulfillment_channel")
+						if si_fulfilement_channel:
+							if si_fulfilement_channel=='AFN':
+								return_warehouse = self.amz_setting.afn_warehouse
+					return_si.set_warehouse = return_warehouse
 
 					actual_item = frappe.db.get_value("Item", item.get('item_code'), "actual_item")
 					if not actual_item:
@@ -894,10 +901,21 @@ class AmazonRepository:
 					"Unfulfillable",
 				]
 
-				if order.get("OrderStatus") in order_statuses and len(so.taxes):
+				order_status_valid = order.get("OrderStatus") in order_statuses
+				has_taxes = len(so.taxes) > 0
+				temp_transfer_required = self.amz_setting.temporary_stock_transfer_required
+
+				transfer_exists = frappe.db.exists("Stock Entry", {
+					"name": so.temporary_stock_tranfer_id,
+					"docstatus": 1
+				}) if temp_transfer_required else True
+
+				if order_status_valid and has_taxes and transfer_exists:
 					try:
+						print("Submitting SO: ", so.name)
 						so.submit()
 					except Exception as e:
+						print("Oops: ", e)
 						frappe.log_error("Error submitting Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
 			elif not frappe.db.exists("Amazon Failed Sync Record", {"amazon_order_id":order_id}):
 				remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
