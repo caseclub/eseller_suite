@@ -131,8 +131,9 @@ class AmazonPaymentEntry(Document):
 						replaced_jv = get_replaced_jv(row.order_id)
 						if replaced_jv:
 							row.journal_entry = replaced_jv
-							row.ready_to_process = 1
-							has_changes = True
+							if row.sales_invoice and row.customer:
+								row.ready_to_process = 1
+								has_changes = True
 				if row.transaction_type in ['Other', 'Inventory Reimbursement'] and row.product_details in ['FBA Inventory Reimbursement', 'FBA Reversed Reimbursement'] and row.order_id == '---':
 					if float(row.total) < 0:
 						inventory_reimbursement_account = frappe.db.get_single_value('eSeller Settings', 'inventory_reimbursement_account')
@@ -233,6 +234,8 @@ class AmazonPaymentEntry(Document):
 					jv_row.debit = abs(float(row.total))
 					jv_row.debit_in_account_currency = abs(float(row.total))
 					total_debit += abs(float(row.total))
+				if not jv_row.get("account", None) and not jv_row.get("party", None):
+					frappe.throw("Please re-fetch due to missing account or party in row # {0}".format(row.idx))
 			elif frappe.db.get_single_value("eSeller Settings", "use_reserve_lines_in_amazon_payment_entry"):
 				reserve_jv_row = jv_doc.append('accounts')
 				reserve_jv_row.user_remark = row.product_details
@@ -287,6 +290,14 @@ class AmazonPaymentEntry(Document):
 					except Exception as e:
 						print(e)
 		frappe.db.set_value(self.doctype, self.name, 'in_progress', 0)
+
+	@frappe.whitelist()
+	def unset_ready_to_process(self):
+		'''Method to uncheck ready to process for all the rows in the payment details table'''
+		for row in self.payment_details:
+			if row.ready_to_process:
+				row.ready_to_process = 0
+		self.save()
 
 def get_invoice_details(amazon_order_id, is_return=0):
 	'''
