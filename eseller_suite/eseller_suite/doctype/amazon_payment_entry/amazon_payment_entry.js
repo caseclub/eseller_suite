@@ -60,6 +60,13 @@ function handle_custom_buttons(frm) {
             frm.add_custom_button('Missing Sales Orders', () => {
                 get_missing_sales_orders(frm);
             }, 'Fetch');
+
+            // Button for debug purposes only for Administrator
+            if (frappe.session.user == "Administrator") {
+                frm.add_custom_button('Unset Ready to Process', () => {
+                    unset_ready_to_process(frm);
+                }, 'Fetch');
+            }
         }
     }
 }
@@ -113,6 +120,27 @@ function get_missing_sales_orders(frm) {
             if (r && r.message) {
                 frappe.show_alert({
                     message: __('Sales Orders created/updated successfully'),
+                    indicator: 'green'
+                }, 5);
+            }
+            frm.reload_doc();
+        }
+    });
+}
+
+/**
+ * function to uncheck ready to process checks in all the lines in the table
+ */
+function unset_ready_to_process(frm) {
+    frm.call({
+        method: "unset_ready_to_process",
+        doc: frm.doc,
+        freeze: true,
+        freeze_message: __("Removing Ready to Process.."),
+        callback: (r) => {
+            if (r && r.message) {
+                frappe.show_alert({
+                    message: __('Ready to Process removed successfully'),
                     indicator: 'green'
                 }, 5);
             }
