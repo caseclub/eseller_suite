@@ -64,7 +64,7 @@ function handle_custom_buttons(frm) {
             // Button for debug purposes only for Administrator
             if (frappe.session.user == "Administrator") {
                 frm.add_custom_button('Unset Ready to Process', () => {
-                    unsert_ready_to_process(frm);
+                    unset_ready_to_process(frm);
                 }, 'Fetch');
             }
         }
@@ -131,7 +131,7 @@ function get_missing_sales_orders(frm) {
 /**
  * function to uncheck ready to process checks in all the lines in the table
  */
-function unsert_ready_to_process(frm) {
+function unset_ready_to_process(frm) {
     frm.call({
         method: "unset_ready_to_process",
         doc: frm.doc,
