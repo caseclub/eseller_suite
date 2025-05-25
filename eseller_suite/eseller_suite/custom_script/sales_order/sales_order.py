@@ -94,7 +94,8 @@ class SalesOrderOverride(SalesOrder):
 				"s_warehouse": warehouse,
 				"t_warehouse": frappe.db.get_value("Amazon SP API Settings", amz_setting, "temporary_order_warehouse"),
 				"item_code": item.item_code,
-				"qty": item.qty
+				"qty": item.qty,
+				"allow_zero_valuation_rate": 1,
 			})
 		temp_stock_entry.insert(ignore_permissions=True)
 		self.temporary_stock_tranfer_id = temp_stock_entry.name
