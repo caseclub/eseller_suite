@@ -141,6 +141,7 @@ doc_events = {
 	'Stock Entry':{
 		"before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
 		"before_submit": "eseller_suite.eseller_suite.custom_script.stock_entry.stock_entry.transfer_barcodes",
+		"before_insert": "eseller_suite.eseller_suite.custom_script.stock_entry.stock_entry.before_insert_custom",
     },
 }
 
