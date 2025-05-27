@@ -209,7 +209,7 @@ class AmazonRepository:
 	def get_orders_instance(self) -> Orders:
 		return Orders(**self.instance_params)
 
-	def create_item(self, order_item) -> str:
+	def create_item(self, order_item, order_id) -> str:
 		def create_item_group(amazon_item) -> str:
 			if not amazon_item:
 				return self.amz_setting.parent_item_group
@@ -287,7 +287,11 @@ class AmazonRepository:
 			item_price.insert()
 
 		catalog_items = self.get_catalog_items_instance()
-		amazon_item = catalog_items.get_catalog_item(order_item["ASIN"])["payload"]
+		amazon_item = catalog_items.get_catalog_item(order_item["ASIN"]).get("payload", None)
+  
+		if not amazon_item:
+			frappe.log_error("No Amazon Item found for ASIN: {0}. For Order: {1}".format(order_item["ASIN"], order_id))
+			return None
 
 		item = frappe.new_doc("Item")
 		item.item_group = create_item_group(amazon_item)
@@ -303,11 +307,11 @@ class AmazonRepository:
 
 		return item.name
 
-	def get_item_code(self, order_item) -> str:
+	def get_item_code(self, order_item, order_id) -> str:
 		if frappe.db.exists('Item', { 'amazon_item_code': order_item['SellerSKU']}):
 			return frappe.db.get_value('Item', { 'amazon_item_code': order_item['SellerSKU']})
 
-		item_code = self.create_item(order_item)
+		item_code = self.create_item(order_item, order_id)
 		return item_code
 
 	def get_order_items(self, order_id) -> list:
@@ -342,7 +346,9 @@ class AmazonRepository:
 						zero_qty_flag = True
 						actual_qty = order_item.get("ProductInfo").get("NumberOfItems")
 					item_rate = item_amount/item_qty
-					item_code = self.get_item_code(order_item)
+					item_code = self.get_item_code(order_item, order_id)
+					if not item_code:
+						return []
 					actual_item = frappe.db.get_value("Item", item_code, "actual_item")
 					if actual_item:
 						item_code = actual_item
