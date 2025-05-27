@@ -27,3 +27,20 @@ def transfer_barcodes(doc, method=None):
         "Serial Numbers are now Transferred",
         alert=True,
     )
+
+def before_insert_custom(doc, method=None):
+    """method corrects warehouse in stock returns from returns & replaced orders if temporary stock transfer is on"""
+    if doc.from_return_invoice:
+        amz_settings = frappe.get_last_doc("Amazon SP API Settings")
+        if amz_settings.temporary_stock_transfer_required:
+            si = doc.sales_invoice_no
+            return_warehouse = amz_settings.warehouse
+            si_fulfillment_channel = frappe.db.get_value("Sales Invoice", si, "fulfillment_channel")
+        
+            if si_fulfillment_channel:
+                if si_fulfillment_channel == 'AFN':
+                    return_warehouse = amz_settings.afn_warehouse
+        
+            doc.to_warehouse = return_warehouse
+            for row in doc.items:
+                row.t_warehouse = return_warehouse
