@@ -60,7 +60,10 @@ class SalesOrderOverride(SalesOrder):
 		if self.amazon_order_status == "Canceled" and self.temporary_stock_tranfer_id:
 			if frappe.db.exists("Stock Entry", {"name":self.temporary_stock_tranfer_id, "docstatus":["!=", 2]}):
 				temp_stock_transfer_doc = frappe.get_doc("Stock Entry", self.temporary_stock_tranfer_id)
+				self.temporary_stock_tranfer_id = ""
+				self.save(ignore_permissions=True)
 				temp_stock_transfer_doc.cancel()
+				temp_stock_transfer_doc.delete()
 
 	def after_insert(self):
 		amz_setting = frappe.get_last_doc("Amazon SP API Settings", {"is_active":1})
