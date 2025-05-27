@@ -577,11 +577,14 @@ class AmazonRepository:
 							
 							if float(amount) != 0:
 								fee_account = self.get_account(fee_type)
+								description = (
+									f"{fee_type} for {seller_sku if seller_sku else order_id}"
+								)
 								charges_and_fees["fees"].append({
 									"charge_type": "Actual",
 									"account_head": fee_account,
 									"tax_amount": amount,
-									"description": fee_type + " for " + seller_sku,
+									"description": description,
 								})
 						
 						refund_events.append(charges_and_fees)		
@@ -610,16 +613,18 @@ class AmazonRepository:
 								
 								if float(amount) != 0:
 									tds_account = self.get_account(tds_type)
+									description = (
+										f"{fee_type} for {seller_sku if seller_sku else order_id}"
+									)
 									charges_and_fees["tds"].append({
 										"charge_type": "Actual",
 										"account_head": tds_account,
 										"tax_amount": amount,
-										"description": tds_type + " for " + seller_sku,
+										"description": description,
 									})
 						
 						refund_events.append(charges_and_fees)			
 
-				# Remove the redundant line that was causing duplicate appending
 				refund_events.append(charges_and_fees)
 
 				if not next_token:
@@ -947,10 +952,8 @@ class AmazonRepository:
 
 				if order_status_valid and has_taxes and transfer_exists:
 					try:
-						print("Submitting SO: ", so.name)
 						so.submit()
 					except Exception as e:
-						print("Oops: ", e)
 						frappe.log_error("Error submitting Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
 			elif not frappe.db.exists("Amazon Failed Sync Record", {"amazon_order_id":order_id}):
 				remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
