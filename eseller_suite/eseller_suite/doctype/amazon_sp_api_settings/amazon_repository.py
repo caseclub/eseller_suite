@@ -577,11 +577,14 @@ class AmazonRepository:
 							
 							if float(amount) != 0:
 								fee_account = self.get_account(fee_type)
+								description = (
+									f"{fee_type} for {seller_sku if seller_sku else order_id}"
+								)
 								charges_and_fees["fees"].append({
 									"charge_type": "Actual",
 									"account_head": fee_account,
 									"tax_amount": amount,
-									"description": fee_type + " for " + seller_sku,
+									"description": description,
 								})
 						
 						refund_events.append(charges_and_fees)		
@@ -610,16 +613,18 @@ class AmazonRepository:
 								
 								if float(amount) != 0:
 									tds_account = self.get_account(tds_type)
+									description = (
+										f"{fee_type} for {seller_sku if seller_sku else order_id}"
+									)
 									charges_and_fees["tds"].append({
 										"charge_type": "Actual",
 										"account_head": tds_account,
 										"tax_amount": amount,
-										"description": tds_type + " for " + seller_sku,
+										"description": description,
 									})
 						
 						refund_events.append(charges_and_fees)			
 
-				# Remove the redundant line that was causing duplicate appending
 				refund_events.append(charges_and_fees)
 
 				if not next_token:
@@ -887,7 +892,37 @@ class AmazonRepository:
 				if not refunds:
 					for service_fee in charges_and_fees.get("service_fees"):
 						if service_fee:
-							so.append("taxes", service_fee)
+							mfn_postage_fee_account_head = frappe.db.get_value('Amazon SP API Settings', self.amz_setting.name, 'mfn_postage_fee_account_head')
+							if not service_fee.get("account_head") == mfn_postage_fee_account_head:
+								so.append("taxes", service_fee)
+							else:
+								try:
+									jv_doc = frappe.new_doc('Journal Entry')
+									jv_doc.voucher_type = 'Journal Entry'
+									jv_doc.posting_date = so.transaction_date
+									jv_doc.user_remark = f'Amazon MFN Postage Fee - HEL for Order {so.amazon_order_id}'
+									jv_doc.amazon_order_id = so.amazon_order_id
+									tax_amount = abs(float(service_fee.get("tax_amount", 0)))
+									jv_row = jv_doc.append('accounts')
+									jv_row.account = service_fee.get("account_head")
+									jv_row.debit = tax_amount
+									jv_row.debit_in_account_currency = tax_amount
+									jv_row.user_remark = row.get('description')
+									jv_row.amazon_order_id = so.amazon_order_id
+									default_receivable_account = frappe.db.get_value('Company', self.amz_setting.company, 'default_receivable_account')
+									jv_row = jv_doc.append('accounts')
+									jv_row.credit = abs(float(service_fee.get("tax_amount", 0)))
+									jv_row.credit_in_account_currency = abs(float(service_fee.get("tax_amount", 0)))
+									jv_row.user_remark = f'Amazon MFN Postage Fee - HEL for Order {so.amazon_order_id}'
+									jv_row.amazon_order_id = so.amazon_order_id
+									jv_row.party_type = 'Customer'
+									jv_row.party = so.get('customer')
+									jv_row.account = default_receivable_account
+									jv_doc.flags.ignore_mandatory = True
+									jv_doc.save(ignore_permissions=True)
+									jv_doc.submit()
+								except Exception as e:
+									pass
 
 				if charges_and_fees.get("additional_discount"):
 					so.discount_amount = float(charges_and_fees.get("additional_discount")) * -1
@@ -918,10 +953,8 @@ class AmazonRepository:
 
 				if order_status_valid and has_taxes and transfer_exists:
 					try:
-						print("Submitting SO: ", so.name)
 						so.submit()
 					except Exception as e:
-						print("Oops: ", e)
 						frappe.log_error("Error submitting Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
 			elif not frappe.db.exists("Amazon Failed Sync Record", {"amazon_order_id":order_id}):
 				remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)

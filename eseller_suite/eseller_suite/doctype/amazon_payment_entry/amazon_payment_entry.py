@@ -113,6 +113,9 @@ class AmazonPaymentEntry(Document):
 							row.return_sales_invoice = return_invoice_details.get('sales_invoice')
 							row.ready_to_process = 1
 							has_changes = True
+					elif not return_invoice_details and self.remaining_refunds_have_no_returns:
+						row.ready_to_process = 1
+						has_changes = True
 				elif row.transaction_type in ["Unavailable balance", "Previous statement's unavailable balance"]:
 					row.ready_to_process = 1
 					has_changes = True
@@ -193,6 +196,8 @@ class AmazonPaymentEntry(Document):
 		total_credit = 0
 		for row in self.payment_details:
 			if row.ready_to_process and row.total:
+				if row.total == 0:
+					continue
 				jv_row = jv_doc.append('accounts')
 				if row.transaction_type in ["Previous statement's unavailable balance", "Unavailable balance"]:
 					jv_row.account = self.amazon_reserve_fund_account

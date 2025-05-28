@@ -16,6 +16,8 @@
   "company",
   "default_receivable_account",
   "amazon_reserve_fund_account",
+  "fetch_customizations_section",
+  "remaining_refunds_have_no_returns",
   "payment_details_section",
   "payment_details",
   "amended_from"
@@ -110,6 +112,18 @@
    "label": "In Progress",
    "no_copy": 1,
    "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "fetch_customizations_section",
+   "fieldtype": "Section Break",
+   "label": "Fetch Customizations"
+  },
+  {
+   "default": "0",
+   "fieldname": "remaining_refunds_have_no_returns",
+   "fieldtype": "Check",
+   "label": "Remaining Refunds have no Returns"
   }
  ],
  "grid_page_length": 50,
@@ -121,7 +135,7 @@
    "link_fieldname": "cheque_no"
   }
  ],
- "modified": "2025-05-19 13:00:51.221508",
+ "modified": "2025-05-27 22:35:46.809548",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Entry",

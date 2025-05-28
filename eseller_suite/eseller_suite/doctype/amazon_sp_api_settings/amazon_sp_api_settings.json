@@ -25,6 +25,7 @@
   "territory",
   "customer_type",
   "market_place_account_group",
+  "mfn_postage_fee_account_head",
   "section_break_3",
   "after_date",
   "taxes_charges",
@@ -260,10 +261,17 @@
    "fieldtype": "Date",
    "label": "Return Invoice Stock Adjustment Before",
    "mandatory_depends_on": "eval: doc.adjust_stock_for_returns"
+  },
+  {
+   "fieldname": "mfn_postage_fee_account_head",
+   "fieldtype": "Link",
+   "label": "MFN Postage Fee Account Head",
+   "options": "Account",
+   "reqd": 1
   }
  ],
  "links": [],
- "modified": "2025-02-20 11:47:42.068266",
+ "modified": "2025-05-28 11:37:39.301083",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon SP API Settings",
@@ -280,6 +288,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "modified",
  "sort_order": "DESC",
  "states": [],
