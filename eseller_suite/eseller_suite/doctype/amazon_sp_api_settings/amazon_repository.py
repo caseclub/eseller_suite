@@ -652,6 +652,11 @@ class AmazonRepository:
 		if so_id and refunds and so_docstatus:
 			si = frappe.db.exists("Sales Invoice", { "amazon_order_id": order_id, "docstatus":1, "is_return":0})
 			existing_return_si = frappe.db.exists("Sales Invoice", {"amazon_order_id": order_id, "docstatus": 1, "is_return": 1, "return_against": si})
+
+			# Preventing returns that are linked in an amazon payment entry from being cancelled
+			if frappe.db.exists("Amazon Payment Entry Item", {"order_id": order_id, "return_sales_invoice": existing_return_si}):
+				return so_id
+
 			if existing_return_si:
 				existing_return_si_jv = frappe.db.exists("Journal Entry Account", {"reference_name": existing_return_si, "reference_type": "Sales Invoice"})
 				if existing_return_si_jv:
@@ -895,12 +900,17 @@ class AmazonRepository:
 							mfn_postage_fee_account_head = frappe.db.get_value('Amazon SP API Settings', self.amz_setting.name, 'mfn_postage_fee_account_head')
 							if not service_fee.get("account_head") == mfn_postage_fee_account_head:
 								so.append("taxes", service_fee)
-							else:
+							elif not frappe.db.exists("Journal Entry Account", {
+								"amazon_order_id": so.amazon_order_id,
+								"account_head": service_fee.get("account_head"),
+								"tax_amount": service_fee.get("tax_amount"),
+								"user_remark": f"Amazon MFN Postage Fee for Order {so.amazon_order_id}"
+							}):
 								try:
 									jv_doc = frappe.new_doc('Journal Entry')
 									jv_doc.voucher_type = 'Journal Entry'
 									jv_doc.posting_date = so.transaction_date
-									jv_doc.user_remark = f'Amazon MFN Postage Fee - HEL for Order {so.amazon_order_id}'
+									jv_doc.user_remark = f'Amazon MFN Postage Fee for Order {so.amazon_order_id}'
 									jv_doc.amazon_order_id = so.amazon_order_id
 									tax_amount = abs(float(service_fee.get("tax_amount", 0)))
 									jv_row = jv_doc.append('accounts')
@@ -913,7 +923,7 @@ class AmazonRepository:
 									jv_row = jv_doc.append('accounts')
 									jv_row.credit = abs(float(service_fee.get("tax_amount", 0)))
 									jv_row.credit_in_account_currency = abs(float(service_fee.get("tax_amount", 0)))
-									jv_row.user_remark = f'Amazon MFN Postage Fee - HEL for Order {so.amazon_order_id}'
+									jv_row.user_remark = f'Amazon MFN Postage Fee for Order {so.amazon_order_id}'
 									jv_row.amazon_order_id = so.amazon_order_id
 									jv_row.party_type = 'Customer'
 									jv_row.party = so.get('customer')
