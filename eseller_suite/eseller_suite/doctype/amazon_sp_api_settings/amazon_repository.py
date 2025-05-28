@@ -654,7 +654,7 @@ class AmazonRepository:
 			existing_return_si = frappe.db.exists("Sales Invoice", {"amazon_order_id": order_id, "docstatus": 1, "is_return": 1, "return_against": si})
 
 			# Preventing returns that are linked in an amazon payment entry from being cancelled
-			if frappe.db.exists("Amazon Payment Entry Item", {"order_id": order_id, "return_sales_invoice": existing_return_si}):
+			if existing_return_si and frappe.db.exists("Amazon Payment Entry Item", {"order_id": order_id, "return_sales_invoice": existing_return_si}):
 				return so_id
 
 			if existing_return_si:
