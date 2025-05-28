@@ -892,7 +892,8 @@ class AmazonRepository:
 				if not refunds:
 					for service_fee in charges_and_fees.get("service_fees"):
 						if service_fee:
-							if not service_fee.get("account_head") == "Amazon MFNPostageFee - HEL":
+							mfn_postage_fee_account_head = frappe.db.get_value('Amazon SP API Settings', self.amz_setting.name, 'mfn_postage_fee_account_head')
+							if not service_fee.get("account_head") == mfn_postage_fee_account_head:
 								so.append("taxes", service_fee)
 							else:
 								try:
