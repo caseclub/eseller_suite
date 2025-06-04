@@ -12,6 +12,16 @@ from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repositor
 from charset_normalizer import from_path
 
 class AmazonPaymentEntry(Document):
+	def before_save(self):
+		'''
+  		Method to check if the return sales invoice is already cancelled
+		and remove it from the payment details table
+  		'''
+		for row in self.payment_details:
+			if row.return_sales_invoice:
+				if frappe.db.get_value('Sales Invoice', row.return_sales_invoice, 'docstatus') == 2:
+					row.return_sales_invoice = ''
+     
 	def validate(self):
 		if not self.payment_details:
 			self.process_payment_data()
@@ -302,6 +312,7 @@ class AmazonPaymentEntry(Document):
 		for row in self.payment_details:
 			if row.ready_to_process:
 				row.ready_to_process = 0
+				row.return_sales_invoice = ''
 		self.save()
 
 def get_invoice_details(amazon_order_id, is_return=0):

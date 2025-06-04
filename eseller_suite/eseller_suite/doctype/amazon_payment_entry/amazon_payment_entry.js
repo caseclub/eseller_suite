@@ -62,7 +62,7 @@ function handle_custom_buttons(frm) {
             }, 'Fetch');
 
             // Button for debug purposes only for Administrator
-            if (frappe.session.user == "Administrator") {
+            if (frappe.user.has_role('System Manager')) {
                 frm.add_custom_button('Unset Ready to Process', () => {
                     unset_ready_to_process(frm);
                 }, 'Fetch');
