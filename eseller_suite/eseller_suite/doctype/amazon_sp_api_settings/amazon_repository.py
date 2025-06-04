@@ -471,7 +471,7 @@ class AmazonRepository:
 			financial_events_payload = self.call_sp_api_method(
 				sp_api_method=finances.list_financial_events_by_order_id, order_id=order_id
 			)
-   
+
 			if not (
 				financial_events_payload
 				and financial_events_payload.get("FinancialEvents")
@@ -614,7 +614,7 @@ class AmazonRepository:
 								if float(amount) != 0:
 									tds_account = self.get_account(tds_type)
 									description = (
-										f"{fee_type} for {seller_sku if seller_sku else order_id}"
+										f"{tds_type} for {seller_sku if seller_sku else order_id}"
 									)
 									charges_and_fees["tds"].append({
 										"charge_type": "Actual",
