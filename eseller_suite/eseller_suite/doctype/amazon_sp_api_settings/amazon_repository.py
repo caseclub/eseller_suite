@@ -137,7 +137,7 @@ class AmazonRepository:
 										"charge_type": "Actual",
 										"account_head": charge_account,
 										"tax_amount": amount,
-										"description": charge_type + " for " + seller_sku,
+										"description": f"{charge_type} for {seller_sku if seller_sku else order_id}",
 									}
 								)
 							if charge_type == 'Principal':
@@ -154,7 +154,7 @@ class AmazonRepository:
 										"charge_type": "Actual",
 										"account_head": fee_account,
 										"tax_amount": amount,
-										"description": fee_type + " for " + seller_sku,
+										"description": f"{fee_type} for {seller_sku if seller_sku else order_id}",
 									}
 								)
 
@@ -168,7 +168,7 @@ class AmazonRepository:
 										"charge_type": "Actual",
 										"account_head": tds_account,
 										"tax_amount": amount,
-										"description": tds_type + " for " + seller_sku,
+										"description": f"{tds_type} for {seller_sku if seller_sku else order_id}",
 									}
 								)
 
@@ -191,7 +191,7 @@ class AmazonRepository:
 									"charge_type": "Actual",
 									"account_head": fee_account,
 									"tax_amount": amount,
-									"description": fee_type + " for " + seller_sku,
+									"description": f"{fee_type} for {seller_sku if seller_sku else order_id}",
 								}
 							)
 
@@ -509,7 +509,7 @@ class AmazonRepository:
 							seller_sku = refund_item.get("SellerSKU")
 							
 							item_code = None
-							if frappe.db.exists('Item', {'amazon_item_code': seller_sku}):
+							if seller_sku and frappe.db.exists('Item', {'amazon_item_code': seller_sku}):
 								item_code = frappe.db.get_value('Item', {'amazon_item_code': seller_sku})
 
 							for charge in charges:
@@ -522,7 +522,7 @@ class AmazonRepository:
 										"charge_type": "Actual",
 										"account_head": charge_account,
 										"tax_amount": amount,
-										"description": charge_type + " refund for " + seller_sku,
+										"description": f"{charge_type} refund for {seller_sku if seller_sku else order_id}",
 									})
 								else:
 									charges_and_fees["items"].append({
@@ -541,7 +541,7 @@ class AmazonRepository:
 										"charge_type": "Actual",
 										"account_head": fee_account,
 										"tax_amount": amount,
-										"description": fee_type + " refund for " + seller_sku,
+										"description": f"{fee_type} refund for {seller_sku if seller_sku else order_id}",
 									})
 
 							for promotion in promotions:
@@ -554,7 +554,7 @@ class AmazonRepository:
 										"charge_type": "Actual",
 										"account_head": promotion_account,
 										"tax_amount": amount,
-										"description": promotion_type + " refund for " + seller_sku,
+										"description": f"{promotion_type} refund for {seller_sku if seller_sku else order_id}",
 									})
 
 							refund_events.append(charges_and_fees)
