@@ -48,6 +48,12 @@ frappe.query_reports["Amazon Itemwise Sales Report"] = {
 			fieldtype: "Link",
 			options: "Customer",
 		},
+		{
+			fieldname: "summary",
+			label: __("Summary"),
+			fieldtype: "Check",
+			default: 0,
+		}
 	],
 
 	formatter: function (value, row, column, data, default_formatter) {
