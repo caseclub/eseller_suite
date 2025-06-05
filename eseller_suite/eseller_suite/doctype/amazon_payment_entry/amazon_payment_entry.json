@@ -11,6 +11,7 @@
   "mode_of_payment",
   "payment_account",
   "in_progress",
+  "reset_progress",
   "column_break_isbj",
   "posting_date",
   "company",
@@ -124,6 +125,12 @@
    "fieldname": "remaining_refunds_have_no_returns",
    "fieldtype": "Check",
    "label": "Remaining Refunds have no Returns"
+  },
+  {
+   "depends_on": "eval: doc.in_progress;",
+   "fieldname": "reset_progress",
+   "fieldtype": "Button",
+   "label": "Reset Progress"
   }
  ],
  "grid_page_length": 50,
@@ -135,7 +142,7 @@
    "link_fieldname": "cheque_no"
   }
  ],
- "modified": "2025-05-27 22:35:46.809548",
+ "modified": "2025-06-05 15:16:47.819889",
  "modified_by": "Administrator",
  "module": "eSeller Suite",
  "name": "Amazon Payment Entry",

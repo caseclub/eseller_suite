@@ -47,6 +47,11 @@ frappe.ui.form.on("Amazon Payment Entry", {
         else {
             frm.set_value('payment_account',);
         }
+    },
+    reset_progress(frm) {
+        frm.set_value('in_progress', 0);
+        frm.refresh_fields();
+        frm.save();
     }
 });
 
