@@ -87,6 +87,19 @@ def get_columns(filters):
 				"options": "currency",
 				"width": 120,
 			},
+			{
+				"label": _("Net Quantity"),
+				"fieldtype": "Float",
+				"fieldname": "net_quantity",
+				"width": 150,
+			},
+			{
+				"label": _("Net Amount"),
+				"fieldname": "net_amount",
+				"fieldtype": "Currency",
+				"options": "currency",
+				"width": 120,
+			},
 		]
 
 	return [
@@ -204,7 +217,6 @@ def get_columns(filters):
 			"hidden": 1,
 		},
 	]
-
 def get_data(filters):
 	data = []
 	company_list = get_descendants_of("Company", filters.get("company"))
@@ -216,14 +228,23 @@ def get_data(filters):
 
 	for record in sales_order_records:
 		customer_record = customer_details.get(record.customer)
-		if record.get("qty") < 0:
-			amazon_tax_head = frappe.db.sql("""select name from `tabAccount` where name like 'Amazon Tax%';""", as_dict=True)[0]["name"]
-			amazon_tax = frappe.db.get_value("Sales Taxes and Charges", {"parent": record.name, "account_head": amazon_tax_head}, "tax_amount")
-			record["amount"] += (amazon_tax or 0)
 		item_record = item_details.get(record.item_code)
-		if not record.get("total_order_value", 0) and record.get("qty") > 0:
-			record["total_order_value"] = record.get("amount", 0)
 
+		# Handle Amazon tax for returns
+		if record.get("qty") < 0:
+			amazon_tax_head = frappe.db.sql(
+				"""select name from `tabAccount` where name like 'Amazon Tax%'""",
+				as_dict=True
+			)[0]["name"]
+
+			amazon_tax = frappe.db.get_value(
+				"Sales Taxes and Charges",
+				{"parent": record.name, "account_head": amazon_tax_head},
+				"tax_amount"
+			)
+			record["amount"] = record.get("amount", 0) + (amazon_tax or 0)
+
+		# Summary mode
 		if filters.get("summary"):
 			matched_row = next((d for d in data if d.get("item_code") == record.get("item_code")), None)
 			if not matched_row:
@@ -232,24 +253,31 @@ def get_data(filters):
 					"item_name": item_record.get("item_name"),
 					"item_group": item_record.get("item_group"),
 					"description": record.get("description"),
+					"uom": record.get("uom"),
 					"quantity": record.get("qty") if record.get("qty") > 0 else 0,
 					"return_quantity": abs(record.get("qty")) if record.get("qty") < 0 else 0,
-					"uom": record.get("uom"),
-					"amount": record.get("amount"),
 					"sales_amount": record.get("amount") if record.get("qty") > 0 else 0,
 					"returned_amount": record.get("amount") if record.get("qty") < 0 else 0,
+					"amount": record.get("amount"),
+					"net_quantity": record.get("qty"),
+					"net_amount": record.get("amount"),
 				}
 				data.append(row)
 			else:
 				if record.get("qty") < 0:
 					matched_row["return_quantity"] += abs(record.get("qty"))
 					matched_row["returned_amount"] += record.get("amount")
+					matched_row["net_quantity"] -= abs(record.get("qty"))
+					matched_row["net_amount"] += record.get("amount")
 				else:
 					matched_row["quantity"] += record.get("qty")
 					matched_row["sales_amount"] += record.get("amount")
-				matched_row["amount"] += record.get("amount")
+					matched_row["net_quantity"] += record.get("qty")
+					matched_row["net_amount"] += record.get("amount")
+					matched_row["amount"] += record.get("amount")
 			continue
 
+		# Detailed mode
 		row = {
 			"item_code": record.get("item_code"),
 			"item_name": item_record.get("item_name"),
@@ -257,7 +285,11 @@ def get_data(filters):
 			"description": record.get("description"),
 			"quantity": record.get("qty"),
 			"uom": record.get("uom"),
-			"rate": (record.get("total_order_value") / record.get("qty") if record.get("qty") > 0 else record.get("amount") / abs(record.get("qty"))),
+			"rate": (
+				(record.get("total_order_value") / record.get("qty"))
+				if record.get("qty") > 0 else
+				(record.get("amount") / abs(record.get("qty")) if record.get("qty") < 0 else 0)
+			),
 			"amount": record.get("total_order_value", 0) if record.get("qty") > 0 else record.get("amount"),
 			"sales_order": record.get("name"),
 			"amazon_order_id": record.get("amazon_order_id"),
@@ -275,7 +307,9 @@ def get_data(filters):
 			"returned_amount": record.get("amount") if record.get("qty") < 0 else 0,
 		}
 		data.append(row)
+
 	return data if not filters.get("summary") else sorted(data, key=lambda x: x.get("item_code"))
+
 
 def get_customer_details():
 	details = frappe.get_all("Customer", fields=["name", "customer_name", "customer_group"])
