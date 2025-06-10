@@ -1,7 +1,6 @@
 # Copyright (c) 2019, Frappe Technologies Pvt. Ltd. and contributors
 # For license information, please see license.txt
 
-
 import frappe
 from frappe import _
 from frappe.utils import flt
@@ -15,11 +14,9 @@ def execute(filters=None):
 
 	columns = get_columns(filters)
 	data = get_data(filters)
-
 	chart_data = get_chart_data(data)
 
 	return columns, data, None, chart_data
-
 
 def get_columns(filters):
 	if filters.get("summary"):
@@ -45,16 +42,30 @@ def get_columns(filters):
 				"width": 120,
 			},
 			{
+				"label": _("UOM"),
+				"fieldtype": "Link",
+				"fieldname": "uom",
+				"options": "UOM",
+				"width": 100,
+			},
+			{
 				"label": _("Description"),
 				"fieldtype": "Data",
 				"fieldname": "description",
 				"width": 150,
 			},
 			{
-				"label": _("Quantity"),
+				"label": _("Sales Quantity"),
 				"fieldtype": "Float",
 				"fieldname": "quantity",
 				"width": 150,
+			},
+			{
+				"label": _("Sales Amount"),
+				"fieldname": "sales_amount",
+				"fieldtype": "Currency",
+				"options": "currency",
+				"width": 120,
 			},
 			{
 				"label": _("Returned Quantity"),
@@ -63,11 +74,11 @@ def get_columns(filters):
 				"width": 150,
 			},
 			{
-				"label": _("UOM"),
-				"fieldtype": "Link",
-				"fieldname": "uom",
-				"options": "UOM",
-				"width": 100,
+				"label": _("Returned Amount"),
+				"fieldname": "returned_amount",
+				"fieldtype": "Currency",
+				"options": "currency",
+				"width": 120,
 			},
 			{
 				"label": _("Amount"),
@@ -77,6 +88,7 @@ def get_columns(filters):
 				"width": 120,
 			},
 		]
+
 	return [
 		{
 			"label": _("Item Code"),
@@ -193,10 +205,8 @@ def get_columns(filters):
 		},
 	]
 
-
 def get_data(filters):
 	data = []
-
 	company_list = get_descendants_of("Company", filters.get("company"))
 	company_list.append(filters.get("company"))
 
@@ -207,53 +217,39 @@ def get_data(filters):
 	for record in sales_order_records:
 		customer_record = customer_details.get(record.customer)
 		if record.get("qty") < 0:
-			amazon_tax_head = frappe.db.sql(
-				"""
-				select name from `tabAccount` where name like 'Amazon Tax%';
-			""",
-				as_dict=True,
-			)[0]["name"]
-			amazon_tax = frappe.db.get_value(
-				"Sales Taxes and Charges",
-				{"parent": record.name, "account_head": amazon_tax_head},
-				"tax_amount",
-			)
-			record["amount"] = record.get("amount") + (amazon_tax if amazon_tax else 0)
+			amazon_tax_head = frappe.db.sql("""select name from `tabAccount` where name like 'Amazon Tax%';""", as_dict=True)[0]["name"]
+			amazon_tax = frappe.db.get_value("Sales Taxes and Charges", {"parent": record.name, "account_head": amazon_tax_head}, "tax_amount")
+			record["amount"] += (amazon_tax or 0)
 		item_record = item_details.get(record.item_code)
 		if not record.get("total_order_value", 0) and record.get("qty") > 0:
 			record["total_order_value"] = record.get("amount", 0)
+
 		if filters.get("summary"):
-			if record.get("item_code") not in [d.get("item_code") for d in data]:
+			matched_row = next((d for d in data if d.get("item_code") == record.get("item_code")), None)
+			if not matched_row:
 				row = {
 					"item_code": record.get("item_code"),
 					"item_name": item_record.get("item_name"),
 					"item_group": item_record.get("item_group"),
 					"description": record.get("description"),
-					"quantity": record.get("qty"),
+					"quantity": record.get("qty") if record.get("qty") > 0 else 0,
+					"return_quantity": abs(record.get("qty")) if record.get("qty") < 0 else 0,
 					"uom": record.get("uom"),
-					"amount": (
-						record.get("total_order_value", 0)
-						if record.get("qty") > 0
-						else record.get("amount")
-					),
+					"amount": record.get("amount"),
+					"sales_amount": record.get("amount") if record.get("qty") > 0 else 0,
+					"returned_amount": record.get("amount") if record.get("qty") < 0 else 0,
 				}
 				data.append(row)
 			else:
-				row = next(
-					d for d in data if d.get("item_code") == record.get("item_code")
-				)
 				if record.get("qty") < 0:
-					row["return_quantity"] = row.get("return_quantity", 0) + abs(
-						record.get("qty")
-					)
+					matched_row["return_quantity"] += abs(record.get("qty"))
+					matched_row["returned_amount"] += record.get("amount")
 				else:
-					row["quantity"] += record.get("qty")
-				row["amount"] += (
-					record.get("total_order_value", 0)
-					if record.get("qty") > 0
-					else record.get("amount")
-				)
+					matched_row["quantity"] += record.get("qty")
+					matched_row["sales_amount"] += record.get("amount")
+				matched_row["amount"] += record.get("amount")
 			continue
+
 		row = {
 			"item_code": record.get("item_code"),
 			"item_name": item_record.get("item_name"),
@@ -261,16 +257,8 @@ def get_data(filters):
 			"description": record.get("description"),
 			"quantity": record.get("qty"),
 			"uom": record.get("uom"),
-			"rate": (
-				record.get("total_order_value") / record.get("qty")
-				if record.get("qty") > 0
-				else record.get("amount") / abs(record.get("qty"))
-			),
-			"amount": (
-				record.get("total_order_value", 0)
-				if record.get("qty") > 0
-				else record.get("amount")
-			),
+			"rate": (record.get("total_order_value") / record.get("qty") if record.get("qty") > 0 else record.get("amount") / abs(record.get("qty"))),
+			"amount": record.get("total_order_value", 0) if record.get("qty") > 0 else record.get("amount"),
 			"sales_order": record.get("name"),
 			"amazon_order_id": record.get("amazon_order_id"),
 			"posting_date": record.get("posting_date"),
@@ -282,43 +270,26 @@ def get_data(filters):
 			"delivered_quantity": flt(record.get("delivered_qty")),
 			"billed_amount": flt(record.get("billed_amt")),
 			"company": record.get("company"),
+			"currency": frappe.get_cached_value("Company", record.get("company"), "default_currency"),
+			"sales_amount": record.get("amount") if record.get("qty") > 0 else 0,
+			"returned_amount": record.get("amount") if record.get("qty") < 0 else 0,
 		}
-		row["currency"] = frappe.get_cached_value(
-			"Company", row["company"], "default_currency"
-		)
 		data.append(row)
-
-	return (
-		data
-		if not filters.get("summary")
-		else sorted(data, key=lambda x: x.get("item_code"))
-	)
-
+	return data if not filters.get("summary") else sorted(data, key=lambda x: x.get("item_code"))
 
 def get_customer_details():
-	details = frappe.get_all(
-		"Customer", fields=["name", "customer_name", "customer_group"]
-	)
+	details = frappe.get_all("Customer", fields=["name", "customer_name", "customer_group"])
 	customer_details = {}
 	for d in details:
-		customer_details.setdefault(
-			d.name,
-			frappe._dict(
-				{"customer_name": d.customer_name, "customer_group": d.customer_group}
-			),
-		)
+		customer_details[d.name] = frappe._dict({"customer_name": d.customer_name, "customer_group": d.customer_group})
 	return customer_details
-
 
 def get_item_details():
 	details = frappe.db.get_all("Item", fields=["name", "item_name", "item_group"])
 	item_details = {}
 	for d in details:
-		item_details.setdefault(
-			d.name, frappe._dict({"item_name": d.item_name, "item_group": d.item_group})
-		)
+		item_details[d.name] = frappe._dict({"item_name": d.item_name, "item_group": d.item_group})
 	return item_details
-
 
 def get_sales_order_details(company_list, filters):
 	db_so = frappe.qb.DocType("Sales Invoice")
@@ -366,27 +337,17 @@ def get_sales_order_details(company_list, filters):
 
 	return query.run(as_dict=1)
 
-
 def get_chart_data(data):
 	item_wise_sales_map = {}
 	labels, datapoints = [], []
 
 	for row in data:
 		item_key = row.get("item_code")
-
 		if item_key not in item_wise_sales_map:
 			item_wise_sales_map[item_key] = 0
+		item_wise_sales_map[item_key] += flt(row.get("sales_amount"))
 
-		item_wise_sales_map[item_key] = flt(item_wise_sales_map[item_key]) + flt(
-			row.get("amount")
-		)
-
-	item_wise_sales_map = {
-		item: value
-		for item, value in (
-			sorted(item_wise_sales_map.items(), key=lambda i: i[1], reverse=True)
-		)
-	}
+	item_wise_sales_map = dict(sorted(item_wise_sales_map.items(), key=lambda i: i[1], reverse=True))
 
 	for key in item_wise_sales_map:
 		labels.append(key)
@@ -394,9 +355,9 @@ def get_chart_data(data):
 
 	return {
 		"data": {
-			"labels": labels[:30],  # show max of 30 items in chart
+			"labels": labels[:30],
 			"datasets": [{"name": _("Total Sales Amount"), "values": datapoints[:30]}],
 		},
 		"type": "bar",
 		"fieldtype": "Currency",
-	}
+	}	
