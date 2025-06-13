@@ -898,13 +898,12 @@ class AmazonRepository:
 					for service_fee in charges_and_fees.get("service_fees"):
 						if service_fee:
 							mfn_postage_fee_account_head = frappe.db.get_value('Amazon SP API Settings', self.amz_setting.name, 'mfn_postage_fee_account_head')
-							if not service_fee.get("account_head") == mfn_postage_fee_account_head:
+							if( not service_fee.get("account_head") == mfn_postage_fee_account_head) or so.replaced_order_id:
 								so.append("taxes", service_fee)
 							elif not frappe.db.exists("Journal Entry Account", {
 								"amazon_order_id": so.amazon_order_id,
-								"account_head": service_fee.get("account_head"),
-								"tax_amount": service_fee.get("tax_amount"),
-								"user_remark": f"Amazon MFN Postage Fee for Order {so.amazon_order_id}"
+								"account": service_fee.get("account_head"),
+								"debit_in_account_currency": abs(service_fee.get("tax_amount")),
 							}):
 								try:
 									jv_doc = frappe.new_doc('Journal Entry')
