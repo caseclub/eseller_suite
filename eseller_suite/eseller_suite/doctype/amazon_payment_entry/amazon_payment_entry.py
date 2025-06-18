@@ -1,15 +1,19 @@
 # Copyright (c) 2024, efeone and contributors
 # For license information, please see license.txt
 
-import os
 import csv
-import xlrd
-import frappe
+import os
 from datetime import datetime
+
+import frappe
+from charset_normalizer import from_path
 from frappe.model.document import Document
 from frappe.utils import get_link_to_form, get_url_to_form
-from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import get_order
-from charset_normalizer import from_path
+
+from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository import (
+	get_order,
+)
+
 
 class AmazonPaymentEntry(Document):
 	def before_save(self):
@@ -21,7 +25,10 @@ class AmazonPaymentEntry(Document):
 			if row.return_sales_invoice:
 				if frappe.db.get_value('Sales Invoice', row.return_sales_invoice, 'docstatus') == 2:
 					row.return_sales_invoice = ''
-     
+			if row.sales_invoice:
+				if frappe.db.get_value('Sales Invoice', row.sales_invoice, 'docstatus') == 2:
+					row.sales_invoice = ''
+	 
 	def validate(self):
 		if not self.payment_details:
 			self.process_payment_data()

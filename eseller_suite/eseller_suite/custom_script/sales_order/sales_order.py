@@ -3,11 +3,12 @@ from erpnext.accounts.party import get_party_account
 from erpnext.selling.doctype.sales_order.sales_order import SalesOrder
 from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
 from erpnext.stock.doctype.item.item import get_item_defaults
+from erpnext.stock.stock_ledger import get_stock_balance
+from frappe import _
 from frappe.contacts.doctype.address.address import get_company_address
 from frappe.model.mapper import get_mapped_doc
 from frappe.model.utils import get_fetch_values
 from frappe.utils import cint, flt
-from erpnext.stock.stock_ledger import get_stock_balance
 
 
 class SalesOrderOverride(SalesOrder):
@@ -79,6 +80,10 @@ class SalesOrderOverride(SalesOrder):
 					temp_stock_transfer_doc.cancel()
 				temp_stock_transfer_doc.delete()
 
+	def before_submit(self):
+		if self.amazon_order_id:
+			self.validate_amazon_so_submit()
+
 	def create_temporary_stock_transfer(self):
 		"""method creates a stock entry to the temporary warehoue when a sales order is screated
 		"""
@@ -112,6 +117,38 @@ class SalesOrderOverride(SalesOrder):
 			failed_sync_record.amazon_order_id = self.amazon_order_id
 			failed_sync_record.remarks = "Failed to create temporary stock entry\n" + str(e)
 			failed_sync_record.save(ignore_permissions=True)
+
+	def validate_amazon_so_submit(self):
+		"""method validates the amazon sales order"""
+		order_statuses = [
+			"Shipped",
+			"InvoiceUnconfirmed",
+			"Unfulfillable",
+		]
+
+		order_status_valid = self.amazon_order_status in order_statuses
+		has_taxes = len(self.taxes) > 0
+
+		transfer_flag = True
+		if self.temporary_stock_tranfer_id:
+			transfer_flag = frappe.db.exists("Stock Entry", {
+				"name": self.temporary_stock_tranfer_id,
+				"docstatus": 1
+			})
+
+		if not (order_status_valid and has_taxes and transfer_flag):
+			msg = f"Sales Order {self.name} cannot be submitted."
+			if not order_status_valid:
+				msg += " Ensure that the order status is valid."
+			if order_status_valid and not has_taxes:
+				msg += " Ensure that taxes are set for the order."
+			if order_status_valid and not transfer_flag:
+				msg += " Ensure that the temporary stock transfer has been completed."
+			frappe.throw(
+				_(msg),
+				title=_("Invalid Sales Order Submission"),
+				exc=frappe.ValidationError
+			)
 
 @frappe.whitelist()
 def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
