@@ -81,7 +81,8 @@ class SalesOrderOverride(SalesOrder):
 				temp_stock_transfer_doc.delete()
 
 	def before_submit(self):
-		self.validate_amazon_so_submit()
+		if self.amazon_order_id:
+			self.validate_amazon_so_submit()
 
 	def create_temporary_stock_transfer(self):
 		"""method creates a stock entry to the temporary warehoue when a sales order is screated
