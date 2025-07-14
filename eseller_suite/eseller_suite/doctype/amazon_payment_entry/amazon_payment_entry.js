@@ -114,23 +114,72 @@ function fetch_invoice_details(frm) {
     });
 }
 
-function get_missing_sales_orders(frm) {
-    frm.set_value('in_progress', 1);
-    frm.call({
-        method: "get_missing_sales_orders",
-        doc: frm.doc,
-        freeze: true,
-        freeze_message: __("Syncing Sales Order.."),
-        callback: (r) => {
-            if (r && r.message) {
-                frappe.show_alert({
-                    message: __('Sales Orders created/updated successfully'),
-                    indicator: 'green'
-                }, 5);
-            }
-            frm.reload_doc();
+/**
+ * Function to fetch missing sales orders based on the payment details
+ * and sync them using the Amazon SP API Settings.
+ * It limits the number of invoices fetched based on the max_invoice_count setting.
+ */
+async function get_missing_sales_orders(frm) {
+    let amazon_order_ids = [];
+    let count = 0;
+
+    const max_invoice_count = await frappe.db.get_single_value(
+        "eSeller Settings",
+        "max_invoice_count"
+    );
+
+    for (const row of frm.doc.payment_details) {
+        if (
+            row.order_id &&
+            row.ready_to_process == 0 &&
+            row.order_id.trim() !== "" &&
+            count < max_invoice_count &&
+            !amazon_order_ids.includes(row.order_id.trim())
+        ) {
+            amazon_order_ids.push(row.order_id.trim());
+            count++;
+        } else if (count >= max_invoice_count) {
+            break;
         }
+    }
+
+    const records = await frappe.db.get_list("Amazon SP API Settings", {
+        fields: ["name"],
+        filters: { is_active: 1 },
     });
+
+    const amz_setting_name = records.at(-1)?.name;
+
+    if (!amz_setting_name) {
+        frappe.msgprint("No active Amazon SP API Settings found.");
+        return;
+    }
+
+    for (let i = 0; i < amazon_order_ids.length; i++) {
+        frappe.show_progress(
+            "Syncing Sales Order..",
+            i + 1,
+            amazon_order_ids.length,
+            __("Fetching {0} of {1} invoices", [i + 1, amazon_order_ids.length])
+        );
+
+        try {
+            await frappe.call({
+                method:
+                    "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository.get_order",
+                args: {
+                    amz_setting_name,
+                    amazon_order_ids: amazon_order_ids[i],
+                },
+                freeze: true,
+                freeze_message: __("Syncing Sales Order.."),
+            });
+        } catch (err) {
+            console.error("Error fetching order:", err);
+        }
+    }
+
+    frappe.hide_progress(); // hide after loop
 }
 
 /**
