@@ -140,7 +140,7 @@ class SalesOrderOverride(SalesOrder):
 			msg = f"Sales Order {self.name} cannot be submitted."
 			if not order_status_valid:
 				msg += " Ensure that the order status is valid."
-			if order_status_valid and not has_taxes:
+			if order_status_valid and not has_taxes and not self.replaced_order_id:
 				msg += " Ensure that taxes are set for the order."
 			if order_status_valid and not transfer_flag:
 				msg += " Ensure that the temporary stock transfer has been completed."
