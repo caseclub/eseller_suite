@@ -127,7 +127,10 @@ class SalesOrderOverride(SalesOrder):
 		]
 
 		order_status_valid = self.amazon_order_status in order_statuses
-		has_taxes = len(self.taxes) > 0
+
+		# Check if taxes are set for the order
+		# If the order is a replacement order, taxes are already handled via jv
+		has_taxes = len(self.taxes) > 0 if not self.replaced_order_id else True
 
 		transfer_flag = True
 		if self.temporary_stock_tranfer_id:
