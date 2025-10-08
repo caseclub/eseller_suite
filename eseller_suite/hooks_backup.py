@@ -1,9 +1,3 @@
-#/apps/eseller_suite/eseller_suite
-#After updating hooks.py, reload it with in bench via
-# 1) bench restart
-# 2) bench --site erp.caseclub.com migrate
-# Check status by search in erpNext UI: Scheduled Job Type List
-
 app_name = "eseller_suite"
 app_title = "eSeller Suite"
 app_publisher = "efeone"
@@ -55,7 +49,7 @@ doctype_js = {
 
 # website user home page (by Role)
 # role_home_page = {
-#     "Role": "home_page"
+# 	"Role": "home_page"
 # }
 
 # Generators
@@ -69,8 +63,8 @@ doctype_js = {
 
 # add methods and filters to jinja environment
 # jinja = {
-#     "methods": "eseller_suite.utils.jinja_methods",
-#     "filters": "eseller_suite.utils.jinja_filters"
+# 	"methods": "eseller_suite.utils.jinja_methods",
+# 	"filters": "eseller_suite.utils.jinja_filters"
 # }
 
 # Installation
@@ -113,11 +107,11 @@ before_uninstall = "eseller_suite.setup.before_uninstall"
 # Permissions evaluated in scripted ways
 
 # permission_query_conditions = {
-#     "Event": "frappe.desk.doctype.event.event.get_permission_query_conditions",
+# 	"Event": "frappe.desk.doctype.event.event.get_permission_query_conditions",
 # }
 #
 # has_permission = {
-#     "Event": "frappe.desk.doctype.event.event.has_permission",
+# 	"Event": "frappe.desk.doctype.event.event.has_permission",
 # }
 
 # DocType Class
@@ -125,8 +119,8 @@ before_uninstall = "eseller_suite.setup.before_uninstall"
 # Override standard doctype classes
 
 override_doctype_class = {
-    "Sales Order": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.SalesOrderOverride",
-#    "Journal Entry": "eseller_suite.eseller_suite.custom_script.journal_entry.journal_entry.JournalEntryOverride"
+	"Sales Order": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.SalesOrderOverride",
+	"Journal Entry": "eseller_suite.eseller_suite.custom_script.journal_entry.journal_entry.JournalEntryOverride"
 }
 
 # Document Events
@@ -134,49 +128,42 @@ override_doctype_class = {
 # Hook on document methods and events
 
 doc_events = {
-    "Journal Entry": {
-        "on_submit": "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.shorten_remarks",
+	'Sales Invoice':{
+		"validate": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.validate",
+		"before_submit": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.before_submit",
+		"on_cancel": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.on_cancel",
     },
-#    'Sales Invoice':{
-#        "validate": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.validate",
-#        "before_submit": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.before_submit",
-#        "on_cancel": "eseller_suite.eseller_suite.custom_script.sales_invoice.sales_invoice.on_cancel",
-#    },
-#    'Purchase Receipt':{
-#        "before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
-#        "before_submit": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.activate_barcodes",
-#        "on_cancel": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.delete_barcodes",
-#    },
-#    'Stock Entry':{
-#        "before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
-#        "before_submit": "eseller_suite.eseller_suite.custom_script.stock_entry.stock_entry.transfer_barcodes",
-#        "before_insert": "eseller_suite.eseller_suite.custom_script.stock_entry.stock_entry.before_insert_custom",
-#    },
+	'Purchase Receipt':{
+		"before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
+		"before_submit": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.activate_barcodes",
+		"on_cancel": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.delete_barcodes",
+	},
+	'Stock Entry':{
+		"before_validate": "eseller_suite.eseller_suite.custom_script.purchase_receipt.purchase_receipt.create_barcodes",
+		"before_submit": "eseller_suite.eseller_suite.custom_script.stock_entry.stock_entry.transfer_barcodes",
+		"before_insert": "eseller_suite.eseller_suite.custom_script.stock_entry.stock_entry.before_insert_custom",
+    },
 }
 
 # Scheduled Tasks
 # ---------------
 
 scheduler_events = {
-#     "all": [
-#         "eseller_suite.tasks.all"
-#     ],
-    "daily_long": [
-         "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.schedule_get_order_details_daily",            # Amazon Orders Sync: Import Amazon orders daily and sweep sales orders to create sales invoices as taxes & fees get updated
-         "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.process_settlements",               # Amazon Settlement Report: Download and process recent amazon settlement reports
-    ],
-    "hourly_long": [
-        "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.schedule_get_order_details",                   # Amazon Orders Sync: Import Amazon orders from the current day (goes back to midnight from the night before)
-        "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.create_clearing_payment_entries",    # Amazon Settlement Clearing: Check for & create clearing payment entries (transfering from amazon clearing to bank of america)
-        "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sync_fba_inventory.run_daily_fba_inventory_sync",              # Amazon FBA Inventory Sync: Import/update Amazon FBA inventory & Amazon Inbound inventory by creating stock reconciliation entries and material transfer entries. Runs at 8am daily
-        "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_pay_process_settlement_report.process_settlement_reports"      # Amazon Pay Clearing: Transfers funds from the Amazon Pay Clearing Account to the default bank account & creates a journal entry with the fees. Runs at 1am daily    
-    ],
-#     "weekly": [
-#         "eseller_suite.tasks.weekly"
-#     ],
-#     "monthly": [
-#         "eseller_suite.tasks.monthly"
-#     ],
+# 	"all": [
+# 		"eseller_suite.tasks.all"
+# 	],
+	"daily_long": [
+		"eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.schedule_get_order_details_daily"
+	],
+	"hourly_long": [
+		"eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.schedule_get_order_details",
+	],
+# 	"weekly": [
+# 		"eseller_suite.tasks.weekly"
+# 	],
+# 	"monthly": [
+# 		"eseller_suite.tasks.monthly"
+# 	],
 }
 
 # Testing
@@ -188,14 +175,14 @@ scheduler_events = {
 # ------------------------------
 #
 override_whitelisted_methods = {
-    "erpnext.selling.doctype.sales_order.sales_order.make_sales_invoice": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.make_sales_invoice"
+	"erpnext.selling.doctype.sales_order.sales_order.make_sales_invoice": "eseller_suite.eseller_suite.custom_script.sales_order.sales_order.make_sales_invoice"
 }
 #
 # each overriding function accepts a `data` argument;
 # generated from the base implementation of the doctype dashboard,
 # along with any modifications made in other Frappe apps
 # override_doctype_dashboards = {
-#     "Task": "eseller_suite.task.get_dashboard_data"
+# 	"Task": "eseller_suite.task.get_dashboard_data"
 # }
 
 # exempt linked doctypes from being automatically cancelled
@@ -221,38 +208,38 @@ override_whitelisted_methods = {
 # --------------------
 
 # user_data_fields = [
-#     {
-#         "doctype": "{doctype_1}",
-#         "filter_by": "{filter_by}",
-#         "redact_fields": ["{field_1}", "{field_2}"],
-#         "partial": 1,
-#     },
-#     {
-#         "doctype": "{doctype_2}",
-#         "filter_by": "{filter_by}",
-#         "partial": 1,
-#     },
-#     {
-#         "doctype": "{doctype_3}",
-#         "strict": False,
-#     },
-#     {
-#         "doctype": "{doctype_4}"
-#     }
+# 	{
+# 		"doctype": "{doctype_1}",
+# 		"filter_by": "{filter_by}",
+# 		"redact_fields": ["{field_1}", "{field_2}"],
+# 		"partial": 1,
+# 	},
+# 	{
+# 		"doctype": "{doctype_2}",
+# 		"filter_by": "{filter_by}",
+# 		"partial": 1,
+# 	},
+# 	{
+# 		"doctype": "{doctype_3}",
+# 		"strict": False,
+# 	},
+# 	{
+# 		"doctype": "{doctype_4}"
+# 	}
 # ]
 
 # Authentication and authorization
 # --------------------------------
 
 # auth_hooks = [
-#     "eseller_suite.auth.validate"
+# 	"eseller_suite.auth.validate"
 # ]
 
 # Automatically update python controller files with type annotations for this app.
 # export_python_type_annotations = True
 
 # default_log_clearing_doctypes = {
-#     "Logging DocType Name": 30  # days to retain logs
+# 	"Logging DocType Name": 30  # days to retain logs
 # }
 
 # Fixtures
