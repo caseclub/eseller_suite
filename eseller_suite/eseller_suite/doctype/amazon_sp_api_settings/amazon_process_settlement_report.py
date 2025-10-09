@@ -1500,7 +1500,7 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
         # Find unreferenced AR credit line in JE
         line_name = frappe.db.get_value("Journal Entry Account", {
             "parent": je_name, "amazon_order_id": order_id, "credit_in_account_currency": [">", 0],
-            "reference_type": ["is", "null"]
+            "reference_type": None
         }, "name")
         if not line_name:
             continue
@@ -1549,7 +1549,7 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
                     if apply > 0.01:
                         line_name = frappe.db.get_value("Journal Entry Account", {
                             "parent": je_name, "amazon_order_id": order_id, "debit_in_account_currency": [">", 0],
-                            "reference_type": ["is", "null"]
+                            "reference_type": None
                         }, "name")
                         if line_name:
                             try:
@@ -1576,7 +1576,7 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
                 continue
             line_name = frappe.db.get_value("Journal Entry Account", {
                 "parent": je_name, "amazon_order_id": order_id, "debit_in_account_currency": [">", 0],
-                "reference_type": ["is", "null"]
+                "reference_type": None
             }, "name")
             if not line_name:
                 continue
