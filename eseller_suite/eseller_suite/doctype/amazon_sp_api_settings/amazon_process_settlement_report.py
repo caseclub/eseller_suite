@@ -1210,11 +1210,12 @@ def create_clearing_payment_entries():
         if not je_dict["custom_deposit_date"]:
             continue
         try:
+            pst_tz = ZoneInfo("America/Los_Angeles")
             if isinstance(je_dict["custom_deposit_date"], str):
                 dep_dt = datetime.strptime(je_dict["custom_deposit_date"], "%Y-%m-%d %H:%M:%S")
             else:
                 dep_dt = je_dict["custom_deposit_date"]
-            if dep_dt > datetime.now():
+            if dep_dt > datetime.now(tz=pst_tz):
                 continue
         except ValueError:
             frappe.log_error(f"Invalid custom_deposit_date in JE {je_name}", "Clearing Transfer")
