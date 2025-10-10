@@ -7,7 +7,7 @@ from __future__ import annotations
 import json, requests
 from datetime import datetime, timedelta
 import time
-
+from zoneinfo import ZoneInfo
 import frappe
 from .amazon_repository import _sp_get, AmazonRepository
 
@@ -465,12 +465,10 @@ frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_s
 def run_daily_fba_inventory_sync():
     """Hourly scheduler entry: sync FBA inventory (only runs at 8 AM)."""
     
-    # Get ERPNext's system time zone (e.g., 'America/New_York'); update in System Settings if wrong
-    system_tz_str = frappe.db.get_single_value("System Settings", "time_zone")
-    system_tz = pytz.timezone(system_tz_str)
-    now = datetime.now(system_tz)
+    pst_tz = ZoneInfo("America/Los_Angeles")
+    now = datetime.now(pst_tz)
     if now.hour != 8 and DEBUG == False:
-        return  # Only run at 8 AM in system time zone
+        return  # Only run at 8 AM in PST
     
     try:  # ADDED: Wrap scheduler call
         frappe.get_doc("Amazon SP API Settings", "q3opu7c5ac")  # Load to ensure active
