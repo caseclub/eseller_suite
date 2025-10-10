@@ -1215,6 +1215,9 @@ def create_clearing_payment_entries():
                 dep_dt = datetime.strptime(je_dict["custom_deposit_date"], "%Y-%m-%d %H:%M:%S")
             else:
                 dep_dt = je_dict["custom_deposit_date"]
+            
+            # Attach the Los Angeles timezone to dep_dt (it was previously a naive datetime with no timezone info)
+            # This does not change the clock time — it simply tells Python that this time is in Los Angeles local time
             dep_dt = dep_dt.replace(tzinfo=pst_tz)
             if dep_dt > datetime.now(tz=pst_tz):
                 continue
