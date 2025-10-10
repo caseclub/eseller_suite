@@ -1215,6 +1215,7 @@ def create_clearing_payment_entries():
                 dep_dt = datetime.strptime(je_dict["custom_deposit_date"], "%Y-%m-%d %H:%M:%S")
             else:
                 dep_dt = je_dict["custom_deposit_date"]
+            dep_dt = dep_dt.replace(tzinfo=pst_tz)
             if dep_dt > datetime.now(tz=pst_tz):
                 continue
         except ValueError:
