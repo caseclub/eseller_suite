@@ -8,6 +8,7 @@ import io
 import textwrap
 from erpnext.accounts.utils import get_balance_on
 import pytz
+from zoneinfo import ZoneInfo
 
 DEBUG = False  # Set to False to disable debug prints
 
@@ -15,12 +16,9 @@ DEBUG = False  # Set to False to disable debug prints
 frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_pay_process_settlement_report.process_settlement_reports")
 """
 def process_settlement_reports():
-    # Get ERPNext's system time zone (e.g., 'America/New_York'); update in System Settings if wrong
-    system_tz_str = frappe.db.get_single_value("System Settings", "time_zone")
-    system_tz = pytz.timezone(system_tz_str)
-    now = datetime.now(system_tz)
+    now = datetime.now(ZoneInfo("America/Los_Angeles"))
     if now.hour != 1 and DEBUG == False:
-        return  # Only run at 1 AM in system time zone
+        return  # Only run at 1 AM in Los Angeles time
     
     if DEBUG: print("Starting process_settlement_reports")
     amz_pay_settings = frappe.get_all(
