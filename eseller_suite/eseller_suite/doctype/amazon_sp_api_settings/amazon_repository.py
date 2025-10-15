@@ -866,7 +866,24 @@ class AmazonRepository:
                     country_code = ship_details.get("CountryCode")
                     country_name = frappe.db.get_value("Country", {"code": (country_code or "").lower()}, "name") if country_code else "United States"
                     address.country = country_name or "United States"  # Fallback
-                    address.phone = ship_details.get("Phone") or ""  # Optional
+                    
+                    raw_phone = ship_details.get("Phone") or ""
+                    import re
+                    # Remove extension if present (handles "ext." consistently)
+                    if "ext." in raw_phone.lower():
+                        raw_phone = raw_phone.split("ext.", 1)[0].strip()
+                    # Strip all non-digits for safety
+                    digits = re.sub(r'\D', '', raw_phone)
+                    # Remove leading 1 if it's an 11-digit US number
+                    if digits.startswith('1') and len(digits) == 11:
+                        digits = digits[1:]
+                    # Format as (XXX) XXX-XXXX if 10 digits
+                    if len(digits) == 10:
+                        formatted_phone = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+                    else:
+                        formatted_phone = ""  # Or fallback to cleaned digits without formatting
+                    address.phone = formatted_phone
+                    
                     address.append("links", {
                         "link_doctype": "Customer",
                         "link_name": cust.name
