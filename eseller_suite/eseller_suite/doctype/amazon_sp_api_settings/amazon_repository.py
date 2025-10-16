@@ -1049,8 +1049,8 @@ class AmazonRepository:
         so.set_warehouse = warehouse
 
         # Set payment terms template for MFN orders
-        if channel == "MFN" and self.amz_setting.custom_mfn_payment_terms_template:
-            so.payment_terms_template = self.amz_setting.custom_mfn_payment_terms_template
+        #if channel == "MFN" and self.amz_setting.custom_mfn_payment_terms_template:
+        #    so.payment_terms_template = self.amz_setting.custom_mfn_payment_terms_template
 
         # Guard: Before updating the SO compare the Amazon payload with the existing sales order to determine if a SO rebuild is required
         if so_id and not so_docstatus:  # Only for existing draft SOs
@@ -1224,6 +1224,11 @@ class AmazonRepository:
         so.calculate_taxes_and_totals()
         if so.grand_total>=0:
             try:
+                if channel == "MFN":
+                    so.payment_terms_template = ""
+                    # If a schedule sneaks in via defaults, nuke it:
+                    if getattr(so, "payment_schedule", None):
+                        so.payment_schedule = []
                 so.save(ignore_permissions=True)
             except Exception as e:
                 frappe.log_error("Error saving Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
