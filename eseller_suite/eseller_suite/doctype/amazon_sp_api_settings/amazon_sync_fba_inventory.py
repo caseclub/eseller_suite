@@ -460,6 +460,12 @@ def process_fba_inventory():
 # ──────────────────────────────────────────
 """
 frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sync_fba_inventory.run_daily_fba_inventory_sync")
+
+NOTE:
+You need to Manually Create Opening Stock Entries Before Running the Initial Sync
+Go to Stock > Stock Transactions > Stock Entry > New
+Set Stock Entry Type to "Material Receipt"
+Set Target Warehouse to your relevant warehouses (Amazon FBA, Amazon FBA Inbound, Amazon FBA Prep Area
 """
 @frappe.whitelist()
 def run_daily_fba_inventory_sync():
@@ -467,7 +473,7 @@ def run_daily_fba_inventory_sync():
     
     pst_tz = ZoneInfo("America/Los_Angeles")
     now = datetime.now(pst_tz)
-    if now.hour != 8 and DEBUG == False:
+    if now.hour != 7 and DEBUG == False:
         return  # Only run at 8 AM in PST
     
     try:  # ADDED: Wrap scheduler call

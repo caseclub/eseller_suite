@@ -1,6 +1,6 @@
 #bench functions
 import frappe
-
+from frappe.utils import now
 #-------------------------------------------------------------------------------------------------------------------------------------------------------Accounting
 #--------------------------------------------
 #Delete all general ledger entries
@@ -578,3 +578,57 @@ def hrms_temp():
     frappe.db.delete("Module Def", {"name":["in",["HR","Payroll"]]})
     frappe.db.commit()
 
+#-------------------------------------------------------------------------------------------------------------------------------------------------------Bill of Material (BOM)
+#--------------------------------------------
+#Change BOM status to draft
+#-------------------------------------------- 
+"""
+frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.bench_functions.force_set_bom_to_draft", bom_name="BOM-FO-CC30CALPIS1")
+"""
+def force_set_bom_to_draft(bom_name: str) -> None:
+
+    """
+    Forcefully set a BOM's docstatus to Draft (0), regardless of current state.
+    Prints step-by-step operations and exits cleanly if already draft.
+
+    WARNING:
+        This bypasses normal ERPNext workflow (submit/cancel/amend).
+        Use with caution and only if you know the implications for linked records.
+    """
+    print(f"[start] Preparing to force-set BOM '{bom_name}' to Draft…")
+
+    # Fetch the BOM
+    try:
+        bom = frappe.get_doc("BOM", bom_name)
+    except frappe.DoesNotExistError:
+        print(f"[error] BOM '{bom_name}' not found.")
+        return
+
+    print(f"[info] Current status for '{bom.name}': docstatus={bom.docstatus} "
+          f"(0=Draft, 1=Submitted, 2=Cancelled)")
+
+    # If already draft, nothing to do
+    if bom.docstatus == 0:
+        print(f"[skip] BOM '{bom.name}' is already Draft. No changes made.")
+        return
+
+    # Force-flip using a DB write (bypasses all validations/workflows)
+    print(f"[action] Forcing docstatus -> 0 (Draft) via DB update…")
+    frappe.db.sql(
+        """UPDATE `tabBOM`
+           SET docstatus = 0, modified = %s, modified_by = %s
+           WHERE name = %s""",
+        (now(), frappe.session.user if frappe.session.user else "Administrator", bom.name),
+    )
+
+    # Commit and verify
+    print(f"[commit] Committing transaction…")
+    frappe.db.commit()
+
+    bom_reloaded = frappe.get_doc("BOM", bom.name)
+    print(f"[verify] New status for '{bom_reloaded.name}': docstatus={bom_reloaded.docstatus}")
+
+    if bom_reloaded.docstatus == 0:
+        print(f"[done] Success. BOM '{bom_reloaded.name}' is now Draft.")
+    else:
+        print(f"[warn] Expected docstatus=0, but got {bom_reloaded.docstatus}. Check DB/permissions.")
