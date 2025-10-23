@@ -474,7 +474,7 @@ def run_daily_fba_inventory_sync():
     pst_tz = ZoneInfo("America/Los_Angeles")
     now = datetime.now(pst_tz)
     if now.hour != 7 and DEBUG == False:
-        return  # Only run at 8 AM in PST
+        return  # Only run at 7 AM in PST
     
     try:  # ADDED: Wrap scheduler call
         frappe.get_doc("Amazon SP API Settings", "q3opu7c5ac")  # Load to ensure active
