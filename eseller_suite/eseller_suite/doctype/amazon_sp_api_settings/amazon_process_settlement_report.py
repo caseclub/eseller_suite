@@ -595,17 +595,18 @@ def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, 
         cn.calculate_taxes_and_totals()
                
         # Stamp fields
+        cn.remarks = ""  # Initialize to empty string for safe appending
         if marketplace_name == "non-amazon us":
             cn.custom_merchant_order_id = re.sub(r'\D', '', merchant_order_id)
-            cn.user_remark = "Multi-Channel Fulfillment (MCF) Order Refund"
+            cn.remarks = "Multi-Channel Fulfillment (MCF) Order Refund"
         elif marketplace_name == "amazon.com":
             cn.custom_merchant_order_id = ""
-            cn.user_remark = "Fulfillment by Amazon (FBA) Order Refund"
+            cn.remarks = "Fulfillment by Amazon (FBA) Order Refund"
         cn.amazon_order_id = order_id
         
         # Append per-SKU remark details
         if remark_details:
-            cn.user_remark += "\n" + "\n".join(remark_details)
+            cn.remarks += "\n" + "\n".join(remark_details)
         
         cn.insert(ignore_permissions=True)
         cn.submit()
