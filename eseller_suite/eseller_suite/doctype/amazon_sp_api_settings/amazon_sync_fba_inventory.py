@@ -278,6 +278,29 @@ def process_inbound_inventory(asin_inbound, settings):
             item_dict["allow_zero_valuation_rate"] = 1
         reconcile_items.append(item_dict)
 
+    # Fetch Amazon items in inbound warehouse with positive qty not reported by Amazon, assume 0
+    inbound_amazon_items = frappe.db.sql("""
+        SELECT i.name as item_code, i.custom_asin as asin, b.actual_qty, b.valuation_rate
+        FROM `tabItem` i
+        INNER JOIN `tabBin` b ON i.name = b.item_code
+        WHERE b.warehouse = %s AND i.custom_asin IS NOT NULL AND b.actual_qty > 0 AND i.disabled = 0 AND i.is_stock_item = 1
+    """, inbound_wh, as_dict=True)
+
+    for row in inbound_amazon_items:
+        if row.asin in asin_inbound:
+            continue  # Already handled if needed
+        valuation_rate = row.valuation_rate or frappe.get_value("Item", row.item_code, "valuation_rate") or 0
+        item_dict = {
+            "item_code": row.item_code,
+            "warehouse": inbound_wh,
+            "qty": 0,
+            "valuation_rate": valuation_rate,
+        }
+        if valuation_rate == 0:
+            item_dict["valuation_rate"] = 0.01
+            item_dict["allow_zero_valuation_rate"] = 1
+        reconcile_items.append(item_dict)
+
     # Create and submit Stock Reconciliation if needed
     if reconcile_items:
         if DEBUG: print(f"[DEBUG] Creating Stock Reconciliation with {len(reconcile_items)} items...")
@@ -418,6 +441,29 @@ def process_fba_inventory():
                 "item_code": item_code,
                 "warehouse": wh,
                 "qty": new_qty,
+                "valuation_rate": valuation_rate,
+            }
+            if valuation_rate == 0:
+                item_dict["valuation_rate"] = 0.01
+                item_dict["allow_zero_valuation_rate"] = 1
+            items_list.append(item_dict)
+
+        # Fetch Amazon items in warehouse with positive qty not reported by Amazon, assume 0
+        amazon_items_in_wh = frappe.db.sql("""
+            SELECT i.name as item_code, i.custom_asin as asin, b.actual_qty, b.valuation_rate
+            FROM `tabItem` i
+            INNER JOIN `tabBin` b ON i.name = b.item_code
+            WHERE b.warehouse = %s AND i.custom_asin IS NOT NULL AND b.actual_qty > 0 AND i.disabled = 0 AND i.is_stock_item = 1
+        """, wh, as_dict=True)
+
+        for row in amazon_items_in_wh:
+            if row.asin in asin_fulfillable:
+                continue  # Already handled if needed
+            valuation_rate = row.valuation_rate or frappe.get_value("Item", row.item_code, "valuation_rate") or 0
+            item_dict = {
+                "item_code": row.item_code,
+                "warehouse": wh,
+                "qty": 0,
                 "valuation_rate": valuation_rate,
             }
             if valuation_rate == 0:
