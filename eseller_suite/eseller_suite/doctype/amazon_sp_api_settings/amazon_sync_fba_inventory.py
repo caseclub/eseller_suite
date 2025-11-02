@@ -78,15 +78,16 @@ def process_inbound_inventory(asin_inbound, settings):
             as_dict=True
         ) or {}
         bin_rate = bin_data_prep.get("valuation_rate", 0)
-        item_rate = frappe.get_value("Item", item_code, "valuation_rate") or 0
+
+        item_valuation_rate = frappe.get_value("Item", item_code, "valuation_rate") or 0
+        val_rate = item_valuation_rate if item_valuation_rate > 0 else 0.01
+
         has_batch = frappe.get_value("Item", item_code, "has_batch_no")
         has_serial = frappe.get_value("Item", item_code, "has_serial_no")
 
-        if bin_rate != 0:
-            val_rate = bin_rate
-            transfer_pending.append((item_code, transfer_qty, has_batch, has_serial, val_rate))
-        else:
-            val_rate = item_rate if item_rate != 0 else 0.01
+        reconcile_needed = (bin_rate != val_rate)
+
+        if reconcile_needed:
             item_reconcile_items = []
             if has_serial:
                 serial_nos = frappe.db.sql_list("""SELECT name FROM `tabSerial No` WHERE item_code = %s AND warehouse = %s""", (item_code, prep_wh))
@@ -122,6 +123,8 @@ def process_inbound_inventory(asin_inbound, settings):
                 transfer_pending.append((item_code, transfer_qty, has_batch, has_serial, val_rate))
             else:
                 if DEBUG: print(f"[DEBUG] Could not create reconcile items for {item_code}, skipping transfer")
+        else:
+            transfer_pending.append((item_code, transfer_qty, has_batch, has_serial, val_rate))
 
     # Create and submit Prep Stock Reconciliation if needed
     if prep_reconcile_items:
@@ -164,7 +167,6 @@ def process_inbound_inventory(asin_inbound, settings):
                     "qty": transfer_qty,
                     "basic_rate": val_rate,
                     "serial_no": '\n'.join(serial_nos),
-                    "allow_zero_valuation_rate": 1
                 })
             else:
                 if DEBUG: print(f"[DEBUG] Insufficient serial nos for {item_code}, skipping transfer")
@@ -184,7 +186,6 @@ def process_inbound_inventory(asin_inbound, settings):
                         "qty": move_qty,
                         "basic_rate": val_rate,
                         "batch_no": batch.name,
-                        "allow_zero_valuation_rate": 1
                     })
                     remaining -= move_qty
             if remaining > 0:
@@ -196,7 +197,6 @@ def process_inbound_inventory(asin_inbound, settings):
                 "t_warehouse": inbound_wh,
                 "qty": transfer_qty,
                 "basic_rate": val_rate,
-                "allow_zero_valuation_rate": 1
             })
 
     # Create and submit Stock Entry if needed
@@ -212,9 +212,13 @@ def process_inbound_inventory(asin_inbound, settings):
         se.insert(ignore_permissions=True)
         if DEBUG: print(f"[DEBUG] Inserted SE: {se.name}")
         try:
-            se.submit()
-            frappe.db.commit()
-            if DEBUG: print(f"[DEBUG] Submitted SE: {se.name}")
+            if DEBUG:
+                print(f"[DEBUG] DEBUG mode: leaving SE {se.name} as DRAFT (not submitted)")
+                frappe.db.commit()
+            else:
+                se.submit()
+                frappe.db.commit()
+                if DEBUG: print(f"[DEBUG] Submitted SE: {se.name}")
         except NegativeStockError as e:
             if DEBUG: print(f"[DEBUG] NegativeStockError during submit: {str(e)}")
             # Safely delete draft
@@ -266,22 +270,16 @@ def process_inbound_inventory(asin_inbound, settings):
             continue
 
         if DEBUG: print(f"[DEBUG] Inbound qty mismatch for {item_code}: {current_inbound} != {target_qty}")
-        bin_data = frappe.db.get_value(
-            "Bin",
-            {"item_code": item_code, "warehouse": inbound_wh},
-            ["valuation_rate"],
-            as_dict=True
-        ) or {}
-        valuation_rate = bin_data.get("valuation_rate", 0) or frappe.get_value("Item", item_code, "valuation_rate") or 0
+        item_valuation_rate = frappe.get_value("Item", item_code, "valuation_rate") or 0
         item_dict = {
             "item_code": item_code,
             "warehouse": inbound_wh,
             "qty": target_qty,
-            "valuation_rate": valuation_rate,
         }
-        if valuation_rate == 0:
+        if item_valuation_rate > 0:
+            item_dict["valuation_rate"] = item_valuation_rate
+        else:
             item_dict["valuation_rate"] = 0.01
-            item_dict["allow_zero_valuation_rate"] = 1
         reconcile_items.append(item_dict)
 
     # Fetch Amazon items in inbound warehouse with positive qty not reported by Amazon, assume 0
@@ -295,16 +293,16 @@ def process_inbound_inventory(asin_inbound, settings):
     for row in inbound_amazon_items:
         if row.asin in asin_inbound:
             continue  # Already handled if needed
-        valuation_rate = row.valuation_rate or frappe.get_value("Item", row.item_code, "valuation_rate") or 0
+        item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
         item_dict = {
             "item_code": row.item_code,
             "warehouse": inbound_wh,
             "qty": 0,
-            "valuation_rate": valuation_rate,
         }
-        if valuation_rate == 0:
+        if item_valuation_rate > 0:
+            item_dict["valuation_rate"] = item_valuation_rate
+        else:
             item_dict["valuation_rate"] = 0.01
-            item_dict["allow_zero_valuation_rate"] = 1
         reconcile_items.append(item_dict)
 
     # Create and submit Stock Reconciliation if needed
@@ -452,16 +450,16 @@ def process_fba_inventory():
             if int(current_qty) == new_qty:
                 continue  # No adjustment needed
 
-            valuation_rate = bin_data.get("valuation_rate", 0) or frappe.get_value("Item", item_code, "valuation_rate") or 0
+            item_valuation_rate = frappe.get_value("Item", item_code, "valuation_rate") or 0
             item_dict = {
                 "item_code": item_code,
                 "warehouse": wh,
                 "qty": new_qty,
-                "valuation_rate": valuation_rate,
             }
-            if valuation_rate == 0:
+            if item_valuation_rate > 0:
+                item_dict["valuation_rate"] = item_valuation_rate
+            else:
                 item_dict["valuation_rate"] = 0.01
-                item_dict["allow_zero_valuation_rate"] = 1
             items_list.append(item_dict)
 
         # Fetch Amazon items in warehouse with positive qty not reported by Amazon, assume 0
@@ -475,16 +473,16 @@ def process_fba_inventory():
         for row in amazon_items_in_wh:
             if row.asin in asin_fulfillable:
                 continue  # Already handled if needed
-            valuation_rate = row.valuation_rate or frappe.get_value("Item", row.item_code, "valuation_rate") or 0
+            item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
             item_dict = {
                 "item_code": row.item_code,
                 "warehouse": wh,
                 "qty": 0,
-                "valuation_rate": valuation_rate,
             }
-            if valuation_rate == 0:
+            if item_valuation_rate > 0:
+                item_dict["valuation_rate"] = item_valuation_rate
+            else:
                 item_dict["valuation_rate"] = 0.01
-                item_dict["allow_zero_valuation_rate"] = 1
             items_list.append(item_dict)
 
         if DEBUG: print(f"[DEBUG] Total items to reconcile: {len(items_list)}")
