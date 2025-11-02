@@ -5,7 +5,8 @@
 # =========================================
 from __future__ import annotations
 import json, requests
-from datetime import datetime, timedelta
+
+from datetime import datetime, timedelta, timezone
 import time
 from zoneinfo import ZoneInfo
 import frappe
@@ -20,7 +21,7 @@ from erpnext.stock.stock_ledger import NegativeStockError
 
 import pytz
 
-DEBUG = False  # Toggle to False to disable all debug prints. Also set to True to run the progam on demand as opposed to during the set time
+DEBUG = True  # Toggle to False to disable all debug prints. Also set to True to run the progam on demand as opposed to during the set time
 
 # ──────────────────────────────────────────
 # Helper Functions
@@ -337,24 +338,30 @@ def process_fba_inventory():
 
         # Aggregate across all marketplaces
         summaries = []
+        
+
         for mkt_id in marketplace_ids:
             if DEBUG: print(f"[DEBUG] Querying marketplace: {mkt_id}")
-            qs = {
+            start_dt = (datetime.now(timezone.utc) - timedelta(days=540)).replace(microsecond=0)
+            start_date = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            base_qs = {
                 "granularityType": "Marketplace",
                 "granularityId": mkt_id,
-                "marketplaceIds": mkt_id,  # Single ID per call for consistency
-                "details": "true",  # Include full inventory details
-                # Omit sellerSkus for all items
-                # For full current snapshot, omit startDateTime; but add a recent one if needed for changes
-                # "startDateTime": (datetime.utcnow() - timedelta(days=7)).isoformat() + 'Z'  # Optional: changes in last 7 days
+                "marketplaceIds": mkt_id,
+                "details": "true",
+                "startDateTime": start_date  # UTC ISO format
             }
-            if DEBUG: print(f"[DEBUG] Query parameters: {qs}")
+            if DEBUG: print(f"[DEBUG] Query parameters: {base_qs}")
             next_token = None
             page = 1
             while True:
                 if next_token:
+                    qs = dict(base_qs)
                     qs["nextToken"] = next_token
                     if DEBUG: print(f"[DEBUG] Updated qs with nextToken: {qs}")
+                else:
+                    qs = dict(base_qs)  # First page uses full filters + startDateTime
+
                 if DEBUG: print(f"[DEBUG] Fetching page {page} for {mkt_id}...")
                 try:  # ADDED: Wrap API call for logging
                     resp = _sp_get("/fba/inventory/v1/summaries", qs, settings, return_full=True)  # Added return_full=True
