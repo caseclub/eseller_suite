@@ -21,6 +21,7 @@ from erpnext.stock.stock_ledger import NegativeStockError
 
 import pytz
 
+# When True all docs are left as drafts and not submitted
 DEBUG = True  # Toggle to False to disable all debug prints. Also set to True to run the progam on demand as opposed to during the set time
 
 # ──────────────────────────────────────────
@@ -136,9 +137,13 @@ def process_inbound_inventory(asin_inbound, settings):
             })
             prep_sr.insert(ignore_permissions=True)
             if DEBUG: print(f"[DEBUG] Inserted Prep SR: {prep_sr.name}")
-            prep_sr.submit()
-            frappe.db.commit()
-            if DEBUG: print(f"[DEBUG] Submitted Prep SR: {prep_sr.name}")
+            if DEBUG:
+                if DEBUG: print(f"[DEBUG] DEBUG mode: leaving Prep SR {prep_sr.name} as DRAFT (not submitted)")
+                frappe.db.commit()  # persist draft
+            else:
+                prep_sr.submit()
+                frappe.db.commit()
+                if DEBUG: print(f"[DEBUG] Submitted Prep SR: {prep_sr.name}")
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Prep Stock Reconciliation Error")
             raise  # Re-raise to propagate if needed
@@ -316,9 +321,13 @@ def process_inbound_inventory(asin_inbound, settings):
             })
             sr.insert(ignore_permissions=True)
             if DEBUG: print(f"[DEBUG] Inserted SR: {sr.name}")
-            sr.submit()
-            frappe.db.commit()
-            if DEBUG: print(f"[DEBUG] Submitted inbound SR: {sr.name}")
+            if DEBUG:
+                if DEBUG: print(f"[DEBUG] DEBUG mode: leaving inbound SR {sr.name} as DRAFT (not submitted)")
+                frappe.db.commit()  # persist draft
+            else:
+                sr.submit()
+                frappe.db.commit()
+                if DEBUG: print(f"[DEBUG] Submitted inbound SR: {sr.name}")
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Inbound Stock Reconciliation Error")
             raise
@@ -495,9 +504,13 @@ def process_fba_inventory():
                 })
                 sr.insert(ignore_permissions=True)
                 if DEBUG: print(f"[DEBUG] Inserted SR: {sr.name}")
-                sr.submit()
-                frappe.db.commit()
-                if DEBUG: print(f"[FBA_INV] Synced inventory via Stock Reconciliation {sr.name}")
+                if DEBUG:
+                    if DEBUG: print(f"[DEBUG] DEBUG mode: leaving FBA fulfillable SR {sr.name} as DRAFT (not submitted)")
+                    frappe.db.commit()  # persist draft
+                else:
+                    sr.submit()
+                    frappe.db.commit()
+                    if DEBUG: print(f"[FBA_INV] Synced inventory via Stock Reconciliation {sr.name}")
             except Exception:
                 frappe.log_error(frappe.get_traceback(), "Fulfillable Stock Reconciliation Error")
                 raise
