@@ -22,7 +22,7 @@ from erpnext.stock.stock_ledger import NegativeStockError
 import pytz
 
 # When True all docs are left as drafts and not submitted
-DEBUG = True  # Toggle to False to disable all debug prints. Also set to True to run the progam on demand as opposed to during the set time
+DEBUG = False  # Toggle to False to disable all debug prints. Also set to True to run the progam on demand as opposed to during the set time
 
 # ──────────────────────────────────────────
 # Helper Functions
