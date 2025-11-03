@@ -420,6 +420,59 @@ frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.bench_fu
 
 #-------------------------------------------------------------------------------------------------------------------------------------------------------Sales Orders
 #--------------------------------------------
+# Updaet a specific sales order from submitted to draft
+#--------------------------------------------    
+"""
+frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.bench_functions.force_so_to_draft", so_name="SO25-17101")
+"""
+def force_so_to_draft(so_name: str):
+    """
+    Forcefully change a single Sales Order from Submitted (docstatus=1) to Draft (docstatus=0).
+    Usage (replace site and SO name):
+      bench --site your.site.name execute "my_app.scripts.force_so_to_draft.force_so_to_draft" --args '["SO-0001"]'
+    """
+    # Fetch quick info
+    row = frappe.db.get_value("Sales Order", so_name, ["name", "docstatus", "status"], as_dict=True)
+    if not row:
+        print(f"Not found: {so_name}")
+        return
+
+    print(f"Processing {so_name} (current docstatus={row.docstatus}, status='{row.status}')")
+
+    if row.docstatus == 2:
+        print("This Sales Order is Cancelled. Consider Amending instead. Aborting.")
+        return
+    if row.docstatus == 0:
+        print("Already Draft. Nothing to do.")
+        return
+
+    # Parent → Draft
+    frappe.db.sql("""
+        UPDATE `tabSales Order`
+        SET docstatus = 0, status = 'Draft'
+        WHERE name = %s
+    """, (so_name,))
+
+    # Common child tables → Draft as well
+    child_tables = [
+        ("Sales Order Item", "parent"),
+        ("Packed Item", "parent"),
+        ("Sales Taxes and Charges", "parent"),
+        ("Sales Team", "parent"),
+        ("Payment Schedule", "parent"),
+    ]
+    for doctype, parent_field in child_tables:
+        frappe.db.sql(f"""
+            UPDATE `tab{doctype}`
+            SET docstatus = 0
+            WHERE {parent_field} = %s
+        """, (so_name,))
+
+    frappe.db.commit()
+    print(f"Set {so_name} to Draft (docstatus=0).")
+    print("⚠️ WARNING: This bypasses normal Cancel→Amend flow and may leave linked docs inconsistent.")
+    
+#--------------------------------------------
 # Delete all sales orders
 #--------------------------------------------    
 """
