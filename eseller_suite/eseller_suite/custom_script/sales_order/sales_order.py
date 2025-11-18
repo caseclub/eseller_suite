@@ -89,6 +89,7 @@ class SalesOrderOverride(SalesOrder):
             po.custom_ship_on_third_party = self.custom_ship_on_third_party
             po.custom_third_party_account = self.custom_third_party_account
             po.custom_third_party_postal = self.custom_third_party_postal
+            po.custom_customer_po_number = self.po_no
             po.buying_price_list = frappe.db.get_single_value("Buying Settings", "buying_price_list")
 
             for so_item in items:
@@ -115,6 +116,7 @@ class SalesOrderOverride(SalesOrder):
             try:
                 po.set_missing_values()
                 po.insert(ignore_permissions=True)
+                frappe.publish_realtime('purchase_order_created', {'doctype': 'Purchase Order', 'name': po.name})
             except Exception as e:
                 frappe.throw(f"Failed to create Purchase Order for supplier {supplier} from Sales Order {self.name}: {str(e)}")
 
