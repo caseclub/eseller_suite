@@ -53,15 +53,33 @@ class SalesOrderOverride(SalesOrder):
         super(SalesOrderOverride, self).on_submit()
         
         sales_invoice = make_sales_invoice(source_name=self.name, target_doc=None, ignore_permissions=True)
-        if self.fulfillment_channel == "AFN":
-            sales_invoice.update_stock = 0
-        elif self.fulfillment_channel == "MFN":
-            sales_invoice.update_stock = 1
-        else:
-            # fallback if you have other channels
-            sales_invoice.update_stock = 0
-        sales_invoice.insert(ignore_permissions=True)
-        #sales_invoice.submit() #This is not native and never used. Probably not needed
+        # NEW: Temporarily clear customer's payment_terms to prevent inheritance during SI creation
+        original_cust_terms = frappe.db.get_value("Customer", self.customer, "payment_terms")
+        try:
+            frappe.db.set_value("Customer", self.customer, "payment_terms", None)
+            frappe.clear_cache(doctype="Customer")
+
+            # NEW: Clear payment terms on SI to avoid due date validation errors
+            if sales_invoice.payment_terms_template:
+                sales_invoice.payment_terms_template = None
+            if hasattr(sales_invoice, "payment_schedule"):
+                sales_invoice.payment_schedule = []
+
+            if self.fulfillment_channel == "AFN":
+                sales_invoice.update_stock = 0
+            elif self.fulfillment_channel == "MFN":
+                sales_invoice.update_stock = 1
+            else:
+                # fallback if you have other channels
+                sales_invoice.update_stock = 0
+            sales_invoice.insert(ignore_permissions=True)
+            #sales_invoice.submit() #This is not native and never used. Probably not needed; if needed, add after insert with flags.ignore_mandatory=True
+
+        finally:
+            # Restore customer's original payment terms
+            frappe.db.set_value("Customer", self.customer, "payment_terms", original_cust_terms)
+            frappe.clear_cache(doctype="Customer")
+            frappe.db.commit()  # Ensure restore is committed
 
         self.create_supplier_purchase_orders()
 

@@ -782,3 +782,106 @@ frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.bench_fu
 # 
 #     print(summary)
 #     return summary
+"""
+frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.bench_functions.force_job_card_to_draft", job_card_name="JOB25-00381")
+"""
+def force_job_card_to_draft(job_card_name: str):
+    """
+    Forcefully change a single Job Card from Submitted (docstatus=1) to Draft (docstatus=0).
+    Usage (replace site and Job Card name):
+      bench --site your.site.name execute "my_app.scripts.force_job_card_to_draft.force_job_card_to_draft" --args '["JC-0001"]'
+    """
+    # Fetch quick info
+    row = frappe.db.get_value("Job Card", job_card_name, ["name", "docstatus", "status"], as_dict=True)
+    if not row:
+        print(f"Not found: {job_card_name}")
+        return
+    print(f"Processing {job_card_name} (current docstatus={row.docstatus}, status='{row.status}')")
+    if row.docstatus == 2:
+        print("This Job Card is Cancelled. Consider Amending instead. Aborting.")
+        return
+    if row.docstatus == 0:
+        print("Already Draft. Nothing to do.")
+        return
+    # Parent → Draft
+    frappe.db.sql("""
+        UPDATE `tabJob Card`
+        SET docstatus = 0, status = 'Draft'
+        WHERE name = %s
+    """, (job_card_name,))
+    # Common child tables → Draft as well
+    child_tables = [
+        ("Job Card Item", "parent"),
+        ("Job Card Time Log", "parent"),
+        ("Job Card Operation", "parent"),
+        ("Job Card Scrap Item", "parent"),
+        ("Job Card Scheduled Time", "parent"),
+    ]
+    for doctype, parent_field in child_tables:
+        frappe.db.sql(f"""
+            UPDATE `tab{doctype}`
+            SET docstatus = 0
+            WHERE {parent_field} = %s
+        """, (job_card_name,))
+    frappe.db.commit()
+    print(f"Set {job_card_name} to Draft (docstatus=0).")
+    print("⚠️ WARNING: This bypasses normal Cancel→Amend flow and may leave linked docs inconsistent.")
+
+
+"""
+frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.bench_functions.force_quotation_to_open", quotation_name="Q25-00010-1")
+"""
+def force_quotation_to_open(quotation_name: str):
+    """
+    Forcefully change a single Quotation from 'Ordered' back to 'Open' status
+    (without cancelling or amending).
+
+    Usage (replace site and Quotation name):
+      bench --site your.site.name execute "my_app.scripts.force_quotation_to_open.force_quotation_to_open" --args '["QTN-0001"]'
+    """
+
+    # Fetch quick info
+    row = frappe.db.get_value(
+        "Quotation",
+        quotation_name,
+        ["name", "docstatus", "status"],
+        as_dict=True
+    )
+
+    if not row:
+        print(f"Not found: {quotation_name}")
+        return
+
+    print(f"Processing {quotation_name} (current docstatus={row.docstatus}, status='{row.status}')")
+
+    # Basic sanity checks
+    if row.docstatus == 0:
+        print("Quotation is in Draft (docstatus=0). Open/Ordered status only applies to Submitted docs. Aborting.")
+        return
+
+    if row.docstatus == 2:
+        print("Quotation is Cancelled (docstatus=2). Consider Amending instead. Aborting.")
+        return
+
+    if row.status == "Open":
+        print("Already Open. Nothing to do.")
+        return
+
+    if row.status != "Ordered":
+        print(f"Quotation status is '{row.status}', not 'Ordered'. This tool is intended only for Ordered → Open. Aborting.")
+        return
+
+    # Forcefully change status back to Open (keep docstatus = 1 / Submitted)
+    frappe.db.sql(
+        """
+        UPDATE `tabQuotation`
+        SET status = 'Open'
+        WHERE name = %s
+        """,
+        (quotation_name,),
+    )
+
+    frappe.db.commit()
+
+    print(f"Set {quotation_name} status from 'Ordered' → 'Open'.")
+    print("⚠️ WARNING: This bypasses the normal flow and may leave linked Sales Orders / downstream docs inconsistent.")
