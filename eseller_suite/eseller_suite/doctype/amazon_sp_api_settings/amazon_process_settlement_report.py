@@ -1387,14 +1387,14 @@ def finalize_and_submit_settlement_je(je_name: str):
         # Compute base difference post-validation
         total_debit = sum(flt(row.debit) for row in je.accounts)
         total_credit = sum(flt(row.credit) for row in je.accounts)
-        difference = round(total_debit - total_credit, 2)
+        difference = total_debit - total_credit
 
         company_currency = frappe.get_value("Company", je.company, "default_currency")
         if is_base_currency_only(je, company_currency) and abs(total_debit - total_credit) < 0.01:
             # Already balanced and base-only; just submit
             pass  # Proceed to submit
         
-        if abs(difference) > 0:
+        if abs(difference) > 1e-9:
             # Get settings (assume repo.amz_setting is accessible or fetch)
             settings = frappe.get_doc("Amazon SP API Settings", "q3opu7c5ac")
             rounding_account = settings.custom_round_off_account
@@ -1411,13 +1411,15 @@ def finalize_and_submit_settlement_je(je_name: str):
             
             # Adjust to balance
             if difference > 0:
-                rounding_line.credit = abs(difference)
-                rounding_line.credit_in_account_currency = abs(difference)
+                current_credit = flt(rounding_line.credit_in_account_currency or 0)
+                rounding_line.credit_in_account_currency = flt(current_credit + abs(difference), 9)
+                rounding_line.credit = flt(rounding_line.credit_in_account_currency * rounding_line.exchange_rate, 9)
                 rounding_line.debit = 0
                 rounding_line.debit_in_account_currency = 0
             else:
-                rounding_line.debit = abs(difference)
-                rounding_line.debit_in_account_currency = abs(difference)
+                current_debit = flt(rounding_line.debit_in_account_currency or 0)
+                rounding_line.debit_in_account_currency = flt(current_debit + abs(difference), 9)
+                rounding_line.debit = flt(rounding_line.debit_in_account_currency * rounding_line.exchange_rate, 9)
                 rounding_line.credit = 0
                 rounding_line.credit_in_account_currency = 0
             
