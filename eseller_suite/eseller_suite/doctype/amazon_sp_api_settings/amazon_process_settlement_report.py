@@ -10,21 +10,17 @@ import time
 import re
 import frappe
 from frappe.model.document import Document
-from frappe.utils import flt
+from frappe.utils import flt, add_days
 from .amazon_repository import _sp_get, AmazonRepository
-
+from requests.exceptions import HTTPError, RequestException
 from urllib.parse import urlencode
 from dateutil.parser import parse as dt_parse
-
 import gzip
 from io import BytesIO, StringIO
-
 from collections import defaultdict
 import pprint
-
 from zoneinfo import ZoneInfo
 
-from frappe.utils import flt
 
 # ──────────────────────────────────────────
 # 1. — Helpers
@@ -191,20 +187,64 @@ except ImportError:
         from erpnext.setup.utils import get_exchange_rate
 
 
-def fx_rate(from_ccy: str, posting_date: str, to_ccy: str = "USD") -> float:
-    """Return ERPNext exchange rate; 1 when currencies match."""
+def fx_rate(from_ccy: str, posting_date: str, to_ccy: str = "USD", max_retries=3, fallback_days=7) -> float:
+    """Return ERPNext exchange rate with retries and fallbacks; 1 when currencies match."""
     from_ccy = (from_ccy or "").upper()
     to_ccy   = (to_ccy   or "").upper()
 
     if from_ccy == to_ccy:
         return 1.0
 
-    rate = get_exchange_rate(from_ccy, to_ccy, posting_date)
+    # Check cache first
+    cache_key = f"exchange_rate_{from_ccy}_{to_ccy}_{posting_date}"
+    cached_rate = frappe.cache().get_value(cache_key)
+    if cached_rate:
+        return float(cached_rate)
+
+    # Try to get rate with retries
+    rate = None
+    for attempt in range(max_retries):
+        try:
+            rate = get_exchange_rate(from_ccy, to_ccy, posting_date)
+            if rate:
+                break
+        except (HTTPError, RequestException) as e:
+            frappe.log_error(f"Exchange rate API failed (attempt {attempt+1}): {str(e)}", "Amazon Settlement FX Rate Fetch")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+            else:
+                # On final failure, start fallback
+                break
+
+    # Fallback: Try previous days recursively
+    if not rate and fallback_days > 0:
+        prev_date = add_days(posting_date, -1)
+        rate = fx_rate(from_ccy, prev_date, to_ccy, max_retries=1, fallback_days=fallback_days-1)  # Reduced retries for fallback
+
+    # Ultimate fallback: Use latest DB rate or throw
     if not rate:
-        frappe.throw(
-            f"Exchange rate {from_ccy} → {to_ccy} for {posting_date} is missing. "
-            "Create it under Accounting ▸ Currency Exchange."
+        # Query the most recent manual Currency Exchange record
+        latest_rate = frappe.db.get_value(
+            "Currency Exchange",
+            {"from_currency": from_ccy, "to_currency": to_ccy},
+            "exchange_rate",
+            order_by="date desc"
         )
+        if latest_rate:
+            rate = float(latest_rate)
+            frappe.log_error(
+                f"Using latest manual rate ({rate}) as fallback for {from_ccy} → {to_ccy} on {posting_date}",
+                "Amazon Settlement FX Fallback"
+            )
+        else:
+            frappe.throw(
+                f"Exchange rate {from_ccy} → {to_ccy} for {posting_date} (and fallbacks) is missing. "
+                "Create it under Accounting ▸ Currency Exchange."
+            )
+
+    # Cache the rate for 24 hours
+    frappe.cache().set_value(cache_key, rate, expires_in_sec=86400)
+
     return float(rate)
 
 def list_latest_settlement_reports(settings, limit: int = 5, days_back: int = 90) -> list[dict]:
@@ -740,10 +780,6 @@ def build_je(
     print(f"Sales total: {total_sales_native}")
     print(f"Refund total (positive): {total_refund_native}")
     print(f"Net (for fees): {order_net_native}")
-    # ──────────────────────────────────────────────
-    # Retrieve exchange rate for currency conversion
-    # ──────────────────────────────────────────────
-    rate = fx_rate(settlement_ccy, post_dt)
    
     # ────────────────────────────────────────────────
     # Define reimbursement types whitelist
@@ -800,27 +836,29 @@ def build_je(
         desc = (r.get("amount-description") or "").strip().upper()
         if desc in FEE_ACCOUNT_MAP:
             special_fee_native[desc] += abs(amt) # store as positive
-    # convert each bucket to USD
-    special_fee_usd = {d: round(v * rate, 2) for d, v in special_fee_native.items()}
-    special_fee_total_usd = sum(special_fee_usd.values())
-   
-    # ──────────────────────────────────────────────
-    # Calculate USD equivalents for totals and fees
-    # ──────────────────────────────────────────────
-    usd_total = round(native_total * rate, 2)
-    order_net_usd = round(order_net_native * rate, 2) # grand-total AR
-    reimb_usd = round(reimb_native * rate, 2)
-    fees_usd = round(
-        (order_net_usd + reimb_usd) - (usd_total + special_fee_total_usd), 2
-    )
-    # ──────────────────────────────────────────────
-    # Reset journal entry lines for building
-    # ───────────────────────────────────────────────
-    je_lines: list[dict] = []
-    # ──────────────────────────────────────────────
-    # FIRST-PASS Branch: Build initial journal entry with all lines
-    # ──────────────────────────────────────────────
+
     if first_pass:
+        rate = fx_rate(settlement_ccy, post_dt)
+        # convert each bucket to USD
+        special_fee_usd = {d: round(v * rate, 2) for d, v in special_fee_native.items()}
+        special_fee_total_usd = sum(special_fee_usd.values())
+   
+        # ──────────────────────────────────────────────
+        # Calculate USD equivalents for totals and fees
+        # ──────────────────────────────────────────────
+        usd_total = round(native_total * rate, 2)
+        order_net_usd = round(order_net_native * rate, 2) # grand-total AR
+        reimb_usd = round(reimb_native * rate, 2)
+        fees_usd = round(
+            (order_net_usd + reimb_usd) - (usd_total + special_fee_total_usd), 2
+        )
+        # ──────────────────────────────────────────────
+        # Reset journal entry lines for building
+        # ───────────────────────────────────────────────
+        je_lines: list[dict] = []
+        # ──────────────────────────────────────────────
+        # FIRST-PASS Branch: Build initial journal entry with all lines
+        # ──────────────────────────────────────────────
         non_ar_lines = []
         ar_lines = []
         # ──────────────────────────────────────────────
@@ -994,7 +1032,7 @@ def build_je(
     # ──────────────────────────────────────────────
     else:
         print(f"[SETT] Non-first pass for {rpt_id}: Allocating late documents only")
-        allocate_late_documents_for_settlement(rpt_id, repo, order_groups, settlement_ccy, rate, post_dt)
+        allocate_late_documents_for_settlement(rpt_id, repo, order_groups, settlement_ccy, post_dt)
         return None  # No JE created
 
 def _resolve_advance_values():
@@ -1453,7 +1491,7 @@ def _retry_locked(tries=12, delay=2.0):
         return wrapper
     return decorator
 
-def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, order_groups: dict, settlement_ccy: str, rate: float, post_dt: str):
+def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, order_groups: dict, settlement_ccy: str, post_dt: str):
     je_name = frappe.db.get_value("Journal Entry", {"cheque_no": rpt_id, "docstatus": 1}, "name")
     if not je_name:
         print(f"[SETT] No submitted first-pass JE for {rpt_id}; skipping allocation")
