@@ -467,7 +467,7 @@ def get_account(settings, name: str) -> str:
 # ──────────────────────────────────────────
 # Helper: Create and submit a Credit Note for partial/full refund (unchanged, but now called with non-return SI)
 # ──────────────────────────────────────────
-def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, post_dt: str, order_id: str, marketplace_name: str, merchant_order_id: str, order_rows: list[dict]) -> str | None:
+def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, post_dt: str, order_id: str, marketplace_name: str, merchant_order_id: str, order_rows: list[dict], report_id: str) -> str | None:
     """
     Create a linked Credit Note (CN) for an Amazon refund from settlement data.
     
@@ -497,17 +497,25 @@ def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, 
         # Compute the actual refund magnitude from refund rows (positive value)
         computed_refund_amount = -sum(flt(r['amount']) for r in refund_rows)
         
-        # Idempotency check: Skip if matching CN exists (use computed from rows, not passed refund_amount)
-        existing_cn = frappe.db.get_value("Sales Invoice", {
+        # Idempotency check: Skip if matching CN exists for this report_id
+        if frappe.db.exists("Sales Invoice", {
             "return_against": si_name,
             "amazon_order_id": order_id,
             "company": si.company,
             "docstatus": 1,
-            "is_return": 1
-        }, ["name", "grand_total"], as_dict=True)
-        if existing_cn and abs(existing_cn.grand_total + computed_refund_amount) < 0.01:  # Totals match (CN negative)
-            print(f"[SETT] Existing CN {existing_cn.name} found for refund on {si_name} (order {order_id}) with matching total; skipping creation")
-            return existing_cn.name
+            "is_return": 1,
+            "custom_amazon_settlement_report_id": report_id  # NEW: Settlement-specific check
+        }):
+            existing_cn_name = frappe.db.get_value("Sales Invoice", {  # Get name for return
+                "return_against": si_name,
+                "amazon_order_id": order_id,
+                "company": si.company,
+                "docstatus": 1,
+                "is_return": 1,
+                "custom_amazon_settlement_report_id": report_id
+            }, "name")
+            print(f"[SETT] Existing CN {existing_cn_name} found for refund on {si_name} (order {order_id}, report {report_id}); skipping creation")
+            return existing_cn_name
         
         # Group refund rows by SKU (including empty SKU for order-level if any)
         groups_by_sku = defaultdict(list)
@@ -643,6 +651,7 @@ def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, 
             cn.custom_merchant_order_id = ""
             cn.remarks = "Fulfillment by Amazon (FBA) Order Refund"
         cn.amazon_order_id = order_id
+        cn.custom_amazon_settlement_report_id = report_id
         
         # Append per-SKU remark details
         if remark_details:
@@ -930,7 +939,7 @@ def build_je(
             refund_rows = [r for r in order_rows if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES]
             if si_name and refund_rows:
                 # Create linked CN if not exists
-                cn_name = create_credit_note_for_refund(repo.amz_setting, si_name, refund_total_native, post_dt, order_id, marketplace_name, merchant_order_id, refund_rows)
+                cn_name = create_credit_note_for_refund(repo.amz_setting, si_name, refund_total_native, post_dt, order_id, marketplace_name, merchant_order_id, refund_rows, rpt_id)  # Add rpt_id
             ar_line = {
                 "account": debtors_account,
                 "exchange_rate": rate,
@@ -1586,7 +1595,7 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
         refund_rows = [r for r in order_rows if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES]
         # Create CN if needed and SI exists
         if si_name and refund_rows:
-            cn_name = create_credit_note_for_refund(repo.amz_setting, si_name, refund_to_apply, post_dt, order_id, marketplace_name, merchant_order_id, refund_rows)
+            cn_name = create_credit_note_for_refund(repo.amz_setting, si_name, refund_to_apply, post_dt, order_id, marketplace_name, merchant_order_id, refund_rows, rpt_id)  # Add rpt_id
             if cn_name:
                 # Allocate to new CN
                 if not is_already_referenced_by_report(rpt_id, cn_name):
