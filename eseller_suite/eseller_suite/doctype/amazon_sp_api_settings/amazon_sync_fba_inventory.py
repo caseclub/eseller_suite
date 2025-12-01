@@ -206,6 +206,8 @@ def process_inbound_inventory(asin_inbound, settings):
             "doctype": "Stock Entry",
             "company": company,
             "stock_entry_type": "Material Transfer",
+            "from_warehouse": prep_wh,
+            "to_warehouse": inbound_wh,
             "posting_date": frappe.utils.today(),
             "items": transfer_items,
         })
