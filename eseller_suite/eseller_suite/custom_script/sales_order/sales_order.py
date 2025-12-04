@@ -95,6 +95,7 @@ class SalesOrderOverride(SalesOrder):
 
         for supplier, items in supplier_items.items():
             po = frappe.new_doc("Purchase Order")
+            po.custom_sales_order = self.name
             po.supplier = supplier
             po.transaction_date = self.transaction_date
             po.currency = self.currency
