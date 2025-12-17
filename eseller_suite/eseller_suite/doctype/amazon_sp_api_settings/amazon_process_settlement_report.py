@@ -10,7 +10,7 @@ import time
 import re
 import frappe
 from frappe.model.document import Document
-from frappe.utils import flt, add_days
+from frappe.utils import flt, add_days, cint
 from .amazon_repository import _sp_get, AmazonRepository
 from requests.exceptions import HTTPError, RequestException
 from urllib.parse import urlencode
@@ -1440,8 +1440,12 @@ def finalize_and_submit_settlement_je(je_name: str):
         if is_base_currency_only(je, company_currency) and abs(total_debit - total_credit) < 0.01:
             # Already balanced and base-only; just submit
             pass  # Proceed to submit
-        
-        if abs(difference) > 1e-9:
+
+        # NEW: Fetch system float_precision for robust threshold
+        default_precision = cint(frappe.db.get_default("float_precision")) or 3
+        threshold = 10 ** (-(default_precision + 1))  # e.g., 1e-4 for precision=3; safely below rounding unit
+
+        if abs(difference) >= threshold:  # CHANGED: Skip tiny fp errors (was > 1e-9)
             # Get settings (assume repo.amz_setting is accessible or fetch)
             settings = frappe.get_doc("Amazon SP API Settings", "q3opu7c5ac")
             rounding_account = settings.custom_round_off_account
@@ -1456,25 +1460,33 @@ def finalize_and_submit_settlement_je(je_name: str):
                     "user_remark": "Rounding adjustment for exchange rate variations",
                 })
             
-            # Adjust to balance
+            # Adjust to balance (use system precision for setting amount)
+            adjusted_amount = round(abs(difference), default_precision + 3)  # Extra digits to avoid under-rounding
             if difference > 0:
                 current_credit = flt(rounding_line.credit_in_account_currency or 0)
-                rounding_line.credit_in_account_currency = flt(current_credit + abs(difference), 9)
-                rounding_line.credit = flt(rounding_line.credit_in_account_currency * rounding_line.exchange_rate, 9)
+                rounding_line.credit_in_account_currency = flt(current_credit + adjusted_amount, default_precision + 3)
+                rounding_line.credit = flt(rounding_line.credit_in_account_currency * rounding_line.exchange_rate, default_precision + 3)
                 rounding_line.debit = 0
                 rounding_line.debit_in_account_currency = 0
             else:
                 current_debit = flt(rounding_line.debit_in_account_currency or 0)
-                rounding_line.debit_in_account_currency = flt(current_debit + abs(difference), 9)
-                rounding_line.debit = flt(rounding_line.debit_in_account_currency * rounding_line.exchange_rate, 9)
+                rounding_line.debit_in_account_currency = flt(current_debit + adjusted_amount, default_precision + 3)
+                rounding_line.debit = flt(rounding_line.debit_in_account_currency * rounding_line.exchange_rate, default_precision + 3)
                 rounding_line.credit = 0
                 rounding_line.credit_in_account_currency = 0
             
-            # Save under lock
-            je.save(ignore_permissions=True)
-            frappe.db.commit()
-            print(f"[SETT] Added/Adjusted rounding for difference {difference} in {je_name}")
-        
+            # NEW: If adjusted amount still rounds to zero in validation's flt, remove the line
+            if flt(rounding_line.debit_in_account_currency) == 0 and flt(rounding_line.credit_in_account_currency) == 0:
+                je.accounts.remove(rounding_line)
+                print(f"[SETT] Skipped tiny rounding ({difference:.2e}) for {je_name} as it rounds to zero")
+            else:
+                # Save under lock
+                je.save(ignore_permissions=True)
+                frappe.db.commit()
+                print(f"[SETT] Added/Adjusted rounding for difference {difference} in {je_name}")
+        else:
+            print(f"[SETT] Skipped negligible difference ({difference:.2e}) below threshold {threshold:.2e} for {je_name}")
+
         # Submit under lock
         je.submit()
         frappe.db.commit()
