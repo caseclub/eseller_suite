@@ -260,6 +260,9 @@ def list_latest_settlement_reports(settings, limit: int = 5, days_back: int = 90
         try:
             # Convert date object to aware datetime at midnight UTC
             after_dt = datetime.combine(after_date, datetime.min.time(), tzinfo=timezone.utc)
+            # Clamp to no earlier than 90 days back to avoid API 400 error
+            min_after_dt = current_dt - timedelta(days=90)
+            after_dt = max(after_dt, min_after_dt)
             if after_dt > current_dt:
                 return []  # No reports if after_date is in the future
             created_since = after_dt.isoformat()
