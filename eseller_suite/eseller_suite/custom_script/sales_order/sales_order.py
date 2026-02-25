@@ -8,7 +8,6 @@ from frappe.model.mapper import get_mapped_doc
 from frappe.model.utils import get_fetch_values
 from frappe.utils import cint, flt
 from erpnext.stock.stock_ledger import get_stock_balance
-from collections import defaultdict
 
 class SalesOrderOverride(SalesOrder):
     def custom_validate(self):
@@ -82,64 +81,6 @@ class SalesOrderOverride(SalesOrder):
                 frappe.db.set_value("Customer", self.customer, "payment_terms", original_cust_terms)
                 frappe.clear_cache(doctype="Customer")
                 frappe.db.commit()  # Ensure restore is committed
-
-        self.create_supplier_purchase_orders()
-
-    def create_supplier_purchase_orders(self):
-        supplier_items = defaultdict(list)
-        for item in self.items:
-            if item.delivered_by_supplier:
-                if not item.supplier:
-                    frappe.throw(f"Supplier not set for item {item.item_code} in Sales Order {self.name}")
-                supplier_items[item.supplier].append(item)
-            else:
-                print("Place holder for creating future material requests")
-
-        for supplier, items in supplier_items.items():
-            po = frappe.new_doc("Purchase Order")
-            po.custom_sales_order = self.name
-            po.supplier = supplier
-            po.transaction_date = self.transaction_date
-            po.currency = self.currency
-            po.conversion_rate = self.conversion_rate
-            po.shipping_address = self.shipping_address_name
-            po.custom_address_title = self.custom_shipping_address_title
-            po.shipping_address_display = self.shipping_address
-            po.company = self.company
-            po.custom_shipping_method = self.custom_shipping_method
-            po.custom_ship_on_third_party = self.custom_ship_on_third_party
-            po.custom_third_party_account = self.custom_third_party_account
-            po.custom_third_party_postal = self.custom_third_party_postal
-            po.custom_customer_po_number = self.po_no
-            po.buying_price_list = frappe.db.get_single_value("Buying Settings", "buying_price_list")
-
-            for so_item in items:
-                rate = frappe.db.get_value("Item Price", {
-                    "item_code": so_item.item_code,
-                    "supplier": supplier,
-                    "buying": 1
-                }, "price_list_rate") or 0
-
-                po.append("items", {
-                    "item_code": so_item.item_code,
-                    "item_name": so_item.item_name,
-                    "description": so_item.description,
-                    "qty": so_item.qty,
-                    "uom": so_item.uom,
-                    "rate": rate,
-                    "warehouse": "Main Warehouse - CC",
-                    "sales_order": self.name,
-                    "sales_order_item": so_item.name,
-                    "delivered_by_supplier": 1,
-                    "schedule_date": self.delivery_date
-                })
-
-            try:
-                po.set_missing_values()
-                po.insert(ignore_permissions=True)
-                frappe.publish_realtime('purchase_order_created', {'doctype': 'Purchase Order', 'name': po.name})
-            except Exception as e:
-                frappe.throw(f"Failed to create Purchase Order for supplier {supplier} from Sales Order {self.name}: {str(e)}")
 
     def on_update(self):
         if self.amazon_order_status == "Canceled" and self.temporary_stock_tranfer_id:
