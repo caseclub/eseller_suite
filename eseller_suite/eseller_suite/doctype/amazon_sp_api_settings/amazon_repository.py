@@ -148,19 +148,63 @@ def _to_float(x, default=0.0):
 # ------------------------------------------------------------------
 def _fx_rate(from_ccy: str, to_ccy: str = "USD", posting_date: str | None = None) -> float:
     """
-    Get FX rate for posting_date (defaults to today).
-    Falls back to 1.0 if from_ccy == to_ccy.
+    Enhanced FX rate handler for Amazon order import:
+    1. Calls get_exchange_rate() (which pulls from https://api.frankfurter.app via ERPNext).
+    2. On success: creates a Currency Exchange record for *today* if none exists yet (exactly one record per day per currency pair).
+    3. On failure (e.g. 522, network timeout, etc.): falls back to the most recent record in the Currency Exchange doctype for the same from_currency → to_currency.
     """
     if from_ccy == to_ccy:
-        return 1
+        return 1.0
     posting_date = posting_date or today()
+    date_obj = getdate(posting_date)
+
     try:
-        return get_exchange_rate(from_ccy, to_ccy, posting_date)
-    except Exception:
-        # if ECB feed unavailable, you can choose a default or raise
-        frappe.throw(f"Exchange rate {from_ccy}→{to_ccy} missing; add in Currency Exchange.")
+        # 1. Fetch fresh rate (this is the "exchange rate is fetched" step)
+        rate = get_exchange_rate(from_ccy, to_ccy, posting_date)
 
+        # 2. After successful fetch: create Currency Exchange record for today if missing
+        if not frappe.db.exists("Currency Exchange", {
+            "date": date_obj,
+            "from_currency": from_ccy,
+            "to_currency": to_ccy
+        }):
+            ce = frappe.new_doc("Currency Exchange")
+            ce.date = date_obj
+            ce.from_currency = from_ccy
+            ce.to_currency = to_ccy
+            ce.exchange_rate = rate
+            ce.insert(ignore_permissions=True)
+            frappe.db.commit()  # make the record immediately available
+            frappe.logger().info(f"Created daily Currency Exchange record: {from_ccy}→{to_ccy} = {rate} on {date_obj}")
 
+        return rate
+
+    except Exception as e:
+        # 3. API fetch failed (e.g. frankfurter.app 522) → fallback to most recent record
+        frappe.logger().warning(
+            f"Exchange rate fetch failed for {from_ccy}→{to_ccy} on {date_obj}: {str(e)}. "
+            f"Using most recent record from Currency Exchange doctype."
+        )
+
+        latest_rate = frappe.db.get_value(
+            "Currency Exchange",
+            filters={
+                "from_currency": from_ccy,
+                "to_currency": to_ccy
+            },
+            fieldname="exchange_rate",
+            order_by="date DESC",
+            limit=1
+        )
+
+        if latest_rate is not None:
+            return float(latest_rate)
+
+        # No historical data at all
+        frappe.throw(
+            f"Exchange rate {from_ccy}→{to_ccy} could not be fetched "
+            f"and no previous record exists in Currency Exchange."
+        )
 
 # ---------- thin wrappers that mimic the old SDK -----------------------
 def _list_orders(
