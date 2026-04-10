@@ -377,7 +377,13 @@ def process_fba_inventory():
                 except Exception:
                     frappe.log_error(frappe.get_traceback(), f"API Call Error for Marketplace {mkt_id}")
                     raise
-                #print(f"[DEBUG] Full API response: {json.dumps(resp, indent=2)}")  # Uncomment if needed for verification
+                #print(json.dumps(resp.get("payload", {}), indent=2))  # Uncomment if needed for verification
+                
+                # Print info for a specific asin
+                #for summary in resp.get("payload", {}).get("inventorySummaries", []):
+                #    if summary.get("asin") == "B09D8KWTBW":
+                #        print(json.dumps(summary, indent=2))
+                
                 page_summaries = resp.get("payload", {}).get("inventorySummaries", [])  # Extract from payload
                 summaries.extend(page_summaries)
                 if DEBUG: print(f"[DEBUG] Fetched {len(page_summaries)} summaries from page {page} for {mkt_id}")
@@ -408,16 +414,24 @@ def process_fba_inventory():
             cond = s.get("condition", "")  # Correct key per API docs
             asin = s.get("asin", "")
             fulfillable_qty = s.get("inventoryDetails", {}).get("fulfillableQuantity", 0)
-            inbound_working = s.get("inventoryDetails", {}).get("inboundWorkingQuantity", 0)
+            #inbound_working = s.get("inventoryDetails", {}).get("inboundWorkingQuantity", 0) #Not included in calculations because this represents products that have been scheduled but not left our facility
             inbound_shipped = s.get("inventoryDetails", {}).get("inboundShippedQuantity", 0)
             inbound_receiving = s.get("inventoryDetails", {}).get("inboundReceivingQuantity", 0)
-            inbound_qty = inbound_working + inbound_shipped + inbound_receiving
+            #inbound_qty = inbound_working + inbound_shipped + inbound_receiving
+            inbound_qty = inbound_shipped + inbound_receiving  # inboundWorkingQuantity excluded: these units have not left our facility yet
             if DEBUG: print(f"[DEBUG] Processing summary: ASIN={asin}, Condition={cond}, FulfillableQty={fulfillable_qty}, InboundQty={inbound_qty}")
             if cond != "NewItem":  # Filter to new condition (adjust if your data uses variants like "SELLABLE")
                 if DEBUG: print(f"[DEBUG] Skipping non-new condition: {cond}")
                 continue
-            asin_fulfillable[asin] += fulfillable_qty
-            asin_inbound[asin] += inbound_qty
+            # CRITICAL FIX: Use max() instead of += 
+            # The SP-API /fba/inventory/v1/summaries endpoint (when queried per marketplace)
+            # frequently returns the *exact same* FBA inventory data for an ASIN across
+            # every configured marketplace (common with unified NA/EU/PAN-EU accounts
+            # and shared fulfillment centers). Summing these duplicates inflates
+            # ERPNext target quantities. Taking the max ensures each physical ASIN
+            # is counted exactly once.
+            asin_fulfillable[asin] = max(asin_fulfillable[asin], fulfillable_qty)
+            asin_inbound[asin] = max(asin_inbound[asin], inbound_qty)
             if DEBUG: print(f"[DEBUG] Added to asin_fulfillable: {asin} -> {asin_fulfillable[asin]}")
             if DEBUG: print(f"[DEBUG] Added to asin_inbound: {asin} -> {asin_inbound[asin]}")
 
