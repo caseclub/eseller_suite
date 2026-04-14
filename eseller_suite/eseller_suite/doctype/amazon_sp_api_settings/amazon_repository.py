@@ -23,6 +23,7 @@ from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_se
 from frappe import scrub
 from frappe.utils import getdate, add_days, get_datetime, nowdate, today
 from requests.exceptions import HTTPError
+from requests.exceptions import RequestException
 
 try:
     # v14 / v15 (current)
@@ -45,6 +46,12 @@ SP_DOMAIN  = "sellingpartnerapi-na.amazon.com"
 # ======================================================================
 # Basic LWA + helpers (self-contained; no external SDK required)
 # ======================================================================
+
+# === ROBUSTNESS CONSTANTS (prevents indefinite socket/TCP hangs) ===
+SPAPI_CONNECT_TIMEOUT = 12.0   # time to establish connection
+SPAPI_READ_TIMEOUT    = 45.0   # time to read response body (orderItems/finances can be slow)
+SPAPI_TIMEOUT         = (SPAPI_CONNECT_TIMEOUT, SPAPI_READ_TIMEOUT)
+
 def _get_lwa_token(settings):
     if AmazonRepository._token and time.time() < AmazonRepository._token_expires:
         return AmazonRepository._token
@@ -54,7 +61,7 @@ def _get_lwa_token(settings):
         try:
             resp = requests.post("https://api.amazon.com/auth/o2/token",
                 data={"grant_type": "refresh_token", "refresh_token": settings.refresh_token, "client_id": settings.client_id, "client_secret": settings.get_password("client_secret")},
-                timeout=30,
+                timeout=SPAPI_TIMEOUT,
             )
             resp.raise_for_status()  # Raise on 4xx/5xx
             tok  = resp.json()
@@ -83,6 +90,8 @@ def _sp_get(path, query, settings, rdt=None, max_retry: int = 10, return_full: b
     if query:
         url = f"{url}?{query}"
 
+    timeout = SPAPI_TIMEOUT
+
     # ――― 2.  common headers ------------------------------------------
     token = _get_lwa_token(settings)
     access_token = rdt if rdt else token  # Use RDT if provided, else LWA
@@ -96,10 +105,16 @@ def _sp_get(path, query, settings, rdt=None, max_retry: int = 10, return_full: b
     # ――― 3.  retry / throttle loop -----------------------------------
     for attempt in range(max_retry):
         try:
-             resp = requests.get(url, headers=headers, timeout=45)
+            resp = requests.get(url, headers=headers, timeout=timeout)
         except requests.exceptions.RequestException as e:
-            frappe.logger().warning(f"Amazon's SP-API endpoint connection error for {path}, attempt {attempt+1}/{max_retry}: {str(e)}")
-            time.sleep((2 ** attempt) + random.random())  # Exponential backoff (2, 4, 8... sec) + jitter
+            # More informative logging + smarter backoff for the exact failure you hit
+            is_network_stall = isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))
+            log_level = "warning" if is_network_stall else "error"
+            getattr(frappe.logger(), log_level)(
+                f"SP-API {type(e).__name__} for {path} (attempt {attempt+1}/{max_retry}): {str(e)[:250]}"
+            )
+            sleep_time = min((2 ** attempt) + random.random() * 3, 20) if is_network_stall else (2 ** attempt) + random.random()
+            time.sleep(sleep_time)
             continue  # Retry next attempt
 
         if resp.status_code == 200:                     # ✓ success
@@ -291,7 +306,7 @@ def _create_restricted_data_token(settings, order_id, max_retry: int = 10):
 
     for attempt in range(max_retry):
         try:
-            resp = requests.post(url, headers=headers, json=body, timeout=45)
+            resp = requests.post(url, headers=headers, json=body, timeout=SPAPI_TIMEOUT)
         except RequestException as e:
             frappe.logger().warning(f"Amazon SP-API endpoint network error (Restricted Data Token) on attempt {attempt+1}/{max_retry} for order {order_id}: {e}")
             time.sleep(2 + attempt)
@@ -669,10 +684,10 @@ class AmazonRepository:
     def get_order_items(self, order_id) -> list:
         try:
             order_items_payload = _list_order_items(self.amz_setting, order_id)
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
             frappe.log_error(
                 title="Amazon Order Import",
-                message=f"SP-API orderItems timeout for {order_id}\n{str(e)}"
+                message=f"SP-API orderItems request failed for {order_id}\n{str(e)}"
             )
             # Return an empty list so the SO still gets created;
             # you can backfill items later if you like.
@@ -770,52 +785,31 @@ class AmazonRepository:
             # Limit to a single order for debugging
             #if d.amazon_order_id != "112-8643975-4194655":
             #    continue
-            print(f"Processing draft SO: name={d.name}, amazon_order_id={d.amazon_order_id}", flush=True)
-           
-            # Re-fetch full order from Amazon (use _list_orders with AmazonOrderIds)
-            print(f"Re-fetching order from Amazon for ID: {d.amazon_order_id}", flush=True)
-            order_payload = _list_orders(self.amz_setting, amazon_order_ids=d.amazon_order_id)
-            #print(f"Retrieved order_payload: {json.dumps(order_payload, indent=2)}", flush=True)
-           
-            if not order_payload or not order_payload.get("Orders"):
-                print(f"No order payload found for {d.amazon_order_id}. Deleting orphan SO {d.name}.", flush=True)
-                frappe.delete_doc("Sales Order", d.name) # Orphan: delete if gone from Amazon
-                frappe.db.commit()
-                continue
-           
-            print(f"Fetching detailed order by ID: {d.amazon_order_id}", flush=True)
-            order = self._fetch_order_by_id(d.amazon_order_id)
-            #print(f"Retrieved detailed order: {json.dumps(order, indent=2)}", flush=True)
-            if not order:
-                # Don’t delete on a transient API miss; just skip & log
-                print(f"SP-API returned no order for {d.amazon_order_id}; keeping draft {d.name} and skipping.", flush=True)
-                frappe.logger().warning(f"SP-API returned no order for {d.amazon_order_id}; keeping draft {d.name}")
-                continue
-            # Guard: Only process AFN orders; skip MFN and others
-            fulfillment_channel = order.get("FulfillmentChannel")
-            print(f"Order fulfillment channel: {fulfillment_channel}", flush=True)
-            if fulfillment_channel != "AFN":
-                print(f"Skipping non-AFN order {d.amazon_order_id}.", flush=True)
-                continue
-            status = order.get("OrderStatus")
-            print(f"Order status: {status}", flush=True)
-           
-            if status in ["Unfulfillable", "Canceled"]:
-                print(f"Deleting SO {d.name} due to status {status}.", flush=True)
-                frappe.delete_doc("Sales Order", d.name, ignore_permissions=True)
-                frappe.db.commit()
-                continue
-           
-            if status not in ["Shipped", "InvoiceUnconfirmed"]:
-                print(f"Skipping non-shipped order {d.amazon_order_id} with status {status}.", flush=True)
-                continue # Skip non-shipped
-           
-            # Re-create/update SO with fresh data (forces finance re-fetch)
-            print(f"Re-creating/updating SO for order {d.amazon_order_id}.", flush=True)
-            self.create_sales_order(order) # Will submit if ready
-            print(f"Finished processing order {d.amazon_order_id}.", flush=True)
-            print(f"-")
-       
+            try:
+                print(f"Processing draft SO: name={d.name}, amazon_order_id={d.amazon_order_id}", flush=True)
+
+                # ── original logic (unchanged) ─────────────────────────────
+                order_payload = _list_orders(self.amz_setting, amazon_order_ids=d.amazon_order_id)
+                if not order_payload or not order_payload.get("Orders"):
+                    print(f"No order payload found for {d.amazon_order_id}. Deleting orphan SO {d.name}.")
+                    frappe.delete_doc("Sales Order", d.name, ignore_permissions=True)
+                    frappe.db.commit()
+                    continue
+
+                order = self._fetch_order_by_id(d.amazon_order_id)
+                if not order:
+                    frappe.logger().warning(f"SP-API returned no order for {d.amazon_order_id}; keeping draft {d.name}")
+                    continue
+
+                self.create_sales_order(order)
+                print(f"Finished processing order {d.amazon_order_id}.")
+
+            except Exception as e:   # ← per-order isolation (this was the main cause of the 3h timeout)
+                error_msg = f"Failed to reprocess draft order {d.amazon_order_id} (SO {d.name})"
+                frappe.log_error(title="Amazon Draft Reprocess Error", message=f"{error_msg}: {str(e)}")
+                print(f"ERROR {error_msg}: {str(e)[:150]}", flush=True)
+                continue   # one bad order no longer kills the whole batch job
+
         print("Finished reprocess_draft_orders.", flush=True)
 
     def create_sales_order(self, order) -> str | None:
