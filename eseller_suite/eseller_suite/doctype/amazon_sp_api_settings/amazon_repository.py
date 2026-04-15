@@ -771,8 +771,8 @@ class AmazonRepository:
     def reprocess_draft_orders(self, age_days=7):
         print(f"Starting reprocess_draft_orders with age_days={age_days}", flush=True)
        
-        # Fetch drafts older than age_days with amazon_order_id
-        print("Fetching draft Sales Orders older than {} days...".format(age_days), flush=True)
+        # ── Lightweight dispatcher: enqueue one isolated job per draft ─────
+        # This replaces the old long-running batch loop that was hitting the 10800-second RQ worker timeout.
         drafts = frappe.get_all("Sales Order", filters={
             "docstatus": 0, # Draft
             "amazon_order_id": ["is", "set"],
@@ -780,36 +780,44 @@ class AmazonRepository:
         }, fields=["name", "amazon_order_id"])
        
         print(f"Fetched {len(drafts)} draft Sales Orders to reprocess.", flush=True)
-       
-        for d in drafts:
-            # Limit to a single order for debugging
-            #if d.amazon_order_id != "112-8643975-4194655":
-            #    continue
+        
+        if not drafts:
+            print("No draft orders found to reprocess.", flush=True)
+            return
+
+        enqueued = 0
+        for i, d in enumerate(drafts):
+            job_name = f"Reprocess Amazon Draft {d.amazon_order_id} ({d.name})"
+
+            # Prevent duplicate jobs
+            if frappe.db.exists("RQ Job", {
+                "job_name": job_name,
+                "status": ["in", ["queued", "started"]]
+            }):
+                print(f"Job already queued for {d.amazon_order_id}, skipping.", flush=True)
+                continue
+
             try:
-                print(f"Processing draft SO: name={d.name}, amazon_order_id={d.amazon_order_id}", flush=True)
+                frappe.enqueue(
+                    method="eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository.reprocess_single_draft_order",
+                    queue="long",
+                    job_name=job_name,
+                    amz_setting_name=self.amz_setting.name,
+                    sales_order_name=d.name,
+                    amazon_order_id=d.amazon_order_id,
+                    timeout=1800,                                      # 30 min per order
+                    now=getattr(frappe.flags, "in_test", False),
+                )
+                enqueued += 1
+            except Exception as enqueue_err:
+                print(f"Failed to enqueue job for {d.amazon_order_id}: {enqueue_err}", flush=True)
 
-                # ── original logic (unchanged) ─────────────────────────────
-                order_payload = _list_orders(self.amz_setting, amazon_order_ids=d.amazon_order_id)
-                if not order_payload or not order_payload.get("Orders"):
-                    print(f"No order payload found for {d.amazon_order_id}. Deleting orphan SO {d.name}.")
-                    frappe.delete_doc("Sales Order", d.name, ignore_permissions=True)
-                    frappe.db.commit()
-                    continue
+            # Gentle stagger (prevent Redis/Amazon thundering herd)
+            if i % 10 == 9:
+                time.sleep(1.0)
 
-                order = self._fetch_order_by_id(d.amazon_order_id)
-                if not order:
-                    frappe.logger().warning(f"SP-API returned no order for {d.amazon_order_id}; keeping draft {d.name}")
-                    continue
-
-                self.create_sales_order(order)
-                print(f"Finished processing order {d.amazon_order_id}.")
-
-            except Exception as e:   # ← per-order isolation (this was the main cause of the 3h timeout)
-                error_msg = f"Failed to reprocess draft order {d.amazon_order_id} (SO {d.name})"
-                frappe.log_error(title="Amazon Draft Reprocess Error", message=f"{error_msg}: {str(e)}")
-                print(f"ERROR {error_msg}: {str(e)[:150]}", flush=True)
-                continue   # one bad order no longer kills the whole batch job
-
+        print(f"Successfully enqueued {enqueued} independent reprocess jobs.", flush=True)
+        print("reprocess_draft_orders dispatcher finished (this job is now fast).", flush=True)
         print("Finished reprocess_draft_orders.", flush=True)
 
     def create_sales_order(self, order) -> str | None:
@@ -1432,6 +1440,63 @@ frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_r
 def reprocess_draft_orders_func(amz_setting_name, age_days=7):
     ar = AmazonRepository(amz_setting_name)
     ar.reprocess_draft_orders(age_days=age_days)
+
+#frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_repository.reprocess_single_draft_order", amz_setting_name="q3opu7c5ac", sales_order_name="SO26-15974", amazon_order_id="112-9037060-7281054")
+@frappe.whitelist()
+def reprocess_single_draft_order(amz_setting_name: str, sales_order_name: str, amazon_order_id: str):
+    """
+    Process EXACTLY ONE draft Sales Order in its own isolated RQ job.
+    Failure/timeout here only affects this single order.
+    """
+    ar = AmazonRepository(amz_setting_name)
+    start_time = time.time()
+
+    try:
+        print(f"[{amazon_order_id}] Processing single draft SO {sales_order_name}", flush=True)
+
+        order_payload = _list_orders(ar.amz_setting, amazon_order_ids=amazon_order_id)
+        if not order_payload or not order_payload.get("Orders"):
+            print(f"[{amazon_order_id}] No order payload found. Deleting orphan SO {sales_order_name}.")
+            frappe.delete_doc("Sales Order", sales_order_name, ignore_permissions=True)
+            frappe.db.commit()
+            return
+
+        orders = order_payload.get("Orders") or []
+        order = orders[0] if orders else None
+        if not order:
+            frappe.logger().warning(f"[{amazon_order_id}] SP-API returned no order data; keeping draft.")
+            return
+
+        ar.create_sales_order(order)
+        duration = time.time() - start_time
+        print(f"[{amazon_order_id}] Successfully reprocessed in {duration:.1f}s", flush=True)
+
+    except (requests.exceptions.RequestException,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            HTTPError,
+            SPAPIError) as e:
+        duration = time.time() - start_time
+        msg = f"Transient Amazon API error for order {amazon_order_id} (SO {sales_order_name}) after {duration:.1f}s: {type(e).__name__} – {str(e)[:220]}"
+        print(f"⚠️  {msg}", flush=True)
+        frappe.logger().warning(msg)   # warning only — no error log spam
+
+    except Exception as e:
+        duration = time.time() - start_time
+        error_msg = f"Failed to reprocess draft order {amazon_order_id} (SO {sales_order_name}) after {duration:.1f}s"
+        full_trace = f"{error_msg}\n\n{frappe.get_traceback()}"
+        frappe.log_error(
+            title="Amazon Draft Reprocess - Single Order Failure",
+            message=full_trace
+        )
+        print(f"❌ {error_msg}: {str(e)[:300]}", flush=True)
+
+    finally:
+        # Best-effort commit in case the job was partially successful
+        try:
+            frappe.db.commit()
+        except Exception:
+            pass
 
 @frappe.whitelist()
 def get_order(amz_setting_name, amazon_order_ids) -> list:
