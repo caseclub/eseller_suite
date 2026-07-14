@@ -351,14 +351,11 @@ def process_fba_inventory():
 
         for mkt_id in marketplace_ids:
             if DEBUG: print(f"[DEBUG] Querying marketplace: {mkt_id}")
-            start_dt = (datetime.now(timezone.utc) - timedelta(days=540)).replace(microsecond=0)
-            start_date = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
             base_qs = {
                 "granularityType": "Marketplace",
                 "granularityId": mkt_id,
                 "marketplaceIds": mkt_id,
-                "details": "true",
-                "startDateTime": start_date  # UTC ISO format
+                "details": "true",  # no startDateTime: return full current snapshot, not a delta, so omitted SKUs aren't wrongly zeroed
             }
             if DEBUG: print(f"[DEBUG] Query parameters: {base_qs}")
             next_token = None
