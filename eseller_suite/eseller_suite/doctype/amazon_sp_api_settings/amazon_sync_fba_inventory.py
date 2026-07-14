@@ -410,7 +410,17 @@ def process_fba_inventory():
         for s in summaries:
             cond = s.get("condition", "")  # Correct key per API docs
             asin = s.get("asin", "")
-            fulfillable_qty = s.get("inventoryDetails", {}).get("fulfillableQuantity", 0)
+            details = s.get("inventoryDetails") or {}  # inventoryDetails sub-object, default empty dict
+            total_quantity = s.get("totalQuantity") or 0  # top-level total units in FC
+            researching_quantity = (
+                details.get("researchingQuantity") or {}
+            ).get("totalResearchingQuantity") or 0  # units under investigation, not sellable
+            fc_transfer_quantity = (
+                details.get("reservedQuantity") or {}
+            ).get("pendingTransshipmentQuantity") or 0  # units reserved for FC-to-FC transfer
+            fulfillable_qty = (
+                total_quantity - researching_quantity + fc_transfer_quantity
+            )  # derived sellable qty; do NOT use API fulfillableQuantity
             #inbound_working = s.get("inventoryDetails", {}).get("inboundWorkingQuantity", 0) #Not included in calculations because this represents products that have been scheduled but not left our facility
             inbound_shipped = s.get("inventoryDetails", {}).get("inboundShippedQuantity", 0)
             inbound_receiving = s.get("inventoryDetails", {}).get("inboundReceivingQuantity", 0)
