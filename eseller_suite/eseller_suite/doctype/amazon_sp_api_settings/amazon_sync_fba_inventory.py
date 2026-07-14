@@ -24,6 +24,12 @@ import pytz
 # When True all docs are left as drafts and not submitted
 DEBUG = False  # Toggle to False to disable all debug prints. Also set to True to run the progam on demand as opposed to during the set time
 
+# Belt-and-suspenders guard: if a single sync run would zero out more than this
+# fraction of the Amazon-linked items currently holding stock in a warehouse,
+# treat the API pull as partial/unhealthy and SKIP the zero-out for that warehouse
+# (reported adjustments still apply). Prevents a truncated response from wiping stock.
+MAX_ZERO_OUT_FRACTION = 0.10  # tune to your catalog's normal daily sell-through-to-zero rate
+
 # ──────────────────────────────────────────
 # Helper Functions
 # ──────────────────────────────────────────
@@ -292,20 +298,30 @@ def process_inbound_inventory(asin_inbound, settings):
         WHERE b.warehouse = %s AND i.custom_asin IS NOT NULL AND b.actual_qty > 0 AND i.disabled = 0 AND i.is_stock_item = 1
     """, inbound_wh, as_dict=True)
 
-    for row in inbound_amazon_items:
-        if row.asin in asin_inbound:
-            continue  # Already handled if needed
-        item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
-        item_dict = {
-            "item_code": row.item_code,
-            "warehouse": inbound_wh,
-            "qty": 0,
-        }
-        if item_valuation_rate > 0:
-            item_dict["valuation_rate"] = item_valuation_rate
-        else:
-            item_dict["valuation_rate"] = 0.01
-        reconcile_items.append(item_dict)
+    # Candidates to zero: stocked Amazon items in this warehouse NOT reported by the API
+    inbound_zero_candidates = [r for r in inbound_amazon_items if r.asin not in asin_inbound]
+    inbound_total_stocked = len(inbound_amazon_items)  # Amazon items currently holding stock here
+    # Guard: refuse to zero if the unreported share exceeds the threshold (likely a partial pull)
+    if inbound_total_stocked and (len(inbound_zero_candidates) / inbound_total_stocked) > MAX_ZERO_OUT_FRACTION:
+        frappe.log_error(
+            f"Skipping inbound zero-out for {inbound_wh}: "
+            f"{len(inbound_zero_candidates)}/{inbound_total_stocked} stocked Amazon items "
+            f"unreported (> {MAX_ZERO_OUT_FRACTION:.0%}); treating as partial API pull.",
+            "FBA Inventory Zero-Out Guard",
+        )
+    else:
+        for row in inbound_zero_candidates:  # already excludes reported ASINs
+            item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
+            item_dict = {
+                "item_code": row.item_code,
+                "warehouse": inbound_wh,
+                "qty": 0,
+            }
+            if item_valuation_rate > 0:
+                item_dict["valuation_rate"] = item_valuation_rate
+            else:
+                item_dict["valuation_rate"] = 0.01
+            reconcile_items.append(item_dict)
 
     # Create and submit Stock Reconciliation if needed
     if reconcile_items:
@@ -366,7 +382,7 @@ def process_fba_inventory():
                     qs["nextToken"] = next_token
                     if DEBUG: print(f"[DEBUG] Updated qs with nextToken: {qs}")
                 else:
-                    qs = dict(base_qs)  # First page uses full filters + startDateTime
+                    qs = dict(base_qs)  # First page uses the full snapshot filters
 
                 if DEBUG: print(f"[DEBUG] Fetching page {page} for {mkt_id}...")
                 try:  # ADDED: Wrap API call for logging
@@ -493,20 +509,30 @@ def process_fba_inventory():
             WHERE b.warehouse = %s AND i.custom_asin IS NOT NULL AND b.actual_qty > 0 AND i.disabled = 0 AND i.is_stock_item = 1
         """, wh, as_dict=True)
 
-        for row in amazon_items_in_wh:
-            if row.asin in asin_fulfillable:
-                continue  # Already handled if needed
-            item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
-            item_dict = {
-                "item_code": row.item_code,
-                "warehouse": wh,
-                "qty": 0,
-            }
-            if item_valuation_rate > 0:
-                item_dict["valuation_rate"] = item_valuation_rate
-            else:
-                item_dict["valuation_rate"] = 0.01
-            items_list.append(item_dict)
+        # Candidates to zero: stocked Amazon items in this warehouse NOT reported by the API
+        zero_candidates = [r for r in amazon_items_in_wh if r.asin not in asin_fulfillable]
+        total_stocked = len(amazon_items_in_wh)  # Amazon items currently holding stock here
+        # Guard: refuse to zero if the unreported share exceeds the threshold (likely a partial pull)
+        if total_stocked and (len(zero_candidates) / total_stocked) > MAX_ZERO_OUT_FRACTION:
+            frappe.log_error(
+                f"Skipping fulfillable zero-out for {wh}: "
+                f"{len(zero_candidates)}/{total_stocked} stocked Amazon items "
+                f"unreported (> {MAX_ZERO_OUT_FRACTION:.0%}); treating as partial API pull.",
+                "FBA Inventory Zero-Out Guard",
+            )
+        else:
+            for row in zero_candidates:  # already excludes reported ASINs
+                item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
+                item_dict = {
+                    "item_code": row.item_code,
+                    "warehouse": wh,
+                    "qty": 0,
+                }
+                if item_valuation_rate > 0:
+                    item_dict["valuation_rate"] = item_valuation_rate
+                else:
+                    item_dict["valuation_rate"] = 0.01
+                items_list.append(item_dict)
 
         if DEBUG: print(f"[DEBUG] Total items to reconcile: {len(items_list)}")
         if not items_list:
