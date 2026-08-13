@@ -428,19 +428,25 @@ def process_fba_inventory():
             asin = s.get("asin", "")
             details = s.get("inventoryDetails") or {}  # inventoryDetails sub-object, default empty dict
             total_quantity = s.get("totalQuantity") or 0  # top-level total units in FC
+            inbound_working = details.get("inboundWorkingQuantity") or 0
+            inbound_shipped = details.get("inboundShippedQuantity") or 0
+            inbound_receiving = details.get("inboundReceivingQuantity") or 0
+            fulfillable_quantity = details.get("fulfillableQuantity") or 0
             researching_quantity = (
                 details.get("researchingQuantity") or {}
-            ).get("totalResearchingQuantity") or 0  # units under investigation, not sellable
+            ).get("totalResearchingQuantity") or 0  # subtracted from totalQuantity-based equation only
             fc_transfer_quantity = (
                 details.get("reservedQuantity") or {}
-            ).get("pendingTransshipmentQuantity") or 0  # units reserved for FC-to-FC transfer
-            fulfillable_qty = (
-                total_quantity - researching_quantity + fc_transfer_quantity
-            )  # derived sellable qty; do NOT use API fulfillableQuantity
-            #inbound_working = s.get("inventoryDetails", {}).get("inboundWorkingQuantity", 0) #Not included in calculations because this represents products that have been scheduled but not left our facility
-            inbound_shipped = s.get("inventoryDetails", {}).get("inboundShippedQuantity", 0)
-            inbound_receiving = s.get("inventoryDetails", {}).get("inboundReceivingQuantity", 0)
-            #inbound_qty = inbound_working + inbound_shipped + inbound_receiving
+            ).get("pendingTransshipmentQuantity") or 0  # added to fulfillableQuantity-based equation only
+            fulfillable_qty = max(
+                0,
+                total_quantity
+                - inbound_working
+                - inbound_shipped
+                - inbound_receiving
+                - researching_quantity,
+                fulfillable_quantity + fc_transfer_quantity,
+            )
             inbound_qty = inbound_shipped + inbound_receiving  # inboundWorkingQuantity excluded: these units have not left our facility yet
             if DEBUG: print(f"[DEBUG] Processing summary: ASIN={asin}, Condition={cond}, FulfillableQty={fulfillable_qty}, InboundQty={inbound_qty}")
             if cond != "NewItem":  # Filter to new condition (adjust if your data uses variants like "SELLABLE")
