@@ -1,15 +1,20 @@
 # amazon_sync_fba_inventory.py
 # =========================================
-#  Syncs Amazon FBA inventory quantities to ERPNext once per day
-#  using the FBA Inventory API (direct GET, no reports/POST needed).
+#  Syncs Amazon FBA inventory quantities to ERPNext using the FBA Inventory API,
+#  with a 6 AM MYI ALL report request and 7 AM report comparison for inbound inventory.
 # =========================================
 from __future__ import annotations
+import csv
+import gzip
+import inspect
+import io
 import json, requests
 
 from datetime import datetime, timedelta, timezone
 import time
 from zoneinfo import ZoneInfo
 import frappe
+from . import amazon_repository as _amazon_repository
 from .amazon_repository import _sp_get, AmazonRepository
 
 from urllib.parse import urlencode
@@ -37,6 +42,230 @@ def parse_marketplaces(mkt_str: str) -> list[str]:
     if not mkt_str:
         return []
     return [m.strip() for m in mkt_str.split(',') if m.strip()]
+
+
+MYI_ALL_REPORT_TYPE = "GET_FBA_MYI_ALL_INVENTORY_DATA"
+MYI_REPORT_LOOKBACK_HOURS = 2
+
+
+def _sp_response_data(response):
+    """Return a JSON dictionary from the project's SP-API helper response."""
+    if isinstance(response, dict):
+        return response
+    json_method = getattr(response, "json", None)
+    if callable(json_method):
+        data = json_method()
+        if isinstance(data, dict):
+            return data
+    raise TypeError("SP-API helper returned an unsupported response type")
+
+
+def _sp_response_payload(response):
+    data = _sp_response_data(response)
+    payload = data.get("payload")
+    return payload if isinstance(payload, dict) else data
+
+
+def _sp_post_existing(path, body, settings):
+    """Use the existing authenticated POST helper without introducing new auth code."""
+    sp_post = getattr(_amazon_repository, "_sp_post", None)
+    if not callable(sp_post):
+        raise RuntimeError("amazon_repository does not expose an authenticated _sp_post helper")
+
+    kwargs = {}
+    try:
+        if "return_full" in inspect.signature(sp_post).parameters:
+            kwargs["return_full"] = True
+    except (TypeError, ValueError):
+        pass
+    return sp_post(path, body, settings, **kwargs)
+
+
+def request_manage_inventory_report(settings, marketplace_ids):
+    """Request one fresh MYI ALL report; do not poll, download, or persist its ID."""
+    if not marketplace_ids:
+        raise RuntimeError("No marketplace IDs configured for MYI ALL report request")
+
+    response = _sp_post_existing(
+        "/reports/2021-06-30/reports",
+        {
+            "reportType": MYI_ALL_REPORT_TYPE,
+            "marketplaceIds": list(marketplace_ids),
+        },
+        settings,
+    )
+    report_id = _sp_response_payload(response).get("reportId")
+    if not report_id:
+        raise RuntimeError("Amazon createReport response did not include reportId")
+    if DEBUG:
+        print(f"[DEBUG] Requested MYI ALL report: {report_id}")
+    return report_id
+
+
+def _utc_iso(value):
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_amazon_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_recent_done_manage_inventory_report(settings, marketplace_ids):
+    """Return the newest suitable recent DONE MYI ALL report, or None without polling."""
+    if not marketplace_ids:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=MYI_REPORT_LOOKBACK_HOURS)
+    response = _sp_get(
+        "/reports/2021-06-30/reports",
+        {
+            "reportTypes": MYI_ALL_REPORT_TYPE,
+            "processingStatuses": "DONE",
+            "marketplaceIds": ",".join(marketplace_ids),
+            "createdSince": _utc_iso(cutoff),
+            "pageSize": 100,
+        },
+        settings,
+        return_full=True,
+    )
+    reports = _sp_response_payload(response).get("reports") or []
+    suitable = []
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        if report.get("reportType") != MYI_ALL_REPORT_TYPE:
+            continue
+        if report.get("processingStatus") != "DONE":
+            continue
+        if not report.get("reportDocumentId"):
+            continue
+        created_time = _parse_amazon_datetime(report.get("createdTime"))
+        if created_time is None or created_time < cutoff:
+            continue
+        suitable.append((created_time, report))
+
+    if not suitable:
+        if DEBUG:
+            print("[DEBUG] No recent completed MYI ALL report available; using API inbound only")
+        return None
+
+    suitable.sort(key=lambda item: item[0], reverse=True)
+    selected = suitable[0][1]
+    if DEBUG:
+        print(
+            f"[DEBUG] Selected MYI ALL report created at {selected.get('createdTime')} "
+            f"with status {selected.get('processingStatus')}"
+        )
+    return selected
+
+
+def _parse_nonnegative_report_quantity(value):
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        parsed = float(text)
+        if parsed <= 0 or not parsed.is_integer():
+            return 0
+        return int(parsed)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _normalize_report_header(value):
+    return str(value or "").lstrip("\ufeff").strip().lower()
+
+
+def _parse_manage_inventory_report(report_bytes):
+    text = report_bytes.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    if not reader.fieldnames:
+        raise ValueError("MYI ALL report has no header row")
+
+    reader.fieldnames = [_normalize_report_header(name) for name in reader.fieldnames]
+    required_headers = {
+        "asin",
+        "condition",
+        "afn-inbound-shipped-quantity",
+        "afn-inbound-receiving-quantity",
+    }
+    if not required_headers.issubset(set(reader.fieldnames)):
+        raise ValueError("MYI ALL report is missing required inbound columns")
+
+    report_inbound_by_asin = defaultdict(int)
+    parsed_rows = 0
+    for raw_row in reader:
+        try:
+            row = {
+                _normalize_report_header(key): str(value or "").strip()
+                for key, value in raw_row.items()
+                if key is not None
+            }
+            asin = row.get("asin", "").strip()
+            if not asin:
+                continue
+
+            condition = "".join(ch for ch in row.get("condition", "").lower() if ch.isalnum())
+            # Blank condition is accepted conservatively because MYI ALL can omit it on otherwise valid rows.
+            if condition and condition not in {"new", "newitem"}:
+                continue
+
+            shipped = _parse_nonnegative_report_quantity(row.get("afn-inbound-shipped-quantity"))
+            receiving = _parse_nonnegative_report_quantity(row.get("afn-inbound-receiving-quantity"))
+            # afn-inbound-working-quantity is intentionally never read or counted.
+            report_inbound_by_asin[asin] += shipped + receiving
+            parsed_rows += 1
+        except Exception:
+            # A malformed individual row must not abort the supplemental report parse.
+            continue
+
+    if DEBUG:
+        print(
+            f"[DEBUG] Parsed {parsed_rows} MYI ALL report rows across "
+            f"{len(report_inbound_by_asin)} ASINs"
+        )
+    return dict(report_inbound_by_asin)
+
+
+def get_recent_manage_inventory_inbound(settings, marketplace_ids):
+    """Download and parse the newest recent completed MYI ALL report entirely in memory."""
+    report = _find_recent_done_manage_inventory_report(settings, marketplace_ids)
+    if not report:
+        return None
+
+    report_document_id = report.get("reportDocumentId")
+    document_response = _sp_get(
+        f"/reports/2021-06-30/documents/{report_document_id}",
+        {},
+        settings,
+        return_full=True,
+    )
+    document = _sp_response_payload(document_response)
+    if document.get("encryptionDetails"):
+        raise RuntimeError("Legacy encrypted report document is not supported by existing project context")
+
+    download_url = document.get("url")
+    if not download_url:
+        raise RuntimeError("Amazon report document response did not include a download URL")
+
+    download = requests.get(download_url, timeout=90)
+    download.raise_for_status()
+    report_bytes = download.content
+    if str(document.get("compressionAlgorithm") or "").upper() == "GZIP":
+        report_bytes = gzip.decompress(report_bytes)
+
+    return _parse_manage_inventory_report(report_bytes)
 
 # ──────────────────────────────────────────
 # Inbound Processing
@@ -568,8 +797,35 @@ def process_fba_inventory():
                 frappe.log_error(frappe.get_traceback(), "Fulfillable Stock Reconciliation Error")
                 raise
 
-        # Process inbound inventory
-        process_inbound_inventory(asin_inbound, settings)
+        # Process inbound inventory, supplementing the API value with the newest recent MYI ALL report when available
+        final_inbound_by_asin = dict(asin_inbound)
+        try:
+            report_inbound_by_asin = get_recent_manage_inventory_inbound(settings, marketplace_ids)
+            if report_inbound_by_asin is not None:
+                final_inbound_by_asin = {
+                    asin: max(
+                        0,
+                        asin_inbound.get(asin, 0),
+                        report_inbound_by_asin.get(asin, 0),
+                    )
+                    for asin in set(asin_inbound) | set(report_inbound_by_asin)
+                }
+                if DEBUG:
+                    for asin in sorted(final_inbound_by_asin):
+                        print(
+                            f"[DEBUG] Inbound merge {asin}: "
+                            f"API={asin_inbound.get(asin, 0)}, "
+                            f"MYI={report_inbound_by_asin.get(asin, 0)}, "
+                            f"Final={final_inbound_by_asin[asin]}"
+                        )
+        except Exception as exc:
+            frappe.log_error(
+                f"Supplemental MYI ALL report failed ({type(exc).__name__}); "
+                "using Inventory Summaries API inbound values only.",
+                "FBA MYI Supplemental Report Error",
+            )
+
+        process_inbound_inventory(final_inbound_by_asin, settings)
     except Exception:
         frappe.log_error(frappe.get_traceback(), "FBA Inventory Process Error")
         raise
@@ -588,12 +844,27 @@ Set Target Warehouse to your relevant warehouses (Amazon FBA, Amazon FBA Inbound
 """
 @frappe.whitelist()
 def run_daily_fba_inventory_sync():
-    """Hourly scheduler entry: sync FBA inventory (only runs at 8 AM)."""
+    """Hourly scheduler entry: request MYI ALL at 6 AM and run the inventory sync at 7 AM."""
     
     pst_tz = ZoneInfo("America/Los_Angeles")
     now = datetime.now(pst_tz)
-    if now.hour != 7 and DEBUG == False:
-        return  # Only run at 7 AM in PST
+
+    if not DEBUG and now.hour == 6:
+        try:
+            repo = AmazonRepository("q3opu7c5ac")
+            settings = repo.amz_setting
+            marketplace_ids = parse_marketplaces(settings.custom_marketplace)
+            request_manage_inventory_report(settings, marketplace_ids)
+        except Exception as exc:
+            frappe.log_error(
+                f"6 AM MYI ALL report request failed ({type(exc).__name__}); "
+                "the 7 AM inventory sync will continue normally.",
+                "FBA MYI Report Request Error",
+            )
+        return
+
+    if not DEBUG and now.hour != 7:
+        return
     
     try:  # ADDED: Wrap scheduler call
         frappe.get_doc("Amazon SP API Settings", "q3opu7c5ac")  # Load to ensure active
