@@ -66,19 +66,92 @@ def _sp_response_payload(response):
     return payload if isinstance(payload, dict) else data
 
 
-def _sp_post_existing(path, body, settings):
-    """Use the existing authenticated POST helper without introducing new auth code."""
-    sp_post = getattr(_amazon_repository, "_sp_post", None)
-    if not callable(sp_post):
-        raise RuntimeError("amazon_repository does not expose an authenticated _sp_post helper")
+def _sp_post_existing(path, body, settings, max_retry: int = 10):
+    """
+    POST to SP-API using the repository's existing auth primitives.
 
-    kwargs = {}
-    try:
-        if "return_full" in inspect.signature(sp_post).parameters:
-            kwargs["return_full"] = True
-    except (TypeError, ValueError):
-        pass
-    return sp_post(path, body, settings, **kwargs)
+    Newer/older amazon_repository.py revisions may not expose a generic
+    `_sp_post` helper, so fall back to the same LWA token/domain/timeout
+    primitives already used by `_sp_get`.
+    """
+    sp_post = getattr(_amazon_repository, "_sp_post", None)
+    if callable(sp_post):
+        kwargs = {}
+        try:
+            if "return_full" in inspect.signature(sp_post).parameters:
+                kwargs["return_full"] = True
+        except (TypeError, ValueError):
+            pass
+        return sp_post(path, body, settings, **kwargs)
+
+    get_lwa_token = getattr(_amazon_repository, "_get_lwa_token", None)
+    sp_domain = getattr(_amazon_repository, "SP_DOMAIN", None)
+    timeout = getattr(_amazon_repository, "SPAPI_TIMEOUT", (12.0, 45.0))
+    if not callable(get_lwa_token) or not sp_domain:
+        raise RuntimeError(
+            "amazon_repository exposes neither _sp_post nor the "
+            "_get_lwa_token/SP_DOMAIN primitives required for SP-API POST"
+        )
+
+    url = f"https://{sp_domain}{path}"
+    token = get_lwa_token(settings)
+    headers = {
+        "host": sp_domain,
+        "user-agent": "ERPNext-eSellerSuite/1.0",
+        "x-amz-access-token": token,
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+
+    retryable_statuses = {429, 500, 502, 503, 504}
+    last_error = None
+
+    for attempt in range(max_retry):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=timeout,
+            )
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            frappe.logger().warning(
+                f"SP-API POST {type(exc).__name__} for {path} "
+                f"(attempt {attempt + 1}/{max_retry}): {str(exc)[:250]}"
+            )
+            if attempt == max_retry - 1:
+                raise
+            time.sleep(min(2 + attempt, 20))
+            continue
+
+        if 200 <= response.status_code < 300:
+            return response.json()
+
+        response_excerpt = (response.text or "")[:500]
+        if response.status_code not in retryable_statuses:
+            raise RuntimeError(
+                f"SP-API POST {path} failed with HTTP {response.status_code}: "
+                f"{response_excerpt}"
+            )
+
+        last_error = RuntimeError(
+            f"SP-API POST {path} returned retryable HTTP {response.status_code}: "
+            f"{response_excerpt}"
+        )
+        retry_after_raw = response.headers.get("Retry-After")
+        try:
+            retry_after = int(retry_after_raw) if retry_after_raw else (2 + attempt)
+        except (TypeError, ValueError):
+            retry_after = 2 + attempt
+        frappe.logger().info(
+            f"SP-API POST {response.status_code}, sleeping {retry_after}s for {path}"
+        )
+        time.sleep(min(retry_after, 60))
+
+    raise RuntimeError(
+        f"SP-API POST {path} failed after {max_retry} attempts: {last_error}"
+    )
 
 
 def request_manage_inventory_report(settings, marketplace_ids):
@@ -857,8 +930,9 @@ def run_daily_fba_inventory_sync():
             request_manage_inventory_report(settings, marketplace_ids)
         except Exception as exc:
             frappe.log_error(
-                f"6 AM MYI ALL report request failed ({type(exc).__name__}); "
-                "the 7 AM inventory sync will continue normally.",
+                f"6 AM MYI ALL report request failed ({type(exc).__name__}: {exc}); "
+                "the 7 AM inventory sync will continue normally.\n\n"
+                f"{frappe.get_traceback()}",
                 "FBA MYI Report Request Error",
             )
         return
