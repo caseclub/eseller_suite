@@ -10,7 +10,9 @@ import time
 import re
 import frappe
 from frappe.model.document import Document
-from frappe.utils import flt, add_days, cint
+from frappe.utils import flt, add_days, cint, getdate
+from erpnext.accounts.party import get_party_account
+from erpnext.accounts.utils import reconcile_against_document
 from .amazon_repository import _sp_get, AmazonRepository
 from requests.exceptions import HTTPError, RequestException
 from urllib.parse import urlencode
@@ -69,10 +71,155 @@ def get_open_sales_invoice(order_id: str) -> str | None:
         {
             "amazon_order_id": order_id,
             "docstatus": 1,  # Submitted
+            "is_return": 0,
             "outstanding_amount": [">", 0],  # Open/unpaid
         },
         "name",
+        order_by="posting_date desc",
     )
+
+def get_sales_order_context(order_id: str) -> frappe._dict:
+    """Return the latest non-cancelled Amazon Sales Order customer/channel context."""
+    # Cached per request: called once per AR line, per remark stamp and per CN.
+    cache = frappe.local.amazon_so_ctx_cache = getattr(frappe.local, "amazon_so_ctx_cache", {})
+    if order_id in cache:
+        return cache[order_id]
+    ctx = frappe.db.get_value(
+        "Sales Order",
+        {"amazon_order_id": order_id, "docstatus": ["!=", 2]},
+        ["name", "customer", "fulfillment_channel"],
+        as_dict=True,
+        order_by="transaction_date desc, creation desc",
+    ) or frappe._dict()
+    cache[order_id] = ctx
+    return ctx
+
+def get_invoice_receivable_context(invoice_name: str | None) -> frappe._dict:
+    """Return the accounting fields ERPNext requires when a JE references a Sales Invoice/Credit Note."""
+    if not invoice_name:
+        return frappe._dict()
+    ctx = frappe.db.get_value(
+        "Sales Invoice",
+        invoice_name,
+        [
+            "name", "customer", "debit_to", "outstanding_amount",
+            "conversion_rate", "currency", "is_return", "docstatus", "posting_date",
+        ],
+        as_dict=True,
+    ) or frappe._dict()
+    if ctx and ctx.debit_to:
+        ctx.account_currency = _get_account_currency(ctx.debit_to)
+    return ctx
+
+def _ccy_mapping(settings, settlement_ccy: str) -> dict:
+    """Return the configured Amazon currency map; account compatibility is validated before posting."""
+    mapping = get_currency_accounts_map(settings)
+    return mapping.get(settlement_ccy) or mapping["USD"]
+
+def _get_account_currency(account: str | None, company: str | None = None) -> str:
+    """Return Account.account_currency, treating a blank value as the company's base currency."""
+    if not account:
+        return ""
+    account_ccy = frappe.get_cached_value("Account", account, "account_currency")
+    if account_ccy:
+        return str(account_ccy).upper()
+    company = company or frappe.get_cached_value("Account", account, "company")
+    if not company:
+        return ""
+    return (frappe.get_cached_value("Company", company, "default_currency") or "").upper()
+
+def _account_matches_currency(account: str | None, settlement_ccy: str, company: str | None = None) -> bool:
+    """
+    True when a native settlement amount may be posted to this account.
+    A blank Account.account_currency means company currency in ERPNext, so normalize
+    that case before comparing against the settlement currency.
+    """
+    return _get_account_currency(account, company) == (settlement_ccy or "").upper()
+
+def resolve_order_receivable_context(settings, order_id: str, settlement_ccy: str, invoice_name: str | None = None) -> frappe._dict:
+    """
+    Resolve AR party/account from the referenced invoice whenever possible.
+    For an invoice that does not exist yet, use the imported Sales Order customer
+    and ERPNext's party-account resolver. Only fall back to the legacy Amazon FBA
+    customer/debtors mapping when neither document can identify the party.
+    """
+    invoice = get_invoice_receivable_context(invoice_name)
+    order_ctx = get_sales_order_context(order_id)
+
+    mapping = _ccy_mapping(settings, settlement_ccy)
+
+    if invoice:
+        return frappe._dict(
+            account=invoice.debit_to,
+            account_currency=(invoice.account_currency or "").upper(),
+            customer=invoice.customer,
+            currency=(invoice.currency or "").upper(),
+            outstanding=abs(flt(invoice.outstanding_amount)),
+            fulfillment_channel=(order_ctx.fulfillment_channel or "").upper(),
+            invoice=invoice,
+        )
+
+    if order_ctx.customer:
+        try:
+            account = get_party_account("Customer", order_ctx.customer, settings.company)
+        except Exception:
+            account = None
+            frappe.log_error(
+                title=f"Amazon Settlement Party Account Resolution {order_id}"[:140],
+                message=frappe.get_traceback(),
+            )
+
+        # get_party_account already falls back to the company default receivable, which is
+        # in company currency. Reject it when it cannot carry the settlement currency and
+        # use the currency-specific Amazon debtors account instead. The customer (which may
+        # be a real FBM buyer) is never discarded just because the account had to change.
+        if not _account_matches_currency(account, settlement_ccy, settings.company):
+            account = mapping["debtors"]
+
+        if not _account_matches_currency(account, settlement_ccy, settings.company):
+            frappe.throw(
+                f"Amazon settlement currency {settlement_ccy} requires a {settlement_ccy}-denominated "
+                f"receivable account, but no compatible account is configured for Amazon order {order_id}."
+            )
+
+        return frappe._dict(
+            account=account,
+            account_currency=settlement_ccy,
+            customer=order_ctx.customer,
+            currency=settlement_ccy,
+            outstanding=0.0,
+            fulfillment_channel=(order_ctx.fulfillment_channel or "").upper(),
+            invoice=frappe._dict(),
+        )
+
+    fallback_account = mapping["debtors"]
+    if not _account_matches_currency(fallback_account, settlement_ccy, settings.company):
+        frappe.throw(
+            f"Amazon settlement currency {settlement_ccy} requires a {settlement_ccy}-denominated "
+            "Amazon debtors account; check Amazon SP API Settings."
+        )
+
+    return frappe._dict(
+        account=fallback_account,
+        account_currency=settlement_ccy,
+        customer=mapping["customer"],
+        currency=settlement_ccy,
+        outstanding=0.0,
+        fulfillment_channel=(order_ctx.fulfillment_channel or "").upper(),
+        invoice=frappe._dict(),
+    )
+
+def _append_ar_line(ar_lines: list, base: dict, amount: float, credit: bool):
+    """
+    Emit one AR line, flipping direction for negative amounts (e.g. a net-negative
+    order_retrocharge) so the settlement total is never silently dropped from the JE.
+    """
+    if abs(flt(amount)) < 0.01:
+        return
+    line = dict(base)
+    is_credit = credit if amount > 0 else not credit
+    line["credit_in_account_currency" if is_credit else "debit_in_account_currency"] = abs(flt(amount))
+    ar_lines.append(line)
 
 def cancel_sales_invoice(inv_name: str) -> bool:
     """
@@ -405,14 +552,31 @@ def get_open_credit_notes_for_order(order_id: str) -> list[str]:
         pluck="name",
     )
 
-def stamp_marketplace_fields(dr: dict, cr: dict, marketplace_name: str, merchant_order_id: str):
+def stamp_marketplace_fields(
+    dr: dict,
+    cr: dict,
+    marketplace_name: str,
+    merchant_order_id: str,
+    fulfillment_channel: str = "",
+    is_refund: bool = False,
+):
+    """Stamp descriptive fields without assuming amazon.com means FBA."""
+    suffix = "Refund" if is_refund else "Order"
+    channel = (fulfillment_channel or "").upper()
+
     if marketplace_name == "non-amazon us":
         cleaned_id = re.sub(r'\D', '', merchant_order_id)
         dr["custom_merchant_order_id"] = cr["custom_merchant_order_id"] = cleaned_id
-        dr["user_remark"] = cr["user_remark"] = "Multi-Channel Fulfillment (MCF) Order" if "reference_name" not in dr else "Multi-Channel Fulfillment (MCF) Order Refund"
+        dr["user_remark"] = cr["user_remark"] = f"Multi-Channel Fulfillment (MCF) {suffix}"
     elif marketplace_name == "amazon.com":
         dr["custom_merchant_order_id"] = cr["custom_merchant_order_id"] = ""
-        dr["user_remark"] = cr["user_remark"] = "Fulfillment by Amazon (FBA) Order" if "reference_name" not in dr else "Fulfillment by Amazon (FBA) Order Refund"
+        if channel == "MFN":
+            label = f"Fulfillment by Merchant (FBM/MFN) {suffix}"
+        elif channel == "AFN":
+            label = f"Fulfillment by Amazon (FBA) {suffix}"
+        else:
+            label = f"Amazon {suffix}"
+        dr["user_remark"] = cr["user_remark"] = label
 
 # ──────────────────────────────────────────
 # Updated: Idempotency check now includes legacy "-adj" and docstatus=2 (cancelled) for stricter duplicate prevention
@@ -645,14 +809,20 @@ def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, 
         # Compute totals (no diff check or rounding; rely on report data)
         cn.calculate_taxes_and_totals()
                
-        # Stamp fields
+        # Stamp fields. marketplace-name identifies the storefront, not who fulfilled it.
         cn.remarks = ""  # Initialize to empty string for safe appending
+        fulfillment_channel = (get_sales_order_context(order_id).fulfillment_channel or "").upper()
         if marketplace_name == "non-amazon us":
             cn.custom_merchant_order_id = re.sub(r'\D', '', merchant_order_id)
             cn.remarks = "Multi-Channel Fulfillment (MCF) Order Refund"
         elif marketplace_name == "amazon.com":
             cn.custom_merchant_order_id = ""
-            cn.remarks = "Fulfillment by Amazon (FBA) Order Refund"
+            if fulfillment_channel == "MFN":
+                cn.remarks = "Fulfillment by Merchant (FBM/MFN) Order Refund"
+            elif fulfillment_channel == "AFN":
+                cn.remarks = "Fulfillment by Amazon (FBA) Order Refund"
+            else:
+                cn.remarks = "Amazon Order Refund"
         cn.amazon_order_id = order_id
         cn.custom_amazon_settlement_report_id = report_id
         
@@ -896,12 +1066,8 @@ def build_je(
         # - Reasoning: Ensures separate lines without netting; SIs get paid via credit allocation; CNs handle refunds financially (no stock).
         # - Edge cases: Partial payments (apply to open outstanding only); missing SI (treat as advance); refunds without SI (CN skipped, debit as advance); multiple CNs (idempotency skips duplicates).
         # ──────────────────────────────────────────────
-        debtors_account = get_debtors_account(repo.amz_setting, settlement_ccy)
-        map = get_currency_accounts_map(repo.amz_setting)
-        customer = map[settlement_ccy]["customer"]
         # Sales pass
         for order_id, sales_total_native in sales_totals.items():
-            # Fetch marketplace-name and merchant-order-id from the first row for this order
             marketplace_name = ""
             merchant_order_id = ""
             order_rows = order_groups.get(order_id, [])
@@ -909,26 +1075,78 @@ def build_je(
                 first_row = order_rows[0]
                 marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
                 merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
-            si_name = get_sales_invoice(order_id)  # Latest non-return SI
-            ar_line = {
-                "account": debtors_account,
+
+            si_name = get_sales_invoice(order_id)
+            open_si_name = get_open_sales_invoice(order_id)
+            ctx = resolve_order_receivable_context(
+                repo.amz_setting, order_id, settlement_ccy, open_si_name or si_name
+            )
+            base_line = {
+                "account": ctx.account,
                 "exchange_rate": rate,
                 "party_type": "Customer",
-                "party": customer,
+                "party": ctx.customer,
                 "amazon_order_id": order_id,
             }
-            stamp_marketplace_fields(ar_line, {}, marketplace_name, merchant_order_id)  # Stamp on line
-            if si_name and get_open_sales_invoice(order_id):
-                ar_line.update({
-                    "reference_type": "Sales Invoice",
-                    "reference_name": si_name,
-                })
-            # Set as credit
-            ar_line.update({"credit_in_account_currency": sales_total_native})
-            ar_lines.append(ar_line)
+            stamp_marketplace_fields(
+                base_line, {}, marketplace_name, merchant_order_id,
+                ctx.fulfillment_channel, is_refund=False,
+            )
+            remaining = sales_total_native
+
+            # Only reference an invoice denominated in the settlement currency; a native
+            # amount posted against a differently-denominated AR account is not meaningful.
+            ccy_ok = (
+                (not ctx.currency or ctx.currency == settlement_ccy)
+                and (not ctx.account_currency or ctx.account_currency == settlement_ccy)
+            )
+            if open_si_name and not ccy_ok:
+                frappe.log_error(
+                    title=f"Amazon Settlement Currency Mismatch {order_id}"[:140],
+                    message=(
+                        f"Settlement {rpt_id} currency {settlement_ccy} cannot be applied to Sales Invoice "
+                        f"{open_si_name}: invoice currency={ctx.currency}, receivable account "
+                        f"currency={ctx.account_currency}. Booking as an unreferenced settlement-currency line."
+                    ),
+                )
+                # Do not post the native settlement amount to the invoice's differently
+                # denominated debit_to account. Resolve a currency-compatible account while
+                # retaining the real order customer (important for MFN/FBM).
+                unref_ctx = resolve_order_receivable_context(
+                    repo.amz_setting, order_id, settlement_ccy, invoice_name=None
+                )
+                base_line = {
+                    "account": unref_ctx.account,
+                    "exchange_rate": rate,
+                    "party_type": "Customer",
+                    "party": unref_ctx.customer,
+                    "amazon_order_id": order_id,
+                }
+                stamp_marketplace_fields(
+                    base_line, {}, marketplace_name, merchant_order_id,
+                    unref_ctx.fulfillment_channel, is_refund=False,
+                )
+
+            # Reference only the amount ERPNext says is currently outstanding. Negative
+            # sales totals (net retrocharges) are never referenced: a debit against an SI
+            # would re-open an already-settled invoice.
+            if open_si_name and ccy_ok and remaining > 0 and ctx.outstanding > 0:
+                apply = min(remaining, ctx.outstanding)
+                if apply >= 0.01:
+                    ref_line = dict(base_line)
+                    ref_line.update({
+                        "reference_type": "Sales Invoice",
+                        "reference_name": open_si_name,
+                    })
+                    _append_ar_line(ar_lines, ref_line, apply, credit=True)
+                    remaining = round(remaining - apply, 2)
+
+            # Preserve any excess/unmatched settlement amount (either sign) as an
+            # unreferenced party line instead of over-allocating or dropping it.
+            _append_ar_line(ar_lines, base_line, remaining, credit=True)
+
         # Refund pass
         for order_id, refund_total_native in refund_totals.items():
-            # Fetch metadata (same as above)
             marketplace_name = ""
             merchant_order_id = ""
             order_rows = order_groups.get(order_id, [])
@@ -936,28 +1154,76 @@ def build_je(
                 first_row = order_rows[0]
                 marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
                 merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
-            si_name = get_sales_invoice(order_id)  # Latest non-return SI
+
+            si_name = get_sales_invoice(order_id)
             cn_name = None
-            # CHANGE: Filter to refund_rows only for CN creation (preserves refund-only logic).
-            refund_rows = [r for r in order_rows if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES]
-            if si_name and refund_rows:
-                # Create linked CN if not exists
-                cn_name = create_credit_note_for_refund(repo.amz_setting, si_name, refund_total_native, post_dt, order_id, marketplace_name, merchant_order_id, refund_rows, rpt_id)  # Add rpt_id
-            ar_line = {
-                "account": debtors_account,
+            refund_rows = [
+                r for r in order_rows
+                if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES
+            ]
+            # A negative refund total is a refund reversal, not a refund: no Credit Note.
+            if si_name and refund_rows and refund_total_native > 0:
+                cn_name = create_credit_note_for_refund(
+                    repo.amz_setting, si_name, refund_total_native, post_dt, order_id,
+                    marketplace_name, merchant_order_id, refund_rows, rpt_id
+                )
+
+            ctx = resolve_order_receivable_context(
+                repo.amz_setting, order_id, settlement_ccy, cn_name or si_name
+            )
+            base_line = {
+                "account": ctx.account,
                 "exchange_rate": rate,
                 "party_type": "Customer",
-                "party": customer,
+                "party": ctx.customer,
                 "amazon_order_id": order_id,
             }
-            stamp_marketplace_fields(ar_line, {}, marketplace_name, merchant_order_id)
-            if cn_name:
-                ar_line.update({
-                    "reference_type": "Sales Invoice",
-                    "reference_name": cn_name,
-                })
-            ar_line.update({"debit_in_account_currency": refund_total_native})
-            ar_lines.append(ar_line)
+            stamp_marketplace_fields(
+                base_line, {}, marketplace_name, merchant_order_id,
+                ctx.fulfillment_channel, is_refund=True,
+            )
+            remaining = refund_total_native
+            ccy_ok = (
+                (not ctx.currency or ctx.currency == settlement_ccy)
+                and (not ctx.account_currency or ctx.account_currency == settlement_ccy)
+            )
+            if (cn_name or si_name) and not ccy_ok:
+                frappe.log_error(
+                    title=f"Amazon Settlement Refund Currency Mismatch {order_id}"[:140],
+                    message=(
+                        f"Settlement {rpt_id} currency {settlement_ccy} cannot be applied to the linked "
+                        f"Sales Invoice/Credit Note for Amazon order {order_id}: document currency={ctx.currency}, "
+                        f"receivable account currency={ctx.account_currency}. Booking as an unreferenced "
+                        "settlement-currency line."
+                    ),
+                )
+                unref_ctx = resolve_order_receivable_context(
+                    repo.amz_setting, order_id, settlement_ccy, invoice_name=None
+                )
+                base_line = {
+                    "account": unref_ctx.account,
+                    "exchange_rate": rate,
+                    "party_type": "Customer",
+                    "party": unref_ctx.customer,
+                    "amazon_order_id": order_id,
+                }
+                stamp_marketplace_fields(
+                    base_line, {}, marketplace_name, merchant_order_id,
+                    unref_ctx.fulfillment_channel, is_refund=True,
+                )
+
+            if cn_name and ccy_ok and remaining > 0 and ctx.outstanding > 0:
+                apply = min(remaining, ctx.outstanding)
+                if apply >= 0.01:
+                    ref_line = dict(base_line)
+                    ref_line.update({
+                        "reference_type": "Sales Invoice",
+                        "reference_name": cn_name,
+                    })
+                    _append_ar_line(ar_lines, ref_line, apply, credit=False)
+                    remaining = round(remaining - apply, 2)
+
+            _append_ar_line(ar_lines, base_line, remaining, credit=False)
         # ──────────────────────────────────────────────
         # 3) Add reimbursement line if significant (unchanged)
         # ──────────────────────────────────────────────
@@ -1108,6 +1374,25 @@ def _flag_unallocated_as_advance(je_doc):
 
 
             
+def _enqueue_settlement_finalize(je_name: str, account_count: int | None = None) -> bool:
+    """Idempotently enqueue the settlement finalize job for an existing draft JE."""
+    from frappe.utils.background_jobs import enqueue
+
+    job_name = f"Finalize Amazon Settlement {je_name}"
+    if frappe.db.exists("RQ Job", {"job_name": job_name, "status": ["in", ["queued", "started"]]}):
+        return False
+
+    if account_count is None:
+        account_count = frappe.db.count("Journal Entry Account", {"parent": je_name})
+    enqueue(
+        "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.finalize_and_submit_settlement_je",
+        queue="long" if account_count > 200 else "default",
+        timeout=3600 if account_count > 200 else 300,
+        job_name=job_name,
+        je_name=je_name,
+    )
+    return True
+
 # ──────────────────────────────────────────
 # 4. — Orchestrator
 # ──────────────────────────────────────────
@@ -1130,7 +1415,33 @@ def process_settlements(): # CHANGED: Default to 4
     print(f"[SETT] pulled {len(reports)} reports")
     for i, rpt in enumerate(reports):
         rpt_id = rpt["reportId"]
-        first_pass = not frappe.db.exists("Journal Entry", {"cheque_no": rpt_id, "docstatus": 1})
+        submitted_je = frappe.db.get_value(
+            "Journal Entry", {"cheque_no": rpt_id, "docstatus": 1}, "name", order_by="creation asc"
+        )
+        draft_je = frappe.db.get_value(
+            "Journal Entry", {"cheque_no": rpt_id, "docstatus": 0}, "name", order_by="creation asc"
+        )
+
+        # Never build a second first-pass JE while an earlier draft for this exact report exists.
+        # Re-enqueue the draft instead; finalize_and_submit_settlement_je is itself idempotent.
+        if draft_je and not submitted_je:
+            queued = _enqueue_settlement_finalize(draft_je)
+            print(
+                f"[SETT] {rpt_id} already has draft {draft_je}; "
+                f"{'re-enqueued finalize' if queued else 'finalize already queued/running'}"
+            )
+            continue
+
+        if draft_je and submitted_je:
+            frappe.log_error(
+                title="Amazon Settlement Duplicate Draft Manual Review",
+                message=(
+                    f"Settlement {rpt_id} already has submitted JE {submitted_je} but also draft JE {draft_je}. "
+                    "The draft will not be submitted automatically; review/cancel it manually."
+                ),
+            )
+
+        first_pass = not bool(submitted_je)
         try:
             rows = fetch_settlement_rows(repo.amz_setting, rpt)
            
@@ -1157,14 +1468,7 @@ def process_settlements(): # CHANGED: Default to 4
            
             _insert_draft()
            
-            # Queue the finalize job (idempotent via internal checks)
-            from frappe.utils.background_jobs import enqueue
-            enqueue(
-                "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.finalize_and_submit_settlement_je",
-                queue="long" if len(je.accounts) > 200 else "default",
-                timeout=3600 if len(je.accounts) > 200 else 300,
-                je_name=je.name
-            )
+            _enqueue_settlement_finalize(je.name, len(je.accounts))
             print(f"[SETT] {rpt_id} ➜ {je.name} (draft inserted; finalize/submit queued)")
            
         except Exception:
@@ -1411,6 +1715,136 @@ def run_daily_settlement_sync():
     setting = frappe.get_single("Amazon SP API Settings")
     process_settlements()
 
+def _clear_je_invoice_reference(row):
+    """Detach a stale Sales Invoice/Credit Note reference but preserve the accounting amount."""
+    row.reference_type = None
+    row.reference_name = None
+    if hasattr(row, "reference_due_date"):
+        row.reference_due_date = None
+    if hasattr(row, "reference_detail_no"):
+        row.reference_detail_no = None
+
+
+def _append_unreferenced_residual(je, source_row, amount_field: str, amount: float):
+    """Clone a JE account row as an unreferenced residual while preserving dimensions/metadata."""
+    if flt(amount) < 0.01:
+        return None
+
+    excluded = {
+        "name", "parent", "parentfield", "parenttype", "doctype", "docstatus", "idx",
+        "reference_type", "reference_name", "reference_due_date", "reference_detail_no",
+        "advance_voucher_type", "advance_voucher_no",
+        "debit", "credit", "debit_in_account_currency", "credit_in_account_currency",
+    }
+    values = {}
+    for fieldname in frappe.get_meta("Journal Entry Account").get_fieldnames_with_value():
+        if fieldname in excluded:
+            continue
+        value = source_row.get(fieldname)
+        if value is not None:
+            values[fieldname] = value
+
+    values.update({
+        "reference_type": None,
+        "reference_name": None,
+        "debit_in_account_currency": 0,
+        "credit_in_account_currency": 0,
+        amount_field: flt(amount),
+    })
+    return je.append("accounts", values)
+
+
+def _revalidate_draft_settlement_allocations(je) -> bool:
+    """
+    Re-read every referenced Sales Invoice/Credit Note immediately before submit.
+
+    Settlement JEs are inserted as drafts and submitted later by a queued worker. Another
+    settlement/payment can therefore change an invoice's outstanding amount after build_je()
+    bounded the allocation. Lock referenced invoices, cap each draft reference to the live
+    outstanding amount, and move any excess to an unreferenced row for the same party/account.
+    """
+    referenced_names = sorted({
+        row.reference_name
+        for row in je.accounts
+        if row.reference_type == "Sales Invoice" and row.reference_name
+    })
+    if not referenced_names:
+        return False
+
+    # Serialize outstanding changes with other accounting transactions touching these invoices.
+    for invoice_name in referenced_names:
+        frappe.db.sql(
+            "SELECT name FROM `tabSales Invoice` WHERE name=%s FOR UPDATE",
+            (invoice_name,),
+        )
+
+    remaining_by_invoice = {}
+    changed = False
+
+    for row in list(je.accounts):
+        if row.reference_type != "Sales Invoice" or not row.reference_name:
+            continue
+
+        invoice_name = row.reference_name
+        inv = get_invoice_receivable_context(invoice_name)
+        reason = None
+        if not inv or inv.docstatus != 1:
+            reason = "invoice is missing, cancelled, or no longer submitted"
+        elif row.party != inv.customer or row.account != inv.debit_to:
+            reason = "party/account no longer matches the referenced invoice"
+        elif (inv.currency or "").upper() != (inv.account_currency or "").upper():
+            reason = (
+                f"invoice currency {inv.currency} differs from receivable account currency "
+                f"{inv.account_currency}; automatic settlement allocation is unsafe"
+            )
+
+        is_return = bool(inv and cint(inv.is_return))
+        amount_field = "debit_in_account_currency" if is_return else "credit_in_account_currency"
+        opposite_field = "credit_in_account_currency" if is_return else "debit_in_account_currency"
+        row_amount = flt(row.get(amount_field))
+
+        if not reason and (row_amount <= 0 or flt(row.get(opposite_field)) > 0):
+            reason = "reference direction is invalid for the invoice/credit-note type"
+
+        if reason:
+            _clear_je_invoice_reference(row)
+            changed = True
+            print(f"[SETT] Detached stale reference {invoice_name} from {je.name}: {reason}")
+            continue
+
+        if invoice_name not in remaining_by_invoice:
+            outstanding = flt(inv.outstanding_amount)
+            remaining_by_invoice[invoice_name] = (
+                abs(outstanding) if is_return and outstanding < 0 else max(outstanding, 0)
+            )
+
+        available_outstanding = remaining_by_invoice[invoice_name]
+        allowed = min(row_amount, available_outstanding)
+        remaining_by_invoice[invoice_name] = max(available_outstanding - allowed, 0)
+
+        if allowed + 0.000001 >= row_amount:
+            continue
+
+        residual = round(row_amount - allowed, 9)
+        if allowed < 0.01:
+            # The invoice was paid/closed after this JE was drafted. Keep the entire amount
+            # as an unreferenced customer line rather than failing submission or overpaying.
+            _clear_je_invoice_reference(row)
+        else:
+            row.set(amount_field, allowed)
+            _append_unreferenced_residual(je, row, amount_field, residual)
+
+        changed = True
+        print(
+            f"[SETT] Revalidated {je.name} -> {invoice_name}: live outstanding={available_outstanding}, "
+            f"referenced={allowed}, residual_unreferenced={residual}"
+        )
+
+    if changed:
+        _flag_unallocated_as_advance(je)
+    return changed
+
+
 def finalize_and_submit_settlement_je(je_name: str):
     """
     Queued job: Acquires lock, adds rounding if needed, saves, submits.
@@ -1430,11 +1864,29 @@ def finalize_and_submit_settlement_je(je_name: str):
         return
 
     # Acquire lock and proceed (retry on lock error)
-    @_retry_locked()  # Assume this decorator exists; retries on DocumentLockedError
+    @_retry_locked()  # Retries Frappe document-lock conflicts
     def _finalize_and_submit():
-        je = frappe.get_doc("Journal Entry", je_name)  # Fresh reload under lock
+        # The queued finalize worker is a different DB session from process_settlements().
+        # Set the lock wait timeout here before taking potentially hundreds of invoice locks.
+        frappe.db.sql("SET SESSION innodb_lock_wait_timeout = 300;")
 
-        # Compute base difference post-validation
+        # Serialize duplicate finalize jobs for the same settlement JE. Keep this DB lock
+        # until the final submit commit; do not commit between revalidation and submit.
+        frappe.db.sql(
+            "SELECT name FROM `tabJournal Entry` WHERE name=%s FOR UPDATE",
+            (je_name,),
+        )
+        je = frappe.get_doc("Journal Entry", je_name)
+        if je.docstatus != 0:
+            print(f"[SETT] JE {je_name} no longer draft (docstatus={je.docstatus}); skipping")
+            return
+
+        # Close the draft->submit race: lock each referenced invoice and cap allocations
+        # against the live outstanding immediately before submission.
+        if _revalidate_draft_settlement_allocations(je):
+            je.save(ignore_permissions=True)
+
+        # Compute base difference after any allocation split/detach and validation.
         total_debit = sum(flt(row.debit) for row in je.accounts)
         total_credit = sum(flt(row.credit) for row in je.accounts)
         difference = total_debit - total_credit
@@ -1483,51 +1935,356 @@ def finalize_and_submit_settlement_je(je_name: str):
                 je.accounts.remove(rounding_line)
                 print(f"[SETT] Skipped tiny rounding ({difference:.2e}) for {je_name} as it rounds to zero")
             else:
-                # Save under lock
+                # Save while retaining the transaction/row locks until submit.
                 je.save(ignore_permissions=True)
-                frappe.db.commit()
                 print(f"[SETT] Added/Adjusted rounding for difference {difference} in {je_name}")
         else:
             print(f"[SETT] Skipped negligible difference ({difference:.2e}) below threshold {threshold:.2e} for {je_name}")
 
-        # Submit under lock
-        je.submit()
+        # Submit inline while the Journal Entry + Sales Invoice row locks are still held.
+        # JournalEntry.submit() may queue itself when there are >100 account rows in ERPNext v15,
+        # which would release these locks before the real submit. _submit() performs the submit now.
+        je._submit()
         frappe.db.commit()
         print(f"[SETT] Submitted JE {je_name}")
 
     _finalize_and_submit()
 
+def _is_retryable_lock_error(exc: Exception) -> bool:
+    """Recognize Frappe locks plus MariaDB/MySQL lock-wait/deadlock OperationalErrors."""
+    if isinstance(exc, frappe.exceptions.DocumentLockedError):
+        return True
+    code = exc.args[0] if getattr(exc, "args", None) else None
+    if code in (1205, 1213):  # lock wait timeout / deadlock
+        return True
+    msg = str(exc).lower()
+    return (
+        "lock wait timeout" in msg
+        or "deadlock found" in msg
+        or "try restarting transaction" in msg
+    )
+
 def _retry_locked(tries=12, delay=2.0):
     def decorator(fn):
         def wrapper(*args, **kwargs):
-            import time
-            import frappe  # Ensure frappe is imported here (or move to top if needed)
             current_delay = delay
             for attempt in range(tries):
                 try:
                     return fn(*args, **kwargs)
-                except frappe.exceptions.DocumentLockedError:
-                    print(f"[SETT] Document locked on attempt {attempt+1}; retrying after {current_delay}s")
+                except Exception as exc:
+                    if not _is_retryable_lock_error(exc):
+                        raise
+                    # Release any locks/state from the failed transaction before retrying.
+                    frappe.db.rollback()
+                    print(
+                        f"[SETT] DB lock/deadlock on attempt {attempt+1}; "
+                        f"retrying after {current_delay}s: {exc}"
+                    )
                     time.sleep(current_delay)
                     current_delay = min(current_delay * 1.5, 15.0)
-            # Final attempt (raise if fails)
             return fn(*args, **kwargs)
         return wrapper
     return decorator
+
+def _reconcile_submitted_journal_line(
+    je_name: str,
+    line_name: str,
+    against_voucher_type: str,
+    against_voucher: str,
+    allocated_amount: float,
+) -> bool:
+    """Use ERPNext's reconciliation engine instead of mutating a submitted JE row directly."""
+    line = frappe.db.get_value(
+        "Journal Entry Account",
+        line_name,
+        [
+            "account", "party_type", "party", "exchange_rate", "is_advance",
+            "debit_in_account_currency", "credit_in_account_currency",
+        ],
+        as_dict=True,
+    )
+    if not line:
+        return False
+
+    if flt(line.credit_in_account_currency) > 0:
+        dr_or_cr = "credit_in_account_currency"
+        available = flt(line.credit_in_account_currency)
+    elif flt(line.debit_in_account_currency) > 0:
+        dr_or_cr = "debit_in_account_currency"
+        available = flt(line.debit_in_account_currency)
+    else:
+        return False
+
+    apply = min(flt(allocated_amount), available)
+    if apply < 0.01:
+        return False
+
+    args = frappe._dict({
+        "voucher_type": "Journal Entry",
+        "voucher_no": je_name,
+        "voucher_detail_no": line_name,
+        "against_voucher_type": against_voucher_type,
+        "against_voucher": against_voucher,
+        "account": line.account,
+        "exchange_rate": flt(line.exchange_rate) or 1,
+        "party_type": line.party_type,
+        "party": line.party,
+        "is_advance": line.is_advance,
+        "dr_or_cr": dr_or_cr,
+        "unreconciled_amount": available,
+        "unadjusted_amount": available,
+        "allocated_amount": apply,
+        "difference_amount": 0,
+    })
+
+    try:
+        reconcile_against_document([args])
+        frappe.db.commit()
+        return True
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(
+            title=f"Amazon Settlement Reconciliation {je_name} -> {against_voucher}"[:140],
+            message=frappe.get_traceback(),
+        )
+        return False
+    finally:
+        # reconcile_against_document sets this flag and only clears it on success.
+        frappe.flags.ignore_party_validation = False
+
+def _reclass_cheque_no(rpt_id: str, order_id: str) -> str:
+    """Current deterministic cheque_no for one receivable reclassification per report+order."""
+    return f"{rpt_id}-AR-{hashlib.sha1(order_id.encode()).hexdigest()[:10]}"
+
+def _legacy_reclass_cheque_no(rpt_id: str, order_id: str) -> str:
+    """Backward-compatible ID used by the earlier FBM-specific patch."""
+    return f"{rpt_id}-FBM-{hashlib.sha1(order_id.encode()).hexdigest()[:10]}"
+
+def _prefetch_reclassification_index(rpt_id: str) -> dict[str, frappe._dict]:
+    """Fetch current and legacy reclassification JEs once per settlement report."""
+    rows = frappe.db.sql(
+        """
+        SELECT name, cheque_no, docstatus
+        FROM `tabJournal Entry`
+        WHERE docstatus != 2
+          AND (cheque_no LIKE %s OR cheque_no LIKE %s)
+        """,
+        (f"{rpt_id}-AR-%", f"{rpt_id}-FBM-%"),
+        as_dict=True,
+    )
+    return {row.cheque_no: row for row in rows}
+
+def _existing_reclassification(
+    rpt_id: str, order_id: str, reclass_index: dict[str, frappe._dict] | None = None
+) -> frappe._dict:
+    """Return either the current -AR- JE or a legacy -FBM- JE, preferring the current key."""
+    refs = (_reclass_cheque_no(rpt_id, order_id), _legacy_reclass_cheque_no(rpt_id, order_id))
+    if reclass_index is not None:
+        for ref in refs:
+            if ref in reclass_index:
+                return reclass_index[ref]
+        return frappe._dict()
+    row = frappe.db.get_value(
+        "Journal Entry",
+        {"cheque_no": ["in", list(refs)], "docstatus": ["!=", 2]},
+        ["name", "cheque_no", "docstatus"],
+        as_dict=True,
+        order_by="creation asc",
+    )
+    return row or frappe._dict()
+
+def _finish_pending_reclassification(
+    rpt_id: str, je_name: str, order_id: str, reclass_index: dict[str, frappe._dict] | None = None
+) -> bool:
+    """
+    Recover from a crash between reclassification-JE submission and reconciliation.
+
+    The reclassification JE already closed the invoice, so the normal late-sales loop
+    skips the order on the next run and would never retry. Detect the submitted
+    reclassification JE plus a still-unreferenced settlement credit and finish the job.
+    """
+    reclass_row = _existing_reclassification(rpt_id, order_id, reclass_index)
+    if not reclass_row or cint(reclass_row.docstatus) != 1:
+        return False
+    reclass_name = reclass_row.name
+
+    line = frappe.db.get_value(
+        "Journal Entry Account",
+        {
+            "parent": je_name,
+            "amazon_order_id": order_id,
+            "credit_in_account_currency": [">", 0],
+            "reference_type": ["is", "not set"],
+        },
+        ["name", "account", "party", "credit_in_account_currency"],
+        as_dict=True,
+    )
+    if not line:
+        return False
+
+    # Only consume as much as the reclassification JE actually took from this account/party.
+    reclass_debit = flt(frappe.db.get_value(
+        "Journal Entry Account",
+        {
+            "parent": reclass_name,
+            "account": line.account,
+            "party": line.party,
+            "debit_in_account_currency": [">", 0],
+            "reference_type": ["is", "not set"],
+        },
+        "debit_in_account_currency",
+    ))
+    apply = min(flt(line.credit_in_account_currency), reclass_debit)
+    if apply < 0.01:
+        return False
+
+    print(f"[SETT] Resuming reconciliation of {je_name} -> {reclass_name} for {order_id}")
+    return _reconcile_submitted_journal_line(je_name, line.name, "Journal Entry", reclass_name, apply)
+
+def _reclassify_legacy_receivable_mismatch_sale(
+    rpt_id: str,
+    settlement_je: str,
+    settlement_line: frappe._dict,
+    si_name: str,
+    order_id: str,
+    apply: float,
+    post_dt: str,
+    marketplace_name: str,
+    merchant_order_id: str,
+    fulfillment_channel: str,
+    reclass_index: dict[str, frappe._dict] | None = None,
+) -> bool:
+    """
+    Repair a legacy settlement whose receivable party/account does not match the Sales Invoice.
+
+    A new JE debits the old settlement customer and credits the real FBM invoice.
+    The original settlement credit is then reconciled against the new JE's debit
+    using ERPNext's reconciliation engine. This preserves the submitted settlement
+    history while moving the receivable to the correct customer with a clear audit trail.
+    """
+    si = get_invoice_receivable_context(si_name)
+    if not si or si.docstatus != 1:
+        return False
+
+    company = frappe.db.get_value("Journal Entry", settlement_je, "company")
+    company_currency = (frappe.get_cached_value("Company", company, "default_currency") or "").upper()
+    source_currency = _get_account_currency(settlement_line.account, company)
+    target_currency = _get_account_currency(si.debit_to, company)
+    if source_currency != target_currency:
+        frappe.log_error(
+            title="Amazon Settlement AR Reclassification Manual Review",
+            message=(
+                f"Cannot auto-reclassify Amazon order {order_id}: source AR currency {source_currency} "
+                f"!= target AR currency {target_currency}. Settlement JE={settlement_je}, SI={si_name}."
+            ),
+        )
+        return False
+
+    # A foreign-currency AR reclassification carries an FX difference between the
+    # settlement rate and the invoice's conversion_rate that this JE cannot book to
+    # exchange gain/loss. Refuse it rather than leave an unexplained company-currency
+    # residual in the receivable account.
+    if (
+        source_currency != company_currency
+        and abs(flt(settlement_line.exchange_rate) - flt(si.conversion_rate)) > 0.000001
+    ):
+        frappe.log_error(
+            title="Amazon Settlement AR Reclassification Manual Review",
+            message=(
+                f"Cannot auto-reclassify Amazon order {order_id}: settlement rate "
+                f"{settlement_line.exchange_rate} != invoice conversion_rate {si.conversion_rate} on a "
+                f"{source_currency} receivable. Use Payment Reconciliation so ERPNext books exchange gain/loss. "
+                f"Settlement JE={settlement_je}, SI={si_name}."
+            ),
+        )
+        return False
+
+    reclass_ref = _reclass_cheque_no(rpt_id, order_id)
+    existing_reclass = _existing_reclassification(rpt_id, order_id, reclass_index)
+    reclass_name = existing_reclass.name if existing_reclass else None
+    if existing_reclass and cint(existing_reclass.docstatus) == 0:
+        # A previous current or legacy run left a draft behind; never create a second one.
+        frappe.log_error(
+            title="Amazon Settlement AR Reclassification Manual Review",
+            message=(
+                f"Draft reclassification JE {reclass_name} exists for {existing_reclass.cheque_no}; "
+                "submit or delete it before retrying."
+            ),
+        )
+        return False
+
+    if not reclass_name:
+        rate = flt(settlement_line.exchange_rate) or 1
+        source_line = {
+            "account": settlement_line.account,
+            "party_type": "Customer",
+            "party": settlement_line.party,
+            "exchange_rate": rate,
+            "debit_in_account_currency": apply,
+            "amazon_order_id": order_id,
+            "user_remark": "Reclassify legacy Amazon settlement from mismatched receivable party/account",
+        }
+        target_line = {
+            "account": si.debit_to,
+            "party_type": "Customer",
+            "party": si.customer,
+            "exchange_rate": rate,
+            "credit_in_account_currency": apply,
+            "reference_type": "Sales Invoice",
+            "reference_name": si_name,
+            "amazon_order_id": order_id,
+        }
+        stamp_marketplace_fields(
+            target_line, {}, marketplace_name, merchant_order_id,
+            fulfillment_channel, is_refund=False,
+        )
+        # The legacy case is "settlement arrived before the invoice", so post_dt is often
+        # earlier than the SI. Posting before the invoice date can also land in a closed
+        # accounting period; never post the repair earlier than the document it repairs.
+        reclass_dt = max(getdate(post_dt), getdate(si.posting_date)).strftime("%Y-%m-%d")
+        reclass = frappe.get_doc({
+            "doctype": "Journal Entry",
+            "voucher_type": "Journal Entry",
+            "company": company,
+            "posting_date": reclass_dt,
+            "cheque_no": reclass_ref,
+            "cheque_date": reclass_dt,
+            "multi_currency": 1 if source_currency != company_currency else 0,
+            "accounts": [source_line, target_line],
+            "user_remark": f"Amazon settlement receivable reclassification for {order_id}; source settlement {settlement_je}",
+        })
+        try:
+            reclass.insert(ignore_permissions=True)
+            reclass.submit()
+            frappe.db.commit()
+            reclass_name = reclass.name
+            if reclass_index is not None:
+                reclass_index[reclass_ref] = frappe._dict(name=reclass_name, cheque_no=reclass_ref, docstatus=1)
+            print(f"[SETT] Reclassified legacy Amazon settlement {order_id}: {settlement_je} -> {reclass_name} -> {si_name}")
+        except Exception:
+            frappe.db.rollback()
+            frappe.log_error(
+                title=f"Amazon Settlement AR Reclassification {order_id}"[:140],
+                message=frappe.get_traceback(),
+            )
+            return False
+
+    # Consume the original unallocated settlement credit against the reclassification JE.
+    return _reconcile_submitted_journal_line(
+        settlement_je, settlement_line.name, "Journal Entry", reclass_name, apply
+    )
 
 def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, order_groups: dict, settlement_ccy: str, post_dt: str):
     je_name = frappe.db.get_value("Journal Entry", {"cheque_no": rpt_id, "docstatus": 1}, "name")
     if not je_name:
         print(f"[SETT] No submitted first-pass JE for {rpt_id}; skipping allocation")
         return
-    debtors_account = get_debtors_account(repo.amz_setting, settlement_ccy)
-    customer = get_currency_accounts_map(repo.amz_setting)[settlement_ccy]["customer"]
-    # CHANGE: Split into separate sales and refund loops (mirrors build_je change).
-    # - Compute separate sales_totals and refund_totals (positive magnitudes) from order_groups (as in build_je).
-    # - Sales: Allocate late credits to open SIs.
-    # - Refunds: Create CN if needed, allocate late debits to open CNs (new or existing).
-    # - Reasoning: Handles late allocations without netting; ensures late SIs get paid and CNs get allocated separately.
-    # - Edge cases: Partial allocations (min of net_to_apply and outstanding); no SI/CN (skip, leave as advance); concurrent changes (db.rollback on error); large refunds (may create CN and allocate residual to existing open CNs).
+
+    # One Journal Entry scan per report rather than one cheque_no lookup per order.
+    # Include the earlier -FBM- prefix so a prior deployment cannot create a duplicate
+    # -AR- reclassification for the same report/order.
+    reclass_index = _prefetch_reclassification_index(rpt_id)
+
     SALES_TYPES = {"order", "order_retrocharge"}
     REFUND_TYPES = {"refund"}
     sales_totals = {}
@@ -1539,127 +2296,154 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
             sales_totals[order_id] = sales_total
         if abs(refund_total) >= 0.01:
             refund_totals[order_id] = refund_total
-    # Sales allocation loop
+
+    # Late sales: use ERPNext reconciliation if party/account already match.
+    # Historical receivable party/account mismatches are repaired with a reclassification JE.
     for order_id, sales_total_native in sales_totals.items():
-        if abs(sales_total_native) < 0.01:
+        if sales_total_native < 0.01:
+            # A net-negative order/retrocharge is not a payment against an open SI. It was
+            # intentionally booked as an unreferenced debit on first pass.
             continue
-        # Compute already_applied from this JE's lines (positive sum for credits)
-        already_applied = flt(frappe.db.sql("""
-            SELECT SUM(credit_in_account_currency) - SUM(debit_in_account_currency)
-            FROM `tabJournal Entry Account`
-            WHERE parent = %s AND amazon_order_id = %s AND reference_type = 'Sales Invoice'
-        """, (je_name, order_id))[0][0] or 0.0)
-        net_to_apply = sales_total_native - already_applied
-        if net_to_apply < 0.01:
+        # Resume a reclassification that was submitted but never reconciled. Must run
+        # before the open-invoice check, because that JE already closed the invoice.
+        if _finish_pending_reclassification(rpt_id, je_name, order_id, reclass_index):
             continue
-        # Fetch metadata
-        marketplace_name = merchant_order_id = ""
-        if order_groups.get(order_id):
-            first_row = order_groups[order_id][0]
-            marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
-            merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
-        si_name = get_sales_invoice(order_id)
-        if not si_name:
+
+        si_name = get_open_sales_invoice(order_id)
+        if not si_name or is_already_referenced_by_report(rpt_id, si_name):
             continue
-        if is_already_referenced_by_report(rpt_id, si_name):
+
+        si = get_invoice_receivable_context(si_name)
+        if not si or si.docstatus != 1:
             continue
-        outstanding = flt(frappe.db.get_value("Sales Invoice", si_name, "outstanding_amount"))
-        apply = min(net_to_apply, outstanding)
+        if (
+            (si.currency or "").upper() != (settlement_ccy or "").upper()
+            or (si.account_currency or "").upper() != (settlement_ccy or "").upper()
+        ):
+            frappe.log_error(
+                title="Amazon Settlement Late Allocation Manual Review",
+                message=(
+                    f"Settlement {rpt_id} ({settlement_ccy}) cannot be allocated to Sales Invoice "
+                    f"{si_name} for Amazon order {order_id}: invoice currency={si.currency}, "
+                    f"receivable account currency={si.account_currency}."
+                ),
+            )
+            continue
+        outstanding = max(flt(si.outstanding_amount), 0)
+        if outstanding < 0.01:
+            continue
+
+        line = frappe.db.get_value(
+            "Journal Entry Account",
+            {
+                "parent": je_name,
+                "amazon_order_id": order_id,
+                "credit_in_account_currency": [">", 0],
+                "reference_type": ["is", "not set"],
+            },
+            ["name", "account", "party_type", "party", "exchange_rate", "credit_in_account_currency"],
+            as_dict=True,
+        )
+        if not line:
+            continue
+
+        apply = min(sales_total_native, outstanding, flt(line.credit_in_account_currency))
         if apply < 0.01:
             continue
-        # Find unreferenced AR credit line in JE
-        line_name = frappe.db.get_value("Journal Entry Account", {
-            "parent": je_name, "amazon_order_id": order_id, "credit_in_account_currency": [">", 0],
-            "reference_type": None
-        }, "name")
-        if not line_name:
-            continue
-        # Allocate by updating line (atomic)
-        try:
-            frappe.db.set_value("Journal Entry Account", line_name, {
-                "reference_type": "Sales Invoice",
-                "reference_name": si_name
-            })
-            frappe.db.commit()
-            #print(f"[SETT] Allocated {apply:.2f} from {rpt_id} to late SI {si_name} for {order_id}")
-        except Exception as e:
-            frappe.db.rollback()
-            frappe.log_error(f"Failed to update JE line {line_name} for late SI {si_name} (order {order_id}) in {rpt_id}: {frappe.get_traceback()}", "Amazon Settlement Late Allocation")
-    # Refund allocation loop
-    for order_id, refund_total_native in refund_totals.items():
-        if abs(refund_total_native) < 0.01:
-            continue
-        # Compute already_applied (positive sum for debits)
-        already_applied = flt(frappe.db.sql("""
-            SELECT SUM(debit_in_account_currency) - SUM(credit_in_account_currency)
-            FROM `tabJournal Entry Account`
-            WHERE parent = %s AND amazon_order_id = %s AND reference_type = 'Sales Invoice'
-        """, (je_name, order_id))[0][0] or 0.0)
-        refund_to_apply = refund_total_native - already_applied
-        if refund_to_apply < 0.01:
-            continue
-        # Fetch metadata
-        marketplace_name = merchant_order_id = ""
-        if order_groups.get(order_id):
-            first_row = order_groups[order_id][0]
-            marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
-            merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
-        si_name = get_sales_invoice(order_id)
-        # CHANGE: Filter to refund_rows for CN creation.
+
         order_rows = order_groups.get(order_id, [])
-        refund_rows = [r for r in order_rows if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES]
-        # Create CN if needed and SI exists
-        if si_name and refund_rows:
-            cn_name = create_credit_note_for_refund(repo.amz_setting, si_name, refund_to_apply, post_dt, order_id, marketplace_name, merchant_order_id, refund_rows, rpt_id)  # Add rpt_id
-            if cn_name:
-                # Allocate to new CN
-                if not is_already_referenced_by_report(rpt_id, cn_name):
-                    outstanding = abs(flt(frappe.db.get_value("Sales Invoice", cn_name, "outstanding_amount")))
-                    apply = min(refund_to_apply, outstanding)
-                    if apply > 0.01:
-                        line_name = frappe.db.get_value("Journal Entry Account", {
-                            "parent": je_name, "amazon_order_id": order_id, "debit_in_account_currency": [">", 0],
-                            "reference_type": None
-                        }, "name")
-                        if line_name:
-                            try:
-                                frappe.db.set_value("Journal Entry Account", line_name, {
-                                    "reference_type": "Sales Invoice",
-                                    "reference_name": cn_name
-                                })
-                                frappe.db.commit()
-                                #print(f"[SETT] Allocated {apply:.2f} from {rpt_id} to new CN {cn_name} for {order_id}")
-                            except Exception as e:
-                                frappe.db.rollback()
-                                frappe.log_error(f"Failed to update JE line {line_name} for new CN {cn_name} (order {order_id}) in {rpt_id}: {frappe.get_traceback()}", "Amazon Settlement Late Allocation")
-                            refund_to_apply -= apply
-                            if refund_to_apply < 0.01:
-                                continue
-        # Allocate residual to existing open CNs
-        cns = get_open_credit_notes_for_order(order_id)
-        for cn in cns:
-            if is_already_referenced_by_report(rpt_id, cn):
+        first_row = order_rows[0] if order_rows else {}
+        marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
+        merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
+        fulfillment_channel = (get_sales_order_context(order_id).fulfillment_channel or "").upper()
+
+        if line.party == si.customer and line.account == si.debit_to:
+            _reconcile_submitted_journal_line(je_name, line.name, "Sales Invoice", si_name, apply)
+        else:
+            _reclassify_legacy_receivable_mismatch_sale(
+                rpt_id, je_name, line, si_name, order_id, apply, post_dt,
+                marketplace_name, merchant_order_id, fulfillment_channel, reclass_index,
+            )
+
+    # Late refunds: the Credit Note must still be created (it is the revenue reversal and
+    # is idempotent per report), but the submitted JE row is never rewritten with
+    # frappe.db.set_value(). Allocation goes through ERPNext's reconciliation engine when
+    # the settlement row already carries the right party/account, and is surfaced for
+    # manual Payment Reconciliation otherwise.
+    for order_id, refund_total_native in refund_totals.items():
+        if refund_total_native < 0.01:
+            continue
+
+        order_rows = order_groups.get(order_id, [])
+        first_row = order_rows[0] if order_rows else {}
+        marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
+        merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
+        refund_rows = [
+            r for r in order_rows
+            if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES
+        ]
+
+        source_si = get_sales_invoice(order_id)
+        if source_si and refund_rows:
+            create_credit_note_for_refund(
+                repo.amz_setting, source_si, refund_total_native, post_dt, order_id,
+                marketplace_name, merchant_order_id, refund_rows, rpt_id
+            )
+
+        for cn_name in get_open_credit_notes_for_order(order_id):
+            if is_already_referenced_by_report(rpt_id, cn_name):
                 continue
-            outstanding = abs(flt(frappe.db.get_value("Sales Invoice", cn, "outstanding_amount")))
-            apply = min(refund_to_apply, outstanding)
+            cn = get_invoice_receivable_context(cn_name)
+            if not cn or cn.docstatus != 1:
+                continue
+            if (
+                (cn.currency or "").upper() != (settlement_ccy or "").upper()
+                or (cn.account_currency or "").upper() != (settlement_ccy or "").upper()
+            ):
+                frappe.log_error(
+                    title="Amazon Settlement Late Refund Manual Review",
+                    message=(
+                        f"Settlement {rpt_id} ({settlement_ccy}) cannot be allocated to Credit Note "
+                        f"{cn_name} for Amazon order {order_id}: document currency={cn.currency}, "
+                        f"receivable account currency={cn.account_currency}."
+                    ),
+                )
+                continue
+            outstanding = abs(flt(cn.outstanding_amount))
+            if outstanding < 0.01:
+                continue
+
+            line = frappe.db.get_value(
+                "Journal Entry Account",
+                {
+                    "parent": je_name,
+                    "amazon_order_id": order_id,
+                    "debit_in_account_currency": [">", 0],
+                    "reference_type": ["is", "not set"],
+                },
+                ["name", "account", "party", "debit_in_account_currency"],
+                as_dict=True,
+            )
+            if not line:
+                break
+
+            apply = min(refund_total_native, outstanding, flt(line.debit_in_account_currency))
             if apply < 0.01:
-                continue
-            line_name = frappe.db.get_value("Journal Entry Account", {
-                "parent": je_name, "amazon_order_id": order_id, "debit_in_account_currency": [">", 0],
-                "reference_type": None
-            }, "name")
-            if not line_name:
-                continue
-            try:
-                frappe.db.set_value("Journal Entry Account", line_name, {
-                    "reference_type": "Sales Invoice",
-                    "reference_name": cn
-                })
-                frappe.db.commit()
-                #print(f"[SETT] Allocated {apply:.2f} from {rpt_id} to existing CN {cn} for {order_id}")
-            except Exception as e:
-                frappe.db.rollback()
-                frappe.log_error(f"Failed to update JE line {line_name} for existing CN {cn} (order {order_id}) in {rpt_id}: {frappe.get_traceback()}", "Amazon Settlement Late Allocation")
-            refund_to_apply -= apply
-            if refund_to_apply < 0.01:
+                break
+
+            if line.party == cn.customer and line.account == cn.debit_to:
+                _reconcile_submitted_journal_line(je_name, line.name, "Sales Invoice", cn_name, apply)
+            else:
+                # Legacy row booked to the FBA customer. A reclassification would have to
+                # move a debit, which is the mirror of the sales case; leave it to a human.
+                frappe.log_error(
+                    title="Amazon Settlement Late Refund Manual Review",
+                    message=(
+                        f"Settlement {rpt_id} row {line.name} is booked to {line.party}/{line.account} but "
+                        f"Credit Note {cn_name} belongs to {cn.customer}/{cn.debit_to} (Amazon order {order_id}, "
+                        f"amount {apply}). Reconcile manually; the settlement job will not mutate submitted rows."
+                    ),
+                )
+            refund_total_native = round(refund_total_native - apply, 2)
+            if refund_total_native < 0.01:
                 break
