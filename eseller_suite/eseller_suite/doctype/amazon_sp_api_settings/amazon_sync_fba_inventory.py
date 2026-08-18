@@ -46,6 +46,7 @@ def parse_marketplaces(mkt_str: str) -> list[str]:
 
 MYI_ALL_REPORT_TYPE = "GET_FBA_MYI_ALL_INVENTORY_DATA"
 MYI_REPORT_LOOKBACK_HOURS = 2
+MYI_US_MARKETPLACE_ID = "ATVPDKIKX0DER"
 
 
 def _sp_response_data(response):
@@ -155,15 +156,12 @@ def _sp_post_existing(path, body, settings, max_retry: int = 10):
 
 
 def request_manage_inventory_report(settings, marketplace_ids):
-    """Request one fresh MYI ALL report; do not poll, download, or persist its ID."""
-    if not marketplace_ids:
-        raise RuntimeError("No marketplace IDs configured for MYI ALL report request")
-
+    """Request one fresh US MYI ALL report; do not poll, download, or persist its ID."""
     response = _sp_post_existing(
         "/reports/2021-06-30/reports",
         {
             "reportType": MYI_ALL_REPORT_TYPE,
-            "marketplaceIds": list(marketplace_ids),
+            "marketplaceIds": [MYI_US_MARKETPLACE_ID],
         },
         settings,
     )
@@ -171,7 +169,10 @@ def request_manage_inventory_report(settings, marketplace_ids):
     if not report_id:
         raise RuntimeError("Amazon createReport response did not include reportId")
     if DEBUG:
-        print(f"[DEBUG] Requested MYI ALL report: {report_id}")
+        print(
+            f"[DEBUG] Requested MYI ALL report: {report_id} "
+            f"for US marketplace {MYI_US_MARKETPLACE_ID}"
+        )
     return report_id
 
 
@@ -205,7 +206,7 @@ def _find_recent_done_manage_inventory_report(settings, marketplace_ids):
         {
             "reportTypes": MYI_ALL_REPORT_TYPE,
             "processingStatuses": "DONE",
-            "marketplaceIds": ",".join(marketplace_ids),
+            "marketplaceIds": MYI_US_MARKETPLACE_ID,
             "createdSince": _utc_iso(cutoff),
             "pageSize": 100,
         },
