@@ -45,7 +45,7 @@ def parse_marketplaces(mkt_str: str) -> list[str]:
 
 
 MYI_ALL_REPORT_TYPE = "GET_FBA_MYI_ALL_INVENTORY_DATA"
-MYI_REPORT_LOOKBACK_HOURS = 2
+MYI_REPORT_LOOKBACK_HOURS = 48
 MYI_US_MARKETPLACE_ID = "ATVPDKIKX0DER"
 
 
@@ -195,17 +195,13 @@ def _parse_amazon_datetime(value):
         return None
 
 
-def _find_recent_done_manage_inventory_report(settings, marketplace_ids):
-    """Return the newest suitable recent DONE MYI ALL report, or None without polling."""
-    if not marketplace_ids:
-        return None
-
+def _list_recent_manage_inventory_reports(settings):
+    """Return recent MYI ALL report candidates without assuming which daily report is valid."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=MYI_REPORT_LOOKBACK_HOURS)
     response = _sp_get(
         "/reports/2021-06-30/reports",
         {
             "reportTypes": MYI_ALL_REPORT_TYPE,
-            "processingStatuses": "DONE",
             "marketplaceIds": MYI_US_MARKETPLACE_ID,
             "createdSince": _utc_iso(cutoff),
             "pageSize": 100,
@@ -214,47 +210,92 @@ def _find_recent_done_manage_inventory_report(settings, marketplace_ids):
         return_full=True,
     )
     reports = _sp_response_payload(response).get("reports") or []
-    suitable = []
+    return [report for report in reports if isinstance(report, dict)]
+
+
+def _report_candidate_summary(reports):
+    candidates = []
     for report in reports:
-        if not isinstance(report, dict):
-            continue
+        candidates.append(
+            f"{report.get('reportId', '<no-id>')}@{report.get('createdTime', '<no-time>')}"
+            f"[{report.get('processingStatus', '<no-status>')},"
+            f"doc={'yes' if report.get('reportDocumentId') else 'no'}]"
+        )
+    return ", ".join(candidates[:25]) or "<none>"
+
+
+def _select_scheduled_manage_inventory_report(reports, target_date, local_tz):
+    """Select the strict local-date 6 AM DONE report for one calendar date."""
+    scheduled = []
+    for report in reports:
         if report.get("reportType") != MYI_ALL_REPORT_TYPE:
             continue
-        if report.get("processingStatus") != "DONE":
+        created_utc = _parse_amazon_datetime(report.get("createdTime"))
+        if created_utc is None:
             continue
-        if not report.get("reportDocumentId"):
-            continue
-        created_time = _parse_amazon_datetime(report.get("createdTime"))
-        if created_time is None or created_time < cutoff:
-            continue
-        suitable.append((created_time, report))
+        created_local = created_utc.astimezone(local_tz)
+        if created_local.date() == target_date and created_local.hour == 6:
+            scheduled.append((created_local, report))
 
-    if not suitable:
-        if DEBUG:
-            print("[DEBUG] No recent completed MYI ALL report available; using API inbound only")
-        return None
+    valid = [
+        (created_local, report)
+        for created_local, report in scheduled
+        if report.get("processingStatus") == "DONE" and report.get("reportDocumentId")
+    ]
+    if not valid:
+        if not scheduled:
+            same_date = []
+            for report in reports:
+                created_utc = _parse_amazon_datetime(report.get("createdTime"))
+                if created_utc is None:
+                    continue
+                created_local = created_utc.astimezone(local_tz)
+                if created_local.date() == target_date:
+                    same_date.append(
+                        f"{report.get('reportId', '<no-id>')}@{created_local.isoformat()}"
+                        f"[{report.get('processingStatus', '<no-status>')}]"
+                    )
+            detail = ", ".join(same_date[:10]) or "<none>"
+            return None, f"missing strict 6 AM report; same-date candidates: {detail}"
 
-    suitable.sort(key=lambda item: item[0], reverse=True)
-    selected = suitable[0][1]
-    if DEBUG:
-        print(
-            f"[DEBUG] Selected MYI ALL report created at {selected.get('createdTime')} "
-            f"with status {selected.get('processingStatus')}"
+        detail = []
+        for created_local, report in scheduled:
+            reason = []
+            if report.get("processingStatus") != "DONE":
+                reason.append(f"status={report.get('processingStatus')}")
+            if not report.get("reportDocumentId"):
+                reason.append("missing reportDocumentId")
+            detail.append(
+                f"{report.get('reportId', '<no-id>')}@{created_local.isoformat()}"
+                f" ({', '.join(reason) or 'unusable'})"
+            )
+        return None, "6 AM candidate(s) unusable: " + "; ".join(detail)
+
+    six_am = datetime.combine(target_date, datetime.min.time(), tzinfo=local_tz).replace(hour=6)
+    valid.sort(
+        key=lambda item: (
+            abs((item[0] - six_am).total_seconds()),
+            -item[0].timestamp(),
+            str(item[1].get("reportId") or ""),
         )
-    return selected
+    )
+    return valid[0][1], None
 
 
-def _parse_nonnegative_report_quantity(value):
-    text = str(value or "").strip()
-    if not text:
-        return 0
+def _parse_required_nonnegative_quantity(value, field_name, asin):
+    """Parse a required Amazon quantity without turning missing/malformed data into zero."""
+    if value is None:
+        raise ValueError(f"{asin}: missing {field_name}")
+    text = str(value).strip()
+    if text == "":
+        raise ValueError(f"{asin}: blank {field_name}")
     try:
         parsed = float(text)
-        if parsed <= 0 or not parsed.is_integer():
-            return 0
-        return int(parsed)
-    except (TypeError, ValueError, OverflowError):
-        return 0
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{asin}: malformed {field_name}={value!r}") from exc
+    if parsed < 0 or not parsed.is_integer():
+        raise ValueError(f"{asin}: invalid {field_name}={value!r}")
+    return int(parsed)
 
 
 def _normalize_report_header(value):
@@ -262,6 +303,7 @@ def _normalize_report_header(value):
 
 
 def _parse_manage_inventory_report(report_bytes):
+    """Return valid raw C/S/R/F snapshots plus per-ASIN parse failures."""
     text = report_bytes.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     if not reader.fieldnames:
@@ -271,54 +313,107 @@ def _parse_manage_inventory_report(report_bytes):
     required_headers = {
         "asin",
         "condition",
+        "afn-warehouse-quantity",
         "afn-inbound-shipped-quantity",
         "afn-inbound-receiving-quantity",
+        "afn-researching-quantity",
+        "afn-fc-transfer-quantity",
     }
-    if not required_headers.issubset(set(reader.fieldnames)):
-        raise ValueError("MYI ALL report is missing required inbound columns")
+    missing_headers = sorted(required_headers - set(reader.fieldnames))
+    if missing_headers:
+        raise ValueError(
+            "MYI ALL report is missing required columns: " + ", ".join(missing_headers)
+        )
 
-    report_inbound_by_asin = defaultdict(int)
+    raw_by_asin = {}
+    invalid_asins = {}
     parsed_rows = 0
     for raw_row in reader:
-        try:
-            row = {
-                _normalize_report_header(key): str(value or "").strip()
-                for key, value in raw_row.items()
-                if key is not None
-            }
-            asin = row.get("asin", "").strip()
-            if not asin:
-                continue
-
-            condition = "".join(ch for ch in row.get("condition", "").lower() if ch.isalnum())
-            # Blank condition is accepted conservatively because MYI ALL can omit it on otherwise valid rows.
-            if condition and condition not in {"new", "newitem"}:
-                continue
-
-            shipped = _parse_nonnegative_report_quantity(row.get("afn-inbound-shipped-quantity"))
-            receiving = _parse_nonnegative_report_quantity(row.get("afn-inbound-receiving-quantity"))
-            # afn-inbound-working-quantity is intentionally never read or counted.
-            report_inbound_by_asin[asin] += shipped + receiving
-            parsed_rows += 1
-        except Exception:
-            # A malformed individual row must not abort the supplemental report parse.
+        row = {
+            _normalize_report_header(key): value
+            for key, value in raw_row.items()
+            if key is not None
+        }
+        asin = str(row.get("asin") or "").strip()
+        if not asin:
             continue
+
+        condition = "".join(
+            ch for ch in str(row.get("condition") or "").lower() if ch.isalnum()
+        )
+        # Preserve the current parser's conservative acceptance of a blank condition.
+        if condition and condition not in {"new", "newitem"}:
+            continue
+        if asin in invalid_asins:
+            continue
+
+        try:
+            quantities = {
+                "warehouse": _parse_required_nonnegative_quantity(
+                    row.get("afn-warehouse-quantity"), "afn-warehouse-quantity", asin
+                ),
+                "S": _parse_required_nonnegative_quantity(
+                    row.get("afn-inbound-shipped-quantity"),
+                    "afn-inbound-shipped-quantity",
+                    asin,
+                ),
+                "R": _parse_required_nonnegative_quantity(
+                    row.get("afn-inbound-receiving-quantity"),
+                    "afn-inbound-receiving-quantity",
+                    asin,
+                ),
+                "researching": _parse_required_nonnegative_quantity(
+                    row.get("afn-researching-quantity"),
+                    "afn-researching-quantity",
+                    asin,
+                ),
+                "F": _parse_required_nonnegative_quantity(
+                    row.get("afn-fc-transfer-quantity"),
+                    "afn-fc-transfer-quantity",
+                    asin,
+                ),
+            }
+        except ValueError as exc:
+            invalid_asins[asin] = str(exc)
+            raw_by_asin.pop(asin, None)
+            continue
+
+        aggregate = raw_by_asin.setdefault(
+            asin, {"warehouse": 0, "S": 0, "R": 0, "researching": 0, "F": 0}
+        )
+        for key, value in quantities.items():
+            aggregate[key] += value
+        parsed_rows += 1
+
+    snapshots = {}
+    for asin, aggregate in raw_by_asin.items():
+        # A negative derived Core is intentionally floored to zero. Because F is
+        # added back later, this can only bias the protected result high, which
+        # is the desired conservative failure direction.
+        core = max(
+            0,
+            aggregate["warehouse"] - aggregate["F"] - aggregate["researching"],
+        )
+        snapshots[asin] = {
+            "C": core,
+            "S": aggregate["S"],
+            "R": aggregate["R"],
+            "F": aggregate["F"],
+        }
 
     if DEBUG:
         print(
-            f"[DEBUG] Parsed {parsed_rows} MYI ALL report rows across "
-            f"{len(report_inbound_by_asin)} ASINs"
+            f"[DEBUG] Parsed {parsed_rows} MYI ALL New-condition rows into "
+            f"{len(snapshots)} valid ASIN snapshots; invalid ASINs={len(invalid_asins)}"
         )
-    return dict(report_inbound_by_asin)
+    return snapshots, invalid_asins
 
 
-def get_recent_manage_inventory_inbound(settings, marketplace_ids):
-    """Download and parse the newest recent completed MYI ALL report entirely in memory."""
-    report = _find_recent_done_manage_inventory_report(settings, marketplace_ids)
-    if not report:
-        return None
-
+def _download_manage_inventory_report(report, settings):
     report_document_id = report.get("reportDocumentId")
+    if not report_document_id:
+        raise RuntimeError("selected MYI ALL report is missing reportDocumentId")
+
     document_response = _sp_get(
         f"/reports/2021-06-30/documents/{report_document_id}",
         {},
@@ -327,7 +422,9 @@ def get_recent_manage_inventory_inbound(settings, marketplace_ids):
     )
     document = _sp_response_payload(document_response)
     if document.get("encryptionDetails"):
-        raise RuntimeError("Legacy encrypted report document is not supported by existing project context")
+        raise RuntimeError(
+            "Legacy encrypted report document is not supported by existing project context"
+        )
 
     download_url = document.get("url")
     if not download_url:
@@ -340,6 +437,529 @@ def get_recent_manage_inventory_inbound(settings, marketplace_ids):
         report_bytes = gzip.decompress(report_bytes)
 
     return _parse_manage_inventory_report(report_bytes)
+
+
+def _empty_report_source(label, expected_date):
+    return {
+        "label": label,
+        "expected_date": expected_date,
+        "available": False,
+        "report": None,
+        "snapshots": {},
+        "invalid_asins": {},
+        "error": None,
+    }
+
+
+def _load_daily_manage_inventory_sources(settings):
+    """Discover, strictly select, download, and parse today's/yesterday's raw reports."""
+    local_tz = ZoneInfo("America/Los_Angeles")
+    local_today = datetime.now(local_tz).date()
+    yesterday = local_today - timedelta(days=1)
+    today_source = _empty_report_source("TODAY", local_today)
+    yesterday_source = _empty_report_source("YESTERDAY", yesterday)
+
+    try:
+        reports = _list_recent_manage_inventory_reports(settings)
+    except Exception as exc:
+        reason = f"Reports API discovery failed ({type(exc).__name__}: {exc})"
+        today_source["error"] = reason
+        yesterday_source["error"] = reason
+        return today_source, yesterday_source, []
+
+    for source in (today_source, yesterday_source):
+        selected, selection_error = _select_scheduled_manage_inventory_report(
+            reports, source["expected_date"], local_tz
+        )
+        source["report"] = selected
+        if selection_error:
+            source["error"] = selection_error
+            continue
+        try:
+            snapshots, invalid_asins = _download_manage_inventory_report(selected, settings)
+            source["snapshots"] = snapshots
+            source["invalid_asins"] = invalid_asins
+            source["available"] = True
+        except Exception as exc:
+            source["error"] = (
+                f"report {selected.get('reportId', '<no-id>')} unusable "
+                f"({type(exc).__name__}: {exc})"
+            )
+
+    if today_source["available"] and yesterday_source["available"]:
+        today_time = _parse_amazon_datetime(today_source["report"].get("createdTime"))
+        yesterday_time = _parse_amazon_datetime(
+            yesterday_source["report"].get("createdTime")
+        )
+        if today_time is not None and yesterday_time is not None:
+            hours_apart = (today_time - yesterday_time).total_seconds() / 3600.0
+            if not 20 <= hours_apart <= 28:
+                frappe.log_error(
+                    f"Strict calendar-date MYI reports are {hours_apart:.2f} hours apart. "
+                    "The calendar-date/6-AM selection remains authoritative.\n"
+                    f"TODAY={today_source['report'].get('reportId')} "
+                    f"{today_source['report'].get('createdTime')}\n"
+                    f"YESTERDAY={yesterday_source['report'].get('reportId')} "
+                    f"{yesterday_source['report'].get('createdTime')}",
+                    "FBA MYI Daily Report Timestamp Sanity Error",
+                )
+
+    return today_source, yesterday_source, reports
+
+
+def _api_required_quantity(container, key, field_name, asin):
+    if not isinstance(container, dict) or key not in container:
+        raise ValueError(f"{asin}: missing LIVE {field_name}")
+    return _parse_required_nonnegative_quantity(container.get(key), f"LIVE {field_name}", asin)
+
+
+def _build_live_api_snapshots(summaries):
+    """Map current Inventory Summaries to explicit per-ASIN C/S/R/F snapshots."""
+    snapshots = {}
+    invalid_asins = {}
+
+    for summary in summaries:
+        if summary.get("condition", "") != "NewItem":
+            continue
+        asin = str(summary.get("asin") or "").strip()
+        if not asin:
+            continue
+        if asin in invalid_asins:
+            continue
+
+        try:
+            if "totalQuantity" not in summary:
+                raise ValueError(f"{asin}: missing LIVE totalQuantity")
+            total_quantity = _parse_required_nonnegative_quantity(
+                summary.get("totalQuantity"), "LIVE totalQuantity", asin
+            )
+            details = summary.get("inventoryDetails")
+            if not isinstance(details, dict):
+                raise ValueError(f"{asin}: missing LIVE inventoryDetails")
+
+            inbound_working = _api_required_quantity(
+                details, "inboundWorkingQuantity", "inboundWorkingQuantity", asin
+            )
+            shipped = _api_required_quantity(
+                details, "inboundShippedQuantity", "inboundShippedQuantity", asin
+            )
+            receiving = _api_required_quantity(
+                details, "inboundReceivingQuantity", "inboundReceivingQuantity", asin
+            )
+
+            researching_obj = details.get("researchingQuantity")
+            researching = _api_required_quantity(
+                researching_obj,
+                "totalResearchingQuantity",
+                "researchingQuantity.totalResearchingQuantity",
+                asin,
+            )
+            reserved_obj = details.get("reservedQuantity")
+            fc_transfer = _api_required_quantity(
+                reserved_obj,
+                "pendingTransshipmentQuantity",
+                "reservedQuantity.pendingTransshipmentQuantity",
+                asin,
+            )
+
+            core_from_total = max(
+                0,
+                total_quantity
+                - inbound_working
+                - shipped
+                - receiving
+                - researching
+                - fc_transfer,
+            )
+
+            # Preserve the current program's max(total-derived, fulfillable-derived)
+            # main-FBA semantics when fulfillableQuantity is explicitly available.
+            core = core_from_total
+            if "fulfillableQuantity" in details and details.get("fulfillableQuantity") is not None:
+                fulfillable = _parse_required_nonnegative_quantity(
+                    details.get("fulfillableQuantity"), "LIVE fulfillableQuantity", asin
+                )
+                core = max(core, fulfillable)
+        except ValueError as exc:
+            invalid_asins[asin] = str(exc)
+            snapshots.pop(asin, None)
+            continue
+
+        candidate = {"C": core, "S": shipped, "R": receiving, "F": fc_transfer}
+        if asin not in snapshots:
+            snapshots[asin] = candidate
+        else:
+            # Preserve the existing cross-marketplace de-duplication behavior:
+            # take the maximum observed quantity rather than summing duplicate
+            # marketplace views of the same physical ASIN.
+            for key in ("C", "S", "R", "F"):
+                snapshots[asin][key] = max(snapshots[asin][key], candidate[key])
+
+    return snapshots, invalid_asins
+
+
+def _current_erp_qty_by_asin(warehouse):
+    rows = frappe.db.sql(
+        """
+        SELECT i.custom_asin AS asin, SUM(b.actual_qty) AS actual_qty
+        FROM `tabItem` i
+        INNER JOIN `tabBin` b ON i.name = b.item_code
+        WHERE b.warehouse = %s
+          AND i.custom_asin IS NOT NULL
+          AND i.custom_asin != ''
+          AND i.disabled = 0
+          AND i.is_stock_item = 1
+        GROUP BY i.custom_asin
+        """,
+        warehouse,
+        as_dict=True,
+    )
+    return {
+        str(row.asin): int(row.actual_qty or 0)
+        for row in rows
+        if row.asin
+    }
+
+
+def _allocate_shared_warehouse_gain(eligible, warehouse_gain):
+    """Deterministically allocate one integer warehouse-gain budget proportionally."""
+    keys = ("S", "R", "F")
+    eligible = {key: max(int(eligible.get(key, 0)), 0) for key in keys}
+    total_eligible = sum(eligible.values())
+    total_matched = min(max(int(warehouse_gain), 0), total_eligible)
+    if not total_eligible or not total_matched:
+        return {key: 0 for key in keys}
+
+    matched = {
+        key: (total_matched * eligible[key]) // total_eligible
+        for key in keys
+    }
+    remainder = total_matched - sum(matched.values())
+    order_index = {key: index for index, key in enumerate(keys)}
+    remainder_order = sorted(
+        keys,
+        key=lambda key: (
+            -((total_matched * eligible[key]) % total_eligible),
+            order_index[key],
+        ),
+    )
+    for key in remainder_order:
+        if remainder <= 0:
+            break
+        if matched[key] < eligible[key]:
+            matched[key] += 1
+            remainder -= 1
+    return matched
+
+
+def _protect_snapshot_transition(old_snapshot, new_snapshot):
+    """Mode 1/2 one-cycle transition matching and false-low carry."""
+    shipped_drop = max(old_snapshot["S"] - new_snapshot["S"], 0)
+    receiving_gain = max(new_snapshot["R"] - old_snapshot["R"], 0)
+    shipped_to_receiving = min(shipped_drop, receiving_gain)
+    remaining_shipped_drop = shipped_drop - shipped_to_receiving
+
+    eligible = {
+        "S": remaining_shipped_drop,
+        "R": max(old_snapshot["R"] - new_snapshot["R"], 0),
+        "F": max(old_snapshot["F"] - new_snapshot["F"], 0),
+    }
+    warehouse_gain = max(new_snapshot["C"] - old_snapshot["C"], 0)
+    matched = _allocate_shared_warehouse_gain(eligible, warehouse_gain)
+    carry = {key: eligible[key] - matched[key] for key in ("S", "R", "F")}
+
+    protected_inbound = (
+        new_snapshot["S"] + new_snapshot["R"] + carry["S"] + carry["R"]
+    )
+    protected_fc = new_snapshot["F"] + carry["F"]
+    main_target = new_snapshot["C"] + protected_fc
+
+    return main_target, protected_inbound, {
+        "shipped_to_receiving": shipped_to_receiving,
+        "warehouse_gain": warehouse_gain,
+        "eligible": eligible,
+        "matched": matched,
+        "carry": carry,
+        "protected_fc": protected_fc,
+    }
+
+
+def _source_asin_reason(source, asin):
+    report = source.get("report") or {}
+    identity = (
+        f"{source['label']} report {report.get('reportId', '<no-id>')}"
+        f"@{report.get('createdTime', '<no-time>')}"
+    )
+    if not source["available"]:
+        return source["error"] or f"{identity} unavailable"
+    if asin in source["invalid_asins"]:
+        return f"{identity}: {source['invalid_asins'][asin]}"
+    if asin not in source["snapshots"]:
+        return f"ASIN ABSENT from {identity}"
+    return None
+
+
+def _mode4_targets(
+    asin,
+    today_snapshot,
+    yesterday_snapshot,
+    live_snapshot,
+    current_main,
+    current_inbound,
+):
+    """Best-effort Mode 4 protection without inventing absent source quantities."""
+    if live_snapshot is not None:
+        current_snapshot = live_snapshot
+        current_source = "LIVE API"
+    elif today_snapshot is not None:
+        current_snapshot = today_snapshot
+        current_source = "TODAY report"
+    else:
+        current_snapshot = None
+        current_source = None
+
+    report_baseline = today_snapshot or yesterday_snapshot
+    if current_snapshot is not None:
+        reliable_core = current_snapshot["C"]
+        candidate_inbound = current_snapshot["S"] + current_snapshot["R"]
+        candidate_fc = current_snapshot["F"]
+
+        if report_baseline is not None:
+            inbound_baseline = report_baseline["S"] + report_baseline["R"]
+            fc_baseline = report_baseline["F"]
+            baseline_source = "TODAY report" if today_snapshot is not None else "YESTERDAY report"
+        else:
+            # ERP Inbound is itself the protected S+R aggregate, so it is safe to
+            # use as a component-level fallback floor. Main FBA cannot safely be
+            # split into historical Core vs FC, so do not fabricate an FC baseline.
+            inbound_baseline = max(current_inbound, 0)
+            fc_baseline = None
+            baseline_source = "current ERP Inbound (S+R aggregate)"
+
+        protected_inbound = max(candidate_inbound, inbound_baseline)
+        protected_fc = (
+            max(candidate_fc, fc_baseline)
+            if fc_baseline is not None
+            else candidate_fc
+        )
+        main_target = reliable_core + protected_fc
+        return main_target, protected_inbound, {
+            "current_source": current_source,
+            "baseline_source": baseline_source,
+            "candidate_inbound": candidate_inbound,
+            "candidate_fc": candidate_fc,
+            "protected_inbound": protected_inbound,
+            "protected_fc": protected_fc,
+            "reliable_core": reliable_core,
+            "fc_baseline_available": fc_baseline is not None,
+        }
+
+    # No trustworthy current Core snapshot exists. Do not manufacture a downward
+    # current target from source absence. A yesterday-only report may still raise
+    # a protected pool, but it cannot justify lowering current ERP stock.
+    main_target = max(current_main, 0)
+    inbound_target = max(current_inbound, 0)
+    if yesterday_snapshot is not None:
+        main_target = max(
+            main_target, yesterday_snapshot["C"] + yesterday_snapshot["F"]
+        )
+        inbound_target = max(
+            inbound_target, yesterday_snapshot["S"] + yesterday_snapshot["R"]
+        )
+
+    return main_target, inbound_target, {
+        "current_source": "<none>",
+        "baseline_source": "YESTERDAY report" if yesterday_snapshot is not None else "<none>",
+        "candidate_inbound": None,
+        "candidate_fc": None,
+        "protected_inbound": inbound_target,
+        "protected_fc": yesterday_snapshot["F"] if yesterday_snapshot is not None else None,
+        "reliable_core": None,
+        "fc_baseline_available": yesterday_snapshot is not None,
+    }
+
+
+def _build_protected_inventory_targets(
+    today_source,
+    yesterday_source,
+    live_snapshots,
+    live_invalid_asins,
+    live_global_error,
+    current_main_by_asin,
+    current_inbound_by_asin,
+):
+    relevant_asins = (
+        set(today_source["snapshots"])
+        | set(yesterday_source["snapshots"])
+        | set(today_source["invalid_asins"])
+        | set(yesterday_source["invalid_asins"])
+        | set(live_snapshots)
+        | set(live_invalid_asins)
+        | set(current_main_by_asin)
+        | set(current_inbound_by_asin)
+    )
+
+    main_targets = {}
+    inbound_targets = {}
+    mode_by_asin = {}
+    degradation_lines = []
+
+    for asin in sorted(relevant_asins):
+        today_snapshot = (
+            today_source["snapshots"].get(asin) if today_source["available"] else None
+        )
+        yesterday_snapshot = (
+            yesterday_source["snapshots"].get(asin)
+            if yesterday_source["available"]
+            else None
+        )
+        live_snapshot = live_snapshots.get(asin) if not live_global_error else None
+        current_main = int(current_main_by_asin.get(asin, 0) or 0)
+        current_inbound = int(current_inbound_by_asin.get(asin, 0) or 0)
+
+        if today_snapshot is not None and yesterday_snapshot is not None:
+            mode = "NORMAL TWO-REPORT"
+            main_target, inbound_target, diagnostics = _protect_snapshot_transition(
+                yesterday_snapshot, today_snapshot
+            )
+            old_source = (
+                f"YESTERDAY report {yesterday_source['report'].get('reportId')}"
+            )
+            new_source = f"TODAY report {today_source['report'].get('reportId')}"
+            if DEBUG:
+                print(
+                    f"[DEBUG] {asin} mode={mode} old={yesterday_snapshot} "
+                    f"new={today_snapshot} old_source={old_source} new_source={new_source} "
+                    f"S->R={diagnostics['shipped_to_receiving']} "
+                    f"warehouse_gain={diagnostics['warehouse_gain']} "
+                    f"eligible={diagnostics['eligible']} matched={diagnostics['matched']} "
+                    f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
+                )
+
+        elif yesterday_snapshot is not None and live_snapshot is not None:
+            mode = "YESTERDAY REPORT -> LIVE API"
+            main_target, inbound_target, diagnostics = _protect_snapshot_transition(
+                yesterday_snapshot, live_snapshot
+            )
+            if DEBUG:
+                print(
+                    f"[DEBUG] {asin} mode={mode} old={yesterday_snapshot} "
+                    f"new={live_snapshot} old_source=YESTERDAY report "
+                    f"{yesterday_source['report'].get('reportId')} "
+                    f"new_source=LIVE S->R={diagnostics['shipped_to_receiving']} "
+                    f"warehouse_gain={diagnostics['warehouse_gain']} "
+                    f"eligible={diagnostics['eligible']} matched={diagnostics['matched']} "
+                    f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
+                )
+
+        elif today_snapshot is not None and live_snapshot is not None:
+            mode = "TODAY REPORT -> LIVE API WITH PROBLEM-CATEGORY FLOOR"
+            live_inbound = live_snapshot["S"] + live_snapshot["R"]
+            report_inbound_floor = today_snapshot["S"] + today_snapshot["R"]
+            protected_inbound = max(live_inbound, report_inbound_floor)
+            protected_fc = max(live_snapshot["F"], today_snapshot["F"])
+            main_target = live_snapshot["C"] + protected_fc
+            inbound_target = protected_inbound
+            shipped_drop = max(today_snapshot["S"] - live_snapshot["S"], 0)
+            receiving_gain = max(live_snapshot["R"] - today_snapshot["R"], 0)
+            shipped_to_receiving = min(shipped_drop, receiving_gain)
+            if DEBUG:
+                print(
+                    f"[DEBUG] {asin} mode={mode} today={today_snapshot} live={live_snapshot} "
+                    f"today_source={today_source['report'].get('reportId')} "
+                    f"live_source=LIVE S->R={shipped_to_receiving} "
+                    f"pre_floor_inbound={live_inbound} "
+                    f"pre_floor_fc={live_snapshot['F']} inbound_floor={report_inbound_floor} "
+                    f"fc_floor={today_snapshot['F']} protected_inbound={protected_inbound} "
+                    f"protected_fc={protected_fc} live_core={live_snapshot['C']} "
+                    f"main={main_target}"
+                )
+
+        else:
+            mode = "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE"
+            main_target, inbound_target, diagnostics = _mode4_targets(
+                asin,
+                today_snapshot,
+                yesterday_snapshot,
+                live_snapshot,
+                current_main,
+                current_inbound,
+            )
+            if DEBUG:
+                print(
+                    f"[DEBUG] {asin} mode={mode} current_source={diagnostics['current_source']} "
+                    f"baseline={diagnostics['baseline_source']} core={diagnostics['reliable_core']} "
+                    f"candidate_inbound={diagnostics['candidate_inbound']} "
+                    f"candidate_fc={diagnostics['candidate_fc']} "
+                    f"protected_inbound={diagnostics['protected_inbound']} "
+                    f"protected_fc={diagnostics['protected_fc']} "
+                    f"current_main={current_main} current_inbound={current_inbound} "
+                    f"main={main_target} inbound={inbound_target}"
+                )
+
+        main_targets[asin] = max(int(main_target), 0)
+        inbound_targets[asin] = max(int(inbound_target), 0)
+        mode_by_asin[asin] = mode
+
+        if mode != "NORMAL TWO-REPORT":
+            today_reason = _source_asin_reason(today_source, asin)
+            yesterday_reason = _source_asin_reason(yesterday_source, asin)
+            if live_global_error:
+                live_reason = live_global_error
+            elif asin in live_invalid_asins:
+                live_reason = live_invalid_asins[asin]
+            elif asin not in live_snapshots:
+                live_reason = "ASIN ABSENT from LIVE API"
+            else:
+                live_reason = None
+            reasons = [
+                reason
+                for reason in (today_reason, yesterday_reason, live_reason)
+                if reason
+            ]
+            degradation_lines.append(
+                f"ASIN {asin}: mode={mode}; " + "; ".join(reasons or ["fallback selected"])
+            )
+
+    return main_targets, inbound_targets, mode_by_asin, degradation_lines
+
+
+def _log_degraded_asins(lines):
+    if not lines:
+        return
+    chunk_size = 40
+    for index in range(0, len(lines), chunk_size):
+        chunk = lines[index:index + chunk_size]
+        frappe.log_error(
+            "\n".join(chunk),
+            "FBA MYI Per-ASIN Degraded Protection",
+        )
+
+
+def _log_daily_report_errors(today_source, yesterday_source, reports, mode_by_asin):
+    failed = [
+        source
+        for source in (today_source, yesterday_source)
+        if not source["available"]
+    ]
+    if not failed:
+        return
+
+    mode_counts = defaultdict(int)
+    for mode in mode_by_asin.values():
+        mode_counts[mode] += 1
+    failed_text = "\n".join(
+        f"{source['label']} expected {source['expected_date']}: "
+        f"{source['error'] or 'unavailable'}"
+        for source in failed
+    )
+    frappe.log_error(
+        f"{failed_text}\n"
+        f"Discovered candidates: {_report_candidate_summary(reports)}\n"
+        f"Per-ASIN operating modes: {dict(mode_counts)}",
+        "FBA MYI Daily Report Protection Error",
+    )
+
 
 # ──────────────────────────────────────────
 # Inbound Processing
@@ -660,246 +1280,249 @@ def process_fba_inventory():
         settings = repo.amz_setting
         if DEBUG: print("[DEBUG] Starting FBA inventory sync...")
 
-        # Pull and parse marketplace IDs from settings
         marketplace_ids = parse_marketplaces(settings.custom_marketplace)
         if DEBUG: print(f"[DEBUG] Fetching for marketplaces: {marketplace_ids}")
 
-        # Aggregate across all marketplaces
+        # Discover, strictly select, download, and parse both daily reports first.
+        today_source, yesterday_source, report_candidates = (
+            _load_daily_manage_inventory_sources(settings)
+        )
+
+        # Gather LIVE data after report discovery. Do not abort if the live pull
+        # is unavailable; report-only Mode 1 and per-ASIN Mode 4 must still run.
         summaries = []
-        
-
-        for mkt_id in marketplace_ids:
-            if DEBUG: print(f"[DEBUG] Querying marketplace: {mkt_id}")
-            base_qs = {
-                "granularityType": "Marketplace",
-                "granularityId": mkt_id,
-                "marketplaceIds": mkt_id,
-                "details": "true",  # no startDateTime: return full current snapshot, not a delta, so omitted SKUs aren't wrongly zeroed
-            }
-            if DEBUG: print(f"[DEBUG] Query parameters: {base_qs}")
-            next_token = None
-            page = 1
-            while True:
-                if next_token:
+        live_global_error = None
+        try:
+            for mkt_id in marketplace_ids:
+                if DEBUG: print(f"[DEBUG] Querying marketplace: {mkt_id}")
+                base_qs = {
+                    "granularityType": "Marketplace",
+                    "granularityId": mkt_id,
+                    "marketplaceIds": mkt_id,
+                    "details": "true",
+                }
+                next_token = None
+                page = 1
+                while True:
                     qs = dict(base_qs)
-                    qs["nextToken"] = next_token
-                    if DEBUG: print(f"[DEBUG] Updated qs with nextToken: {qs}")
-                else:
-                    qs = dict(base_qs)  # First page uses the full snapshot filters
-
-                if DEBUG: print(f"[DEBUG] Fetching page {page} for {mkt_id}...")
-                try:  # ADDED: Wrap API call for logging
-                    resp = _sp_get("/fba/inventory/v1/summaries", qs, settings, return_full=True)  # Added return_full=True
-                except Exception:
-                    frappe.log_error(frappe.get_traceback(), f"API Call Error for Marketplace {mkt_id}")
-                    raise
-                #print(json.dumps(resp.get("payload", {}), indent=2))  # Uncomment if needed for verification
-                
-                # Print info for a specific asin
-                #for summary in resp.get("payload", {}).get("inventorySummaries", []):
-                #    if summary.get("asin") == "B09D8KWTBW":
-                #        print(json.dumps(summary, indent=2))
-                
-                page_summaries = resp.get("payload", {}).get("inventorySummaries", [])  # Extract from payload
-                summaries.extend(page_summaries)
-                if DEBUG: print(f"[DEBUG] Fetched {len(page_summaries)} summaries from page {page} for {mkt_id}")
-                if len(page_summaries) == 0:
-                    if DEBUG: print("[DEBUG] No summaries in this page - check if response has errors or warnings")
-                next_token = resp.get("pagination", {}).get("nextToken")  # Extract from top-level pagination
-                if not next_token:
-                    if DEBUG: print(f"[DEBUG] No more pages for {mkt_id}")
-                    break
-                time.sleep(1)  # Throttle between pages
-                page += 1
-            time.sleep(2)  # Throttle between marketplaces to avoid rate limits
-
-        if DEBUG: print(f"[DEBUG] Total summaries fetched: {len(summaries)}")
-        if summaries:
-            if DEBUG: print(f"[DEBUG] Sample summary: {summaries[0]}")  # Print first one for inspection
-        else:
-            if DEBUG: print("[DEBUG] No summaries fetched across all marketplaces - possible reasons: no FBA inventory in these marketplaces, missing 'Inventory' role in SP-API permissions, or try adding 'startDateTime' parameter for recent changes")
-
-        # Collect all unique conditions for debugging
-        conditions = set(s.get("condition", "UNKNOWN") for s in summaries)
-        if DEBUG: print(f"[DEBUG] Unique conditions found in summaries: {conditions}")
-
-        # Aggregate fulfillable and inbound qty by ASIN for new condition
-        asin_fulfillable = defaultdict(int)
-        asin_inbound = defaultdict(int)
-        for s in summaries:
-            cond = s.get("condition", "")  # Correct key per API docs
-            asin = s.get("asin", "")
-            details = s.get("inventoryDetails") or {}  # inventoryDetails sub-object, default empty dict
-            total_quantity = s.get("totalQuantity") or 0  # top-level total units in FC
-            inbound_working = details.get("inboundWorkingQuantity") or 0
-            inbound_shipped = details.get("inboundShippedQuantity") or 0
-            inbound_receiving = details.get("inboundReceivingQuantity") or 0
-            fulfillable_quantity = details.get("fulfillableQuantity") or 0
-            researching_quantity = (
-                details.get("researchingQuantity") or {}
-            ).get("totalResearchingQuantity") or 0  # subtracted from totalQuantity-based equation only
-            fc_transfer_quantity = (
-                details.get("reservedQuantity") or {}
-            ).get("pendingTransshipmentQuantity") or 0  # added to fulfillableQuantity-based equation only
-            fulfillable_qty = max(
-                0,
-                total_quantity
-                - inbound_working
-                - inbound_shipped
-                - inbound_receiving
-                - researching_quantity,
-                fulfillable_quantity + fc_transfer_quantity,
+                    if next_token:
+                        qs["nextToken"] = next_token
+                    if DEBUG: print(f"[DEBUG] Fetching page {page} for {mkt_id}...")
+                    resp = _sp_get(
+                        "/fba/inventory/v1/summaries",
+                        qs,
+                        settings,
+                        return_full=True,
+                    )
+                    page_summaries = resp.get("payload", {}).get(
+                        "inventorySummaries", []
+                    )
+                    summaries.extend(page_summaries)
+                    if DEBUG:
+                        print(
+                            f"[DEBUG] Fetched {len(page_summaries)} summaries "
+                            f"from page {page} for {mkt_id}"
+                        )
+                    next_token = resp.get("pagination", {}).get("nextToken")
+                    if not next_token:
+                        break
+                    time.sleep(1)
+                    page += 1
+                time.sleep(2)
+        except Exception as exc:
+            live_global_error = (
+                f"LIVE Inventory Summaries API unavailable/incomplete "
+                f"({type(exc).__name__}: {exc})"
             )
-            inbound_qty = inbound_shipped + inbound_receiving  # inboundWorkingQuantity excluded: these units have not left our facility yet
-            if DEBUG: print(f"[DEBUG] Processing summary: ASIN={asin}, Condition={cond}, FulfillableQty={fulfillable_qty}, InboundQty={inbound_qty}")
-            if cond != "NewItem":  # Filter to new condition (adjust if your data uses variants like "SELLABLE")
-                if DEBUG: print(f"[DEBUG] Skipping non-new condition: {cond}")
-                continue
-            # CRITICAL FIX: Use max() instead of += 
-            # The SP-API /fba/inventory/v1/summaries endpoint (when queried per marketplace)
-            # frequently returns the *exact same* FBA inventory data for an ASIN across
-            # every configured marketplace (common with unified NA/EU/PAN-EU accounts
-            # and shared fulfillment centers). Summing these duplicates inflates
-            # ERPNext target quantities. Taking the max ensures each physical ASIN
-            # is counted exactly once.
-            asin_fulfillable[asin] = max(asin_fulfillable[asin], fulfillable_qty)
-            asin_inbound[asin] = max(asin_inbound[asin], inbound_qty)
-            if DEBUG: print(f"[DEBUG] Added to asin_fulfillable: {asin} -> {asin_fulfillable[asin]}")
-            if DEBUG: print(f"[DEBUG] Added to asin_inbound: {asin} -> {asin_inbound[asin]}")
+            summaries = []
+            frappe.log_error(
+                f"{live_global_error}\n\n{frappe.get_traceback()}",
+                "FBA Inventory Summaries Protection Error",
+            )
 
-        if DEBUG: print(f"[DEBUG] Aggregated asin_fulfillable: {dict(asin_fulfillable)}")
-        if DEBUG: print(f"[DEBUG] Aggregated asin_inbound: {dict(asin_inbound)}")
+        live_snapshots, live_invalid_asins = _build_live_api_snapshots(summaries)
+        if DEBUG:
+            print(
+                f"[DEBUG] LIVE snapshots={len(live_snapshots)}, "
+                f"invalid={len(live_invalid_asins)}, global_error={live_global_error}"
+            )
 
-        # Prepare Stock Reconciliation items for fulfillable
         wh = settings.afn_warehouse
+        inbound_wh = settings.custom_amazon_inbound_warehouse
+        current_main_by_asin = _current_erp_qty_by_asin(wh)
+        current_inbound_by_asin = _current_erp_qty_by_asin(inbound_wh)
+
+        (
+            asin_fulfillable,
+            final_inbound_by_asin,
+            mode_by_asin,
+            degradation_lines,
+        ) = _build_protected_inventory_targets(
+            today_source,
+            yesterday_source,
+            live_snapshots,
+            live_invalid_asins,
+            live_global_error,
+            current_main_by_asin,
+            current_inbound_by_asin,
+        )
+
+        _log_daily_report_errors(
+            today_source, yesterday_source, report_candidates, mode_by_asin
+        )
+        _log_degraded_asins(degradation_lines)
+
+        if DEBUG:
+            print(f"[DEBUG] Final main-FBA targets: {asin_fulfillable}")
+            print(f"[DEBUG] Final inbound targets: {final_inbound_by_asin}")
+
+        # Report Amazon ASINs that cannot be mapped to an enabled ERP Item.
+        # Keep this as one consolidated error per sync run so catalog/configuration
+        # gaps are visible without flooding the Error Log.
+        target_asins = sorted(set(asin_fulfillable) | set(final_inbound_by_asin))
+        missing_erp_asins = []
+        for asin in target_asins:
+            item_code = frappe.db.get_value(
+                "Item", {"custom_asin": asin, "disabled": 0}, "name"
+            )
+            if not item_code:
+                missing_erp_asins.append(asin)
+
+        if missing_erp_asins:
+            missing_lines = [
+                f"ASIN {asin}: main_target={asin_fulfillable.get(asin, '<none>')}, "
+                f"inbound_target={final_inbound_by_asin.get(asin, '<none>')}"
+                for asin in missing_erp_asins
+            ]
+            frappe.log_error(
+                "Amazon inventory data contains ASIN(s) with no matching enabled "
+                "ERP Item. These ASINs will be skipped and ERP stock will not be "
+                "updated for them:\n" + "\n".join(missing_lines),
+                "Amazon ASIN Missing From ERP",
+            )
+
+        # All source discovery, mode selection, and target protection is complete.
+        # Only now may ERP inventory be mutated.
         company = settings.company
-        adjustment_account = settings.custom_amazon_inventory_adjustment_account  # Assume this custom field exists in settings; add if needed
+        adjustment_account = settings.custom_amazon_inventory_adjustment_account
         items_list = []
+
         for asin, new_qty in asin_fulfillable.items():
-            item_code = frappe.db.get_value("Item", {"custom_asin": asin, "disabled": 0}, "name")
+            item_code = frappe.db.get_value(
+                "Item", {"custom_asin": asin, "disabled": 0}, "name"
+            )
             if not item_code:
                 if DEBUG: print(f"[DEBUG] No matching item_code found for ASIN: {asin}")
                 continue
-
-            # ADDED: Skip if not a stock item
             if not frappe.get_value("Item", item_code, "is_stock_item"):
                 if DEBUG: print(f"[DEBUG] Skipping non-stock item: {item_code}")
                 continue
 
-            # Get current bin data
             bin_data = frappe.db.get_value(
                 "Bin",
                 {"item_code": item_code, "warehouse": wh},
                 ["actual_qty", "valuation_rate"],
-                as_dict=True
+                as_dict=True,
             ) or {}
             current_qty = bin_data.get("actual_qty", 0)
-            if DEBUG: print(f"[DEBUG] Current qty in Bin: {current_qty} vs New qty: {new_qty} - {item_code}")
+            if DEBUG:
+                print(
+                    f"[DEBUG] Current qty in Bin: {current_qty} vs "
+                    f"New qty: {new_qty} - {item_code}"
+                )
             if int(current_qty) == new_qty:
-                continue  # No adjustment needed
+                continue
 
-            item_valuation_rate = frappe.get_value("Item", item_code, "valuation_rate") or 0
-            item_dict = {
+            item_valuation_rate = (
+                frappe.get_value("Item", item_code, "valuation_rate") or 0
+            )
+            items_list.append({
                 "item_code": item_code,
                 "warehouse": wh,
                 "qty": new_qty,
-            }
-            if item_valuation_rate > 0:
-                item_dict["valuation_rate"] = item_valuation_rate
-            else:
-                item_dict["valuation_rate"] = 0.01
-            items_list.append(item_dict)
+                "valuation_rate": (
+                    item_valuation_rate if item_valuation_rate > 0 else 0.01
+                ),
+            })
 
-        # Fetch Amazon items in warehouse with positive qty not reported by Amazon, assume 0
-        amazon_items_in_wh = frappe.db.sql("""
-            SELECT i.name as item_code, i.custom_asin as asin, b.actual_qty, b.valuation_rate
+        # Preserve the existing belt-and-suspenders zero-out guard. Because every
+        # currently stocked Amazon ASIN is included in per-ASIN mode selection,
+        # source absence alone cannot enter this zero-out path.
+        amazon_items_in_wh = frappe.db.sql(
+            """
+            SELECT i.name as item_code, i.custom_asin as asin,
+                   b.actual_qty, b.valuation_rate
             FROM `tabItem` i
             INNER JOIN `tabBin` b ON i.name = b.item_code
-            WHERE b.warehouse = %s AND i.custom_asin IS NOT NULL AND b.actual_qty > 0 AND i.disabled = 0 AND i.is_stock_item = 1
-        """, wh, as_dict=True)
-
-        # Candidates to zero: stocked Amazon items in this warehouse NOT reported by the API
-        zero_candidates = [r for r in amazon_items_in_wh if r.asin not in asin_fulfillable]
-        total_stocked = len(amazon_items_in_wh)  # Amazon items currently holding stock here
-        # Guard: refuse to zero if the unreported share exceeds the threshold (likely a partial pull)
-        if total_stocked and (len(zero_candidates) / total_stocked) > MAX_ZERO_OUT_FRACTION:
+            WHERE b.warehouse = %s
+              AND i.custom_asin IS NOT NULL
+              AND b.actual_qty > 0
+              AND i.disabled = 0
+              AND i.is_stock_item = 1
+            """,
+            wh,
+            as_dict=True,
+        )
+        zero_candidates = [
+            row for row in amazon_items_in_wh if row.asin not in asin_fulfillable
+        ]
+        total_stocked = len(amazon_items_in_wh)
+        if (
+            total_stocked
+            and (len(zero_candidates) / total_stocked) > MAX_ZERO_OUT_FRACTION
+        ):
             frappe.log_error(
                 f"Skipping fulfillable zero-out for {wh}: "
                 f"{len(zero_candidates)}/{total_stocked} stocked Amazon items "
-                f"unreported (> {MAX_ZERO_OUT_FRACTION:.0%}); treating as partial API pull.",
+                f"unreported (> {MAX_ZERO_OUT_FRACTION:.0%}); "
+                "treating as partial API pull.",
                 "FBA Inventory Zero-Out Guard",
             )
         else:
-            for row in zero_candidates:  # already excludes reported ASINs
-                item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
-                item_dict = {
+            for row in zero_candidates:
+                item_valuation_rate = (
+                    frappe.get_value("Item", row.item_code, "valuation_rate") or 0
+                )
+                items_list.append({
                     "item_code": row.item_code,
                     "warehouse": wh,
                     "qty": 0,
-                }
-                if item_valuation_rate > 0:
-                    item_dict["valuation_rate"] = item_valuation_rate
-                else:
-                    item_dict["valuation_rate"] = 0.01
-                items_list.append(item_dict)
+                    "valuation_rate": (
+                        item_valuation_rate if item_valuation_rate > 0 else 0.01
+                    ),
+                })
 
         if DEBUG: print(f"[DEBUG] Total items to reconcile: {len(items_list)}")
-        if not items_list:
-            if DEBUG: print("[DEBUG] No items to sync - exiting early")
-        else:
-            # Create and submit Stock Reconciliation
-            if DEBUG: print("[DEBUG] Creating Stock Reconciliation...")
-            try:  # ADDED: Wrap for error logging
+        if items_list:
+            try:
                 sr = frappe.get_doc({
                     "doctype": "Stock Reconciliation",
                     "company": company,
                     "posting_date": frappe.utils.today(),
                     "purpose": "Stock Reconciliation",
-                    "expense_account": adjustment_account,  # For value adjustments
+                    "expense_account": adjustment_account,
                     "items": items_list,
                 })
                 sr.insert(ignore_permissions=True)
-                if DEBUG: print(f"[DEBUG] Inserted SR: {sr.name}")
                 if DEBUG:
-                    if DEBUG: print(f"[DEBUG] DEBUG mode: leaving FBA fulfillable SR {sr.name} as DRAFT (not submitted)")
-                    frappe.db.commit()  # persist draft
+                    print(f"[DEBUG] Inserted SR: {sr.name}")
+                    print(
+                        f"[DEBUG] DEBUG mode: leaving FBA fulfillable SR "
+                        f"{sr.name} as DRAFT (not submitted)"
+                    )
+                    frappe.db.commit()
                 else:
                     sr.submit()
                     frappe.db.commit()
-                    if DEBUG: print(f"[FBA_INV] Synced inventory via Stock Reconciliation {sr.name}")
             except Exception:
-                frappe.log_error(frappe.get_traceback(), "Fulfillable Stock Reconciliation Error")
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "Fulfillable Stock Reconciliation Error",
+                )
                 raise
 
-        # Process inbound inventory, supplementing the API value with the newest recent MYI ALL report when available
-        final_inbound_by_asin = dict(asin_inbound)
-        try:
-            report_inbound_by_asin = get_recent_manage_inventory_inbound(settings, marketplace_ids)
-            if report_inbound_by_asin is not None:
-                final_inbound_by_asin = {
-                    asin: max(
-                        0,
-                        asin_inbound.get(asin, 0),
-                        report_inbound_by_asin.get(asin, 0),
-                    )
-                    for asin in set(asin_inbound) | set(report_inbound_by_asin)
-                }
-                if DEBUG:
-                    for asin in sorted(final_inbound_by_asin):
-                        print(
-                            f"[DEBUG] Inbound merge {asin}: "
-                            f"API={asin_inbound.get(asin, 0)}, "
-                            f"MYI={report_inbound_by_asin.get(asin, 0)}, "
-                            f"Final={final_inbound_by_asin[asin]}"
-                        )
-        except Exception as exc:
-            frappe.log_error(
-                f"Supplemental MYI ALL report failed ({type(exc).__name__}); "
-                "using Inventory Summaries API inbound values only.",
-                "FBA MYI Supplemental Report Error",
-            )
-
         process_inbound_inventory(final_inbound_by_asin, settings)
+
     except Exception:
         frappe.log_error(frappe.get_traceback(), "FBA Inventory Process Error")
         raise
