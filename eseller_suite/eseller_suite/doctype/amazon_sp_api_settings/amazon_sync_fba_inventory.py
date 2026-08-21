@@ -9,6 +9,7 @@ import gzip
 import inspect
 import io
 import json, requests
+import re
 
 from datetime import datetime, timedelta, timezone
 import time
@@ -341,8 +342,8 @@ def _parse_manage_inventory_report(report_bytes):
         condition = "".join(
             ch for ch in str(row.get("condition") or "").lower() if ch.isalnum()
         )
-        # Preserve the current parser's conservative acceptance of a blank condition.
-        if condition and condition not in {"new", "newitem"}:
+        # Only explicit New-condition inventory participates in this sync.
+        if condition not in {"new", "newitem"}:
             continue
         if asin in invalid_asins:
             continue
@@ -619,6 +620,38 @@ def _current_erp_qty_by_asin(warehouse):
         for row in rows
         if row.asin
     }
+
+
+def _erp_items_with_multiple_asins():
+    """Return enabled stock Items whose custom_asin contains 2+ distinct ASINs."""
+    rows = frappe.db.sql(
+        """
+        SELECT i.name AS item_code, i.custom_asin AS custom_asin
+        FROM `tabItem` i
+        WHERE i.disabled = 0
+          AND i.is_stock_item = 1
+          AND i.custom_asin IS NOT NULL
+          AND i.custom_asin != ''
+        """,
+        as_dict=True,
+    )
+
+    issues = []
+    for row in rows:
+        raw_value = str(row.custom_asin or "").strip()
+        detected = []
+        for token in re.findall(r"(?<![A-Z0-9])[A-Z0-9]{10}(?![A-Z0-9])", raw_value.upper()):
+            if token not in detected:
+                detected.append(token)
+        if len(detected) > 1:
+            issues.append(
+                {
+                    "item_code": str(row.item_code),
+                    "custom_asin": raw_value,
+                    "detected_asins": detected,
+                }
+            )
+    return issues
 
 
 def _allocate_shared_warehouse_gain(eligible, warehouse_gain):
@@ -901,25 +934,38 @@ def _build_protected_inventory_targets(
         inbound_targets[asin] = max(int(inbound_target), 0)
         mode_by_asin[asin] = mode
 
-        if mode != "NORMAL TWO-REPORT":
-            today_reason = _source_asin_reason(today_source, asin)
-            yesterday_reason = _source_asin_reason(yesterday_source, asin)
-            if live_global_error:
-                live_reason = live_global_error
-            elif asin in live_invalid_asins:
-                live_reason = live_invalid_asins[asin]
-            elif asin not in live_snapshots:
-                live_reason = "ASIN ABSENT from LIVE API"
-            else:
-                live_reason = None
-            reasons = [
-                reason
-                for reason in (today_reason, yesterday_reason, live_reason)
-                if reason
-            ]
-            degradation_lines.append(
-                f"ASIN {asin}: mode={mode}; " + "; ".join(reasons or ["fallback selected"])
+        if mode == "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE":
+            # If both otherwise-valid daily reports simply omit this ASIN, that
+            # absence is routine and should not create an Error Log entry. Mode 4
+            # protection still applies; only the per-ASIN reporting is suppressed.
+            routine_both_report_absence = (
+                today_source["available"]
+                and yesterday_source["available"]
+                and asin not in today_source["snapshots"]
+                and asin not in yesterday_source["snapshots"]
+                and asin not in today_source["invalid_asins"]
+                and asin not in yesterday_source["invalid_asins"]
             )
+            if not routine_both_report_absence:
+                today_reason = _source_asin_reason(today_source, asin)
+                yesterday_reason = _source_asin_reason(yesterday_source, asin)
+                if live_global_error:
+                    live_reason = live_global_error
+                elif asin in live_invalid_asins:
+                    live_reason = live_invalid_asins[asin]
+                elif asin not in live_snapshots:
+                    live_reason = "ASIN ABSENT from LIVE API"
+                else:
+                    live_reason = None
+                reasons = [
+                    reason
+                    for reason in (today_reason, yesterday_reason, live_reason)
+                    if reason
+                ]
+                degradation_lines.append(
+                    f"ASIN {asin}: mode={mode}; "
+                    + "; ".join(reasons or ["fallback selected"])
+                )
 
     return main_targets, inbound_targets, mode_by_asin, degradation_lines
 
@@ -1376,9 +1422,27 @@ def process_fba_inventory():
             print(f"[DEBUG] Final main-FBA targets: {asin_fulfillable}")
             print(f"[DEBUG] Final inbound targets: {final_inbound_by_asin}")
 
+        # Report enabled stock Items whose ERP ASIN field contains multiple ASINs.
+        # The sync intentionally does not split or reinterpret this bad mapping; it
+        # is surfaced for correction so one ERP Item maps to one ASIN.
+        multiple_asin_items = _erp_items_with_multiple_asins()
+        if multiple_asin_items:
+            multiple_asin_lines = [
+                f"Item {issue['item_code']}: custom_asin={issue['custom_asin']!r}; "
+                f"detected_asins={', '.join(issue['detected_asins'])}"
+                for issue in multiple_asin_items
+            ]
+            frappe.log_error(
+                "ERP Item(s) contain more than one ASIN in custom_asin. "
+                "Correct each Item so it contains exactly one ASIN:\n"
+                + "\n".join(multiple_asin_lines),
+                "ERP Item Has Multiple ASINs",
+            )
+
         # Report Amazon ASINs that cannot be mapped to an enabled ERP Item.
         # Keep this as one consolidated error per sync run so catalog/configuration
-        # gaps are visible without flooding the Error Log.
+        # gaps are visible without flooding the Error Log. Zero/zero targets are
+        # inert and are intentionally ignored.
         target_asins = sorted(set(asin_fulfillable) | set(final_inbound_by_asin))
         missing_erp_asins = []
         for asin in target_asins:
@@ -1386,6 +1450,10 @@ def process_fba_inventory():
                 "Item", {"custom_asin": asin, "disabled": 0}, "name"
             )
             if not item_code:
+                main_target = int(asin_fulfillable.get(asin, 0) or 0)
+                inbound_target = int(final_inbound_by_asin.get(asin, 0) or 0)
+                if main_target == 0 and inbound_target == 0:
+                    continue
                 missing_erp_asins.append(asin)
 
         if missing_erp_asins:
