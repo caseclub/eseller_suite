@@ -25,6 +25,76 @@ from zoneinfo import ZoneInfo
 
 
 # ──────────────────────────────────────────
+# 0. — DB connection recovery
+#
+# This scheduled job performs long stretches of SP-API/network work. If the
+# MariaDB connection is dropped while the job is outside the DB, the next
+# Frappe query/commit can fail with pymysql InterfaceError(0, '').
+#
+# Reconnecting cannot restore a lost transaction, so these helpers are used
+# only at transaction-safe boundaries (after read-only/network work, after an
+# explicit rollback, or immediately before returning to Frappe).
+# ──────────────────────────────────────────
+def _is_db_connection_error(exc: Exception) -> bool:
+    """Return True for a closed/lost MariaDB connection."""
+    code = exc.args[0] if getattr(exc, "args", None) else None
+    if code in (0, 2006, 2013, 2055):
+        return True
+
+    msg = str(exc).lower()
+    return (
+        "server has gone away" in msg
+        or "lost connection" in msg
+        or "broken pipe" in msg
+        or "already closed" in msg
+        or "interfaceerror" in msg
+    )
+
+
+def _reconnect_db() -> None:
+    """Create a fresh DB connection and restore this job's session setting."""
+    frappe.db.connect()
+    frappe.db.sql("SET SESSION innodb_lock_wait_timeout = 300;")
+    print("[SETT] MariaDB connection was dropped; reconnected")
+
+
+def _ensure_db_connection() -> None:
+    """Verify the DB socket and reconnect only when the connection is gone."""
+    try:
+        frappe.db.sql("SELECT 1")
+    except Exception as exc:
+        if not _is_db_connection_error(exc):
+            raise
+        _reconnect_db()
+
+
+def _rollback_for_error() -> None:
+    """Rollback if possible; reconnect if the old socket is already gone."""
+    try:
+        frappe.db.rollback()
+    except Exception as exc:
+        if not _is_db_connection_error(exc):
+            raise
+        _reconnect_db()
+
+
+def _log_error_resilient(title: str, message: str) -> None:
+    """Best-effort Error Log write even if the original DB socket was lost."""
+    try:
+        _ensure_db_connection()
+        frappe.log_error(title=title[:140], message=message)
+    except Exception as exc:
+        print(f"[SETT] Could not write Error Log '{title}': {exc}")
+        print(message)
+
+
+def _sleep_with_db_check(seconds: float) -> None:
+    """Sleep at a safe boundary, then verify the DB socket before continuing."""
+    time.sleep(seconds)
+    _ensure_db_connection()
+
+
+# ──────────────────────────────────────────
 # 1. — Helpers
 # ──────────────────────────────────────────
 def get_currency_accounts_map(settings):
@@ -441,6 +511,9 @@ def list_latest_settlement_reports(settings, limit: int = 5, days_back: int = 90
         
         time.sleep(2)  # Short delay to avoid rate limits during pagination
     
+    # Pagination is read-only/network work; reconnect here if MariaDB went idle.
+    _ensure_db_connection()
+
     # Sort by dataEndTime (primary) or createdTime (fallback), newest first
     all_reports.sort(key=_report_sort_key, reverse=True)
     
@@ -497,6 +570,9 @@ def fetch_settlement_rows(settings, report: dict) -> list[dict]:
 
     # 2) Download the payload
     raw: bytes = requests.get(url, timeout=120).content
+
+    # The report download can spend up to 120s with no DB traffic.
+    _ensure_db_connection()
 
     # 3) Decrypt (AES-CBC/PKCS7) if Amazon gives us keys (kept as-is, but troubleshooting doesn't have this—remove if your reports aren't encrypted)
     if "encryptionDetails" in meta:
@@ -1412,6 +1488,7 @@ def process_settlements(): # CHANGED: Default to 4
    
     repo = AmazonRepository("q3opu7c5ac")
     reports = list_latest_settlement_reports(repo.amz_setting, 4)
+    _ensure_db_connection()
     print(f"[SETT] pulled {len(reports)} reports")
     for i, rpt in enumerate(reports):
         rpt_id = rpt["reportId"]
@@ -1444,6 +1521,7 @@ def process_settlements(): # CHANGED: Default to 4
         first_pass = not bool(submitted_je)
         try:
             rows = fetch_settlement_rows(repo.amz_setting, rpt)
+            _ensure_db_connection()
            
             #save_settlement_csv(rpt_id, rows) #Save thet settlement reports for debugging
            
@@ -1458,6 +1536,7 @@ def process_settlements(): # CHANGED: Default to 4
                 je.multi_currency = 0
             
             _flag_unallocated_as_advance(je)
+            _ensure_db_connection()
             frappe.db.sql("SET SESSION innodb_lock_wait_timeout = 300;")
            
             # Insert as draft (with retry)
@@ -1472,13 +1551,24 @@ def process_settlements(): # CHANGED: Default to 4
             print(f"[SETT] {rpt_id} ➜ {je.name} (draft inserted; finalize/submit queued)")
            
         except Exception:
-            frappe.log_error(frappe.get_traceback(), f"Settlement sync failed {rpt_id}")
+            # Do not let a failed report leave a partial transaction that Frappe's
+            # outer background-job commit could accidentally persist.
+            _rollback_for_error()
+            _log_error_resilient(
+                f"Settlement sync failed {rpt_id}",
+                frappe.get_traceback(),
+            )
             continue
-       
+
         # NEW: Match troubleshooting's delay between reports (skip after last one)
         if i < len(reports) - 1:
             print(f"⏳ Waiting 10s before next report …")
-            time.sleep(10)
+            _sleep_with_db_check(10)
+
+    # execute_job() performs one final frappe.db.commit() after this function
+    # returns. Hand it a live connection so that framework commit does not hit
+    # an already-closed PyMySQL socket.
+    _ensure_db_connection()
 
 def is_base_currency_only(je_doc: Document, base_ccy: str) -> bool:
     """Check if all lines are in base currency with rate=1."""
@@ -1975,12 +2065,12 @@ def _retry_locked(tries=12, delay=2.0):
                     if not _is_retryable_lock_error(exc):
                         raise
                     # Release any locks/state from the failed transaction before retrying.
-                    frappe.db.rollback()
+                    _rollback_for_error()
                     print(
                         f"[SETT] DB lock/deadlock on attempt {attempt+1}; "
                         f"retrying after {current_delay}s: {exc}"
                     )
-                    time.sleep(current_delay)
+                    _sleep_with_db_check(current_delay)
                     current_delay = min(current_delay * 1.5, 15.0)
             return fn(*args, **kwargs)
         return wrapper
@@ -2042,10 +2132,10 @@ def _reconcile_submitted_journal_line(
         frappe.db.commit()
         return True
     except Exception:
-        frappe.db.rollback()
-        frappe.log_error(
-            title=f"Amazon Settlement Reconciliation {je_name} -> {against_voucher}"[:140],
-            message=frappe.get_traceback(),
+        _rollback_for_error()
+        _log_error_resilient(
+            f"Amazon Settlement Reconciliation {je_name} -> {against_voucher}",
+            frappe.get_traceback(),
         )
         return False
     finally:
