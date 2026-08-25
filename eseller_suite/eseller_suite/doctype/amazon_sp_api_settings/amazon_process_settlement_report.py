@@ -148,6 +148,255 @@ def get_open_sales_invoice(order_id: str) -> str | None:
         order_by="posting_date desc",
     )
 
+
+SETTLEMENT_SYNC_TIMEOUT_SECONDS = 3600
+SETTLEMENT_PREFETCH_BATCH_SIZE = 500
+SETTLEMENT_SYNC_JOB_ID = "amazon-settlement-sync"
+# amazon_order_id indexes are optional. The settlement hot path is designed to
+# remain efficient without schema changes by batching lookups and restricting
+# late-allocation work to orders that still have unallocated settlement lines.
+
+
+def _dispatch_to_extended_settlement_worker_if_needed(dispatched: bool = False) -> bool:
+    """
+    Keep scheduler jobs as lightweight dispatchers and run accounting work in a
+    dedicated 3600-second job. Direct/console calls run inline.
+
+    Frappe v15 deduplicates by Redis-backed RQ job_id; do not query the virtual
+    ``RQ Job`` DocType through MariaDB.
+    """
+    if dispatched:
+        return False
+
+    try:
+        from rq import get_current_job
+        current_job = get_current_job()
+    except Exception:
+        current_job = None
+
+    if not current_job:
+        return False  # Direct/console invocation: run in the current process.
+
+    try:
+        from frappe.utils.background_jobs import enqueue
+
+        job = enqueue(
+            "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.process_settlements",
+            queue="long",
+            timeout=SETTLEMENT_SYNC_TIMEOUT_SECONDS,
+            job_id=SETTLEMENT_SYNC_JOB_ID,
+            deduplicate=True,
+            dispatched=True,
+        )
+        if job is None:
+            print("[SETT] Extended settlement worker already queued/running; dispatcher exiting")
+        else:
+            print(
+                f"[SETT] Dispatched settlement sync to explicit "
+                f"{SETTLEMENT_SYNC_TIMEOUT_SECONDS}s worker"
+            )
+        return True
+    except Exception:
+        # Do not fall through and perform financial processing under the scheduler's
+        # shorter death-penalty timeout if dispatch itself failed.
+        _rollback_for_error()
+        _log_error_resilient(
+            "Amazon Settlement Dispatcher Failure",
+            frappe.get_traceback(),
+        )
+        return True
+
+
+def _prefetch_latest_sales_invoice_contexts(
+    order_ids, *, open_only: bool = False, batch_size: int = SETTLEMENT_PREFETCH_BATCH_SIZE
+) -> dict[str, frappe._dict]:
+    """
+    Fetch the latest submitted non-return Sales Invoice for many Amazon orders.
+    Selection intentionally preserves the existing posting_date-desc rule.
+    """
+    ids = list(dict.fromkeys(str(order_id).strip() for order_id in order_ids if order_id))
+    if not ids:
+        return {}
+
+    latest: dict[str, frappe._dict] = {}
+    fields = [
+        "name", "amazon_order_id", "customer", "debit_to", "outstanding_amount",
+        "conversion_rate", "currency", "is_return", "docstatus", "posting_date",
+    ]
+
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start:start + batch_size]
+        filters = {
+            "amazon_order_id": ["in", batch],
+            "docstatus": 1,
+            "is_return": 0,
+        }
+        if open_only:
+            filters["outstanding_amount"] = [">", 0]
+
+        rows = frappe.get_all(
+            "Sales Invoice",
+            filters=filters,
+            fields=fields,
+            order_by="posting_date desc",
+        )
+        for row in rows:
+            order_id = (row.amazon_order_id or "").strip()
+            if order_id and order_id not in latest:
+                row.account_currency = _get_account_currency(row.debit_to)
+                latest[order_id] = row
+
+    return latest
+
+
+def _prefetch_open_credit_note_contexts(
+    order_ids, *, batch_size: int = SETTLEMENT_PREFETCH_BATCH_SIZE
+) -> dict[str, list[frappe._dict]]:
+    """Bulk-fetch open submitted Credit Notes, preserving the existing oldest-first order."""
+    ids = list(dict.fromkeys(str(order_id).strip() for order_id in order_ids if order_id))
+    by_order: dict[str, list[frappe._dict]] = defaultdict(list)
+    if not ids:
+        return by_order
+
+    fields = [
+        "name", "amazon_order_id", "customer", "debit_to", "outstanding_amount",
+        "conversion_rate", "currency", "is_return", "docstatus", "posting_date",
+    ]
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start:start + batch_size]
+        rows = frappe.get_all(
+            "Sales Invoice",
+            filters={
+                "amazon_order_id": ["in", batch],
+                "is_return": 1,
+                "docstatus": 1,
+                "outstanding_amount": ["<", -0.01],
+            },
+            fields=fields,
+            order_by="posting_date asc, name asc",
+        )
+        for row in rows:
+            order_id = (row.amazon_order_id or "").strip()
+            if not order_id:
+                continue
+            row.account_currency = _get_account_currency(row.debit_to)
+            by_order[order_id].append(row)
+    return by_order
+
+
+def _prefetch_existing_report_credit_notes(
+    report_id: str, order_ids, *, batch_size: int = SETTLEMENT_PREFETCH_BATCH_SIZE
+) -> dict[str, str]:
+    """
+    Return this report's already-submitted Credit Note name per Amazon order.
+
+    This intentionally does not filter return_against: if an Amazon order has multiple
+    source SIs, report_id + order_id is treated as the stronger idempotency key so a rerun
+    errs toward not creating a duplicate settlement Credit Note.
+    """
+    ids = list(dict.fromkeys(str(order_id).strip() for order_id in order_ids if order_id))
+    existing: dict[str, str] = {}
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start:start + batch_size]
+        rows = frappe.get_all(
+            "Sales Invoice",
+            filters={
+                "amazon_order_id": ["in", batch],
+                "is_return": 1,
+                "docstatus": 1,
+                "custom_amazon_settlement_report_id": report_id,
+            },
+            fields=["name", "amazon_order_id"],
+            order_by="posting_date asc, name asc",
+        )
+        for row in rows:
+            order_id = (row.amazon_order_id or "").strip()
+            if order_id and order_id not in existing:
+                existing[order_id] = row.name
+    return existing
+
+
+def _prefetch_report_sales_invoice_references(rpt_id: str) -> set[tuple[str, str]]:
+    """Fetch Sales Invoice/Credit Note references already used by this report family."""
+    rows = frappe.db.sql(
+        """
+        SELECT jea.reference_name, jea.amazon_order_id
+        FROM `tabJournal Entry` je
+        JOIN `tabJournal Entry Account` jea ON jea.parent = je.name
+        WHERE je.docstatus = 1
+          AND je.cheque_no LIKE %s
+          AND jea.reference_type = 'Sales Invoice'
+          AND IFNULL(jea.reference_name, '') != ''
+          AND IFNULL(jea.amazon_order_id, '') != ''
+        """,
+        (f"{rpt_id}%",),
+        as_dict=True,
+    )
+    return {(row.reference_name, row.amazon_order_id) for row in rows}
+
+
+def _prefetch_unallocated_settlement_lines(je_name: str) -> tuple[dict, dict]:
+    """Fetch still-unreferenced settlement JE rows once in deterministic document order."""
+    credit_lines = {}
+    debit_lines = {}
+    rows = frappe.get_all(
+        "Journal Entry Account",
+        filters={"parent": je_name, "reference_type": ["is", "not set"]},
+        fields=[
+            "name", "amazon_order_id", "account", "party_type", "party", "exchange_rate",
+            "credit_in_account_currency", "debit_in_account_currency", "idx",
+        ],
+        parent_doctype="Journal Entry",
+        order_by="idx asc",
+    )
+    for row in rows:
+        order_id = (row.amazon_order_id or "").strip()
+        if not order_id:
+            continue
+        if flt(row.credit_in_account_currency) > 0 and order_id not in credit_lines:
+            credit_lines[order_id] = row
+        if flt(row.debit_in_account_currency) > 0 and order_id not in debit_lines:
+            debit_lines[order_id] = row
+    return credit_lines, debit_lines
+
+
+def _prefetch_sales_order_contexts(
+    order_ids, *, batch_size: int = SETTLEMENT_PREFETCH_BATCH_SIZE
+) -> None:
+    """
+    Seed get_sales_order_context()'s per-request cache in batches.
+
+    tabSales Order.amazon_order_id is unindexed, so the per-order lookup inside
+    resolve_order_receivable_context() costs one full scan per Amazon order.
+    Selection intentionally preserves the existing latest-non-cancelled rule.
+    """
+    cache = frappe.local.amazon_so_ctx_cache = getattr(frappe.local, "amazon_so_ctx_cache", {})
+    ids = [oid for oid in dict.fromkeys(str(o).strip() for o in order_ids if o) if oid not in cache]
+    if not ids:
+        return
+
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start:start + batch_size]
+        rows = frappe.get_all(
+            "Sales Order",
+            filters={"amazon_order_id": ["in", batch], "docstatus": ["!=", 2]},
+            fields=["name", "customer", "fulfillment_channel", "amazon_order_id"],
+            order_by="transaction_date desc, creation desc",
+        )
+        for row in rows:
+            oid = (row.amazon_order_id or "").strip()
+            if oid and oid not in cache:
+                # Same shape get_sales_order_context() would have returned.
+                cache[oid] = frappe._dict(
+                    name=row.name,
+                    customer=row.customer,
+                    fulfillment_channel=row.fulfillment_channel,
+                )
+        # Negative-cache misses so a later per-order call does not rescan the table.
+        for oid in batch:
+            cache.setdefault(oid, frappe._dict())
+
+
 def get_sales_order_context(order_id: str) -> frappe._dict:
     """Return the latest non-cancelled Amazon Sales Order customer/channel context."""
     # Cached per request: called once per AR line, per remark stamp and per CN.
@@ -526,6 +775,9 @@ def list_latest_settlement_reports(settings, limit: int = 5, days_back: int = 90
         rows = fetch_settlement_rows(settings, report)
         if not rows:
             continue
+        # Stash the parsed rows: process_settlements() would otherwise re-download and
+        # re-parse the exact same immutable report document a second time.
+        report["_settlement_rows"] = rows
         end_str = rows[0].get("settlement-end-date", "").strip()
         if not end_str:
             continue
@@ -697,6 +949,15 @@ def get_all_submitted_credit_notes_for_order(order_id: str) -> list[str]:
 # Helper: Look up account or create a new one
 # ──────────────────────────────────────────
 def get_account(settings, name: str) -> str:
+    # Cached per job: the same handful of charge descriptions repeat across every Credit
+    # Note in a settlement and tabAccount.account_name is not indexed.
+    cache = frappe.local.amazon_fee_account_cache = getattr(
+        frappe.local, "amazon_fee_account_cache", {}
+    )
+    key = (settings.company, name)
+    if key in cache:
+        return cache[key]
+
     account_name = frappe.db.get_value("Account", {"account_name": f"Amazon {name}"})
     if not account_name:
         new_account = frappe.new_doc("Account")
@@ -704,7 +965,10 @@ def get_account(settings, name: str) -> str:
         new_account.company = settings.company
         new_account.parent_account = settings.market_place_account_group
         new_account.insert(ignore_permissions=True)
-        account_name = new_account.name
+        # Not cached: a caller-level rollback can discard this uncommitted Account.
+        return new_account.name
+
+    cache[key] = account_name
     return account_name
 
 # ──────────────────────────────────────────
@@ -727,38 +991,35 @@ def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, 
     No stock impact: Purely financial (update_stock=0).
     """
     try:
-        si = frappe.get_doc("Sales Invoice", si_name)
-        if si.is_return:
-            frappe.throw("Cannot create Credit Note from another Credit Note.")
-        
-        # Filter to refund rows only (in case not pre-filtered)
+        # Filter to refund rows before loading the full source Sales Invoice document.
         refund_rows = [r for r in order_rows if r.get('transaction-type', '').lower() == 'refund']
         if not refund_rows:
             print(f"[SETT] No refund rows for {order_id}; skipping CN creation")
             return None
-        
-        # Compute the actual refund magnitude from refund rows (positive value)
-        computed_refund_amount = -sum(flt(r['amount']) for r in refund_rows)
-        
-        # Idempotency check: Skip if matching CN exists for this report_id
-        if frappe.db.exists("Sales Invoice", {
-            "return_against": si_name,
-            "amazon_order_id": order_id,
-            "company": si.company,
-            "docstatus": 1,
-            "is_return": 1,
-            "custom_amazon_settlement_report_id": report_id  # NEW: Settlement-specific check
-        }):
-            existing_cn_name = frappe.db.get_value("Sales Invoice", {  # Get name for return
+
+        # Idempotency must be the cheapest operation. return_against uniquely identifies the
+        # source invoice, so company is redundant here and no full SI load is required.
+        existing_cn_name = frappe.db.get_value(
+            "Sales Invoice",
+            {
                 "return_against": si_name,
                 "amazon_order_id": order_id,
-                "company": si.company,
                 "docstatus": 1,
                 "is_return": 1,
-                "custom_amazon_settlement_report_id": report_id
-            }, "name")
+                "custom_amazon_settlement_report_id": report_id,
+            },
+            "name",
+        )
+        if existing_cn_name:
             print(f"[SETT] Existing CN {existing_cn_name} found for refund on {si_name} (order {order_id}, report {report_id}); skipping creation")
             return existing_cn_name
+
+        si = frappe.get_doc("Sales Invoice", si_name)
+        if si.is_return:
+            frappe.throw("Cannot create Credit Note from another Credit Note.")
+
+        # Compute the actual refund magnitude from refund rows (positive value)
+        computed_refund_amount = -sum(flt(r['amount']) for r in refund_rows)
         
         # Group refund rows by SKU (including empty SKU for order-level if any)
         groups_by_sku = defaultdict(list)
@@ -808,7 +1069,10 @@ def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, 
             # Compute refunded qty and rate, respecting UOM integer requirement
             original_rate = flt(matching_item.rate)
             positive_qty = principal_amount / original_rate if original_rate != 0 else 1.0  # Fallback to 1 if rate=0
-            whole_number_required = frappe.db.get_value("UOM", matching_item.uom, "must_be_whole_number") or 0
+            whole_number_required = (  # cached: same UOMs repeat across every CN line
+                frappe.get_cached_value("UOM", matching_item.uom, "must_be_whole_number")
+                if matching_item.uom else 0
+            ) or 0
             
             if whole_number_required:
                 rounded_qty = round(positive_qty)  # Round to nearest integer
@@ -1142,6 +1406,33 @@ def build_je(
         # - Reasoning: Ensures separate lines without netting; SIs get paid via credit allocation; CNs handle refunds financially (no stock).
         # - Edge cases: Partial payments (apply to open outstanding only); missing SI (treat as advance); refunds without SI (CN skipped, debit as advance); multiple CNs (idempotency skips duplicates).
         # ──────────────────────────────────────────────
+        # Bulk prefetch before the per-order passes.
+        # amazon_order_id is unindexed on tabSales Invoice/tabSales Order, so the old
+        # per-order lookups cost 3-4 full table scans per Amazon order. Batch them once.
+        # Selection rules are identical to get_sales_invoice() / get_open_sales_invoice() /
+        # get_sales_order_context(), so invoice choice and allocation order are unchanged.
+        # ──────────────────────────────────────────────
+        prefetch_started = time.monotonic()
+        all_order_ids = list(sales_totals.keys()) + list(refund_totals.keys())
+        latest_si_by_order = _prefetch_latest_sales_invoice_contexts(all_order_ids)
+        open_si_by_order = _prefetch_latest_sales_invoice_contexts(
+            list(sales_totals.keys()), open_only=True
+        )
+        _prefetch_sales_order_contexts(all_order_ids)
+        # report_id + order_id is the stronger Credit Note idempotency key than
+        # return_against: a rerun that picks a different source SI must not create a
+        # second settlement CN for the same report.
+        existing_report_cn_by_order = _prefetch_existing_report_credit_notes(
+            rpt_id, list(refund_totals.keys())
+        )
+        print(
+            f"[SETT][PERF] {rpt_id} first-pass prefetch "
+            f"(orders={len(set(all_order_ids))}, si={len(latest_si_by_order)}, "
+            f"open_si={len(open_si_by_order)}, report_cns={len(existing_report_cn_by_order)}): "
+            f"{time.monotonic() - prefetch_started:.3f}s"
+        )
+
+        # ──────────────────────────────────────────────
         # Sales pass
         for order_id, sales_total_native in sales_totals.items():
             marketplace_name = ""
@@ -1152,8 +1443,10 @@ def build_je(
                 marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
                 merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
 
-            si_name = get_sales_invoice(order_id)
-            open_si_name = get_open_sales_invoice(order_id)
+            si_row = latest_si_by_order.get(order_id)          # latest submitted non-return SI
+            si_name = si_row.name if si_row else None
+            open_si_row = open_si_by_order.get(order_id)        # latest submitted SI with outstanding > 0
+            open_si_name = open_si_row.name if open_si_row else None
             ctx = resolve_order_receivable_context(
                 repo.amz_setting, order_id, settlement_ccy, open_si_name or si_name
             )
@@ -1231,18 +1524,22 @@ def build_je(
                 marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
                 merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
 
-            si_name = get_sales_invoice(order_id)
-            cn_name = None
+            si_row = latest_si_by_order.get(order_id)
+            si_name = si_row.name if si_row else None
+            # Reuse this report's CN if a previous crashed attempt already created one.
+            cn_name = existing_report_cn_by_order.get(order_id)
             refund_rows = [
                 r for r in order_rows
                 if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES
             ]
             # A negative refund total is a refund reversal, not a refund: no Credit Note.
-            if si_name and refund_rows and refund_total_native > 0:
+            if not cn_name and si_name and refund_rows and refund_total_native > 0:
                 cn_name = create_credit_note_for_refund(
                     repo.amz_setting, si_name, refund_total_native, post_dt, order_id,
                     marketplace_name, merchant_order_id, refund_rows, rpt_id
                 )
+                if cn_name:
+                    existing_report_cn_by_order[order_id] = cn_name
 
             ctx = resolve_order_receivable_context(
                 repo.amz_setting, order_id, settlement_ccy, cn_name or si_name
@@ -1386,7 +1683,14 @@ def build_je(
     # ──────────────────────────────────────────────
     else:
         print(f"[SETT] Non-first pass for {rpt_id}: Allocating late documents only")
-        allocate_late_documents_for_settlement(rpt_id, repo, order_groups, settlement_ccy, post_dt)
+        allocation_started = time.monotonic()
+        try:
+            allocate_late_documents_for_settlement(rpt_id, repo, order_groups, settlement_ccy, post_dt)
+        finally:
+            print(
+                f"[SETT][PERF] {rpt_id} allocate_late_documents_for_settlement: "
+                f"{time.monotonic() - allocation_started:.3f}s"
+            )
         return None  # No JE created
 
 def _resolve_advance_values():
@@ -1451,23 +1755,21 @@ def _flag_unallocated_as_advance(je_doc):
 
             
 def _enqueue_settlement_finalize(je_name: str, account_count: int | None = None) -> bool:
-    """Idempotently enqueue the settlement finalize job for an existing draft JE."""
+    """Idempotently enqueue settlement finalization using Redis/RQ job-id deduplication."""
     from frappe.utils.background_jobs import enqueue
-
-    job_name = f"Finalize Amazon Settlement {je_name}"
-    if frappe.db.exists("RQ Job", {"job_name": job_name, "status": ["in", ["queued", "started"]]}):
-        return False
 
     if account_count is None:
         account_count = frappe.db.count("Journal Entry Account", {"parent": je_name})
-    enqueue(
+
+    job = enqueue(
         "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.finalize_and_submit_settlement_je",
         queue="long" if account_count > 200 else "default",
         timeout=3600 if account_count > 200 else 300,
-        job_name=job_name,
+        job_id=f"amazon-settlement-finalize::{je_name}",
+        deduplicate=True,
         je_name=je_name,
     )
-    return True
+    return job is not None
 
 # ──────────────────────────────────────────
 # 4. — Orchestrator
@@ -1475,8 +1777,12 @@ def _enqueue_settlement_finalize(je_name: str, account_count: int | None = None)
 """
 frappe.call("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_process_settlement_report.process_settlements")
 """
-def process_settlements(): # CHANGED: Default to 4
+def process_settlements(dispatched: bool = False): # CHANGED: Default to 4
     """Pull newest settlement reports and book Journal Entries."""
+    if _dispatch_to_extended_settlement_worker_if_needed(dispatched=dispatched):
+        return
+
+    job_started = time.monotonic()
    
     amz_settings = frappe.get_all(
         "Amazon SP API Settings",
@@ -1485,12 +1791,16 @@ def process_settlements(): # CHANGED: Default to 4
     )
     if not amz_settings:
         return
-   
+
     repo = AmazonRepository("q3opu7c5ac")
+    discovery_started = time.monotonic()
     reports = list_latest_settlement_reports(repo.amz_setting, 4)
     _ensure_db_connection()
-    print(f"[SETT] pulled {len(reports)} reports")
-    for i, rpt in enumerate(reports):
+    print(
+        f"[SETT] pulled {len(reports)} reports "
+        f"([PERF] discovery/filter: {time.monotonic() - discovery_started:.3f}s)"
+    )
+    for rpt in reports:
         rpt_id = rpt["reportId"]
         submitted_je = frappe.db.get_value(
             "Journal Entry", {"cheque_no": rpt_id, "docstatus": 1}, "name", order_by="creation asc"
@@ -1519,13 +1829,28 @@ def process_settlements(): # CHANGED: Default to 4
             )
 
         first_pass = not bool(submitted_je)
+        report_started = time.monotonic()
         try:
-            rows = fetch_settlement_rows(repo.amz_setting, rpt)
+            fetch_started = time.monotonic()
+            rows = rpt.pop("_settlement_rows", None)  # reuse the discovery-phase download
+            reused_rows = rows is not None
+            if not reused_rows:
+                rows = fetch_settlement_rows(repo.amz_setting, rpt)
+            print(
+                f"[SETT][PERF] {rpt_id} fetch_settlement_rows: "
+                f"{time.monotonic() - fetch_started:.3f}s ({len(rows)} rows"
+                f"{', reused from discovery' if reused_rows else ''})"
+            )
             _ensure_db_connection()
            
             #save_settlement_csv(rpt_id, rows) #Save thet settlement reports for debugging
            
+            build_started = time.monotonic()
             je = build_je(repo, rpt, rows, first_pass)
+            print(
+                f"[SETT][PERF] {rpt_id} build_je: "
+                f"{time.monotonic() - build_started:.3f}s"
+            )
             if not je:
                 print(f"[SETT] nothing to post for {rpt_id}")
                 continue
@@ -1545,7 +1870,12 @@ def process_settlements(): # CHANGED: Default to 4
                 je.insert(ignore_permissions=True)
                 frappe.db.commit()
            
+            insert_started = time.monotonic()
             _insert_draft()
+            print(
+                f"[SETT][PERF] {rpt_id} insert/commit draft ({len(je.accounts)} lines): "
+                f"{time.monotonic() - insert_started:.3f}s"
+            )
            
             _enqueue_settlement_finalize(je.name, len(je.accounts))
             print(f"[SETT] {rpt_id} ➜ {je.name} (draft inserted; finalize/submit queued)")
@@ -1558,17 +1888,22 @@ def process_settlements(): # CHANGED: Default to 4
                 f"Settlement sync failed {rpt_id}",
                 frappe.get_traceback(),
             )
+            print(
+                f"[SETT][PERF] {rpt_id} failed after "
+                f"{time.monotonic() - report_started:.3f}s"
+            )
             continue
 
-        # NEW: Match troubleshooting's delay between reports (skip after last one)
-        if i < len(reports) - 1:
-            print(f"⏳ Waiting 10s before next report …")
-            _sleep_with_db_check(10)
+        print(
+            f"[SETT][PERF] {rpt_id} total report processing: "
+            f"{time.monotonic() - report_started:.3f}s"
+        )
 
     # execute_job() performs one final frappe.db.commit() after this function
     # returns. Hand it a live connection so that framework commit does not hit
     # an already-closed PyMySQL socket.
     _ensure_db_connection()
+    print(f"[SETT][PERF] process_settlements total: {time.monotonic() - job_started:.3f}s")
 
 def is_base_currency_only(je_doc: Document, base_ccy: str) -> bool:
     """Check if all lines are in base currency with rate=1."""
@@ -1670,11 +2005,43 @@ def create_clearing_payment_entries():
             frappe.log_error(f"Invalid custom_deposit_date in JE {je_name}", "Clearing Transfer")
             continue
         
-        # Check if Payment Entry already exists with matching reference_no
-        if frappe.db.exists(
+        # Recover an existing draft instead of creating a duplicate. A previous run may
+        # have inserted the Payment Entry and then failed before/during submit. Submitted
+        # entries remain the idempotency stop condition; drafts are retried explicitly.
+        existing_pe = frappe.db.get_value(
             "Payment Entry",
-            {"reference_no": je_dict["cheque_no"], "docstatus": 1},
-        ):
+            {
+                "reference_no": je_dict["cheque_no"],
+                "company": je_dict["company"],
+                "payment_type": "Internal Transfer",
+                "docstatus": ["<", 2],
+            },
+            ["name", "docstatus"],
+            as_dict=True,
+            order_by="creation asc",
+        )
+        if existing_pe:
+            if cint(existing_pe.docstatus) == 1:
+                continue
+
+            try:
+                draft_pe = frappe.get_doc("Payment Entry", existing_pe.name)
+                draft_pe.submit()
+                frappe.db.commit()
+                print(
+                    f"[CLEAR] Recovered and submitted existing Payment Entry "
+                    f"{draft_pe.name} for JE {je_name}"
+                )
+            except Exception:
+                _rollback_for_error()
+                _log_error_resilient(
+                    "Clearing Transfer Draft Recovery Error",
+                    (
+                        f"Failed to submit existing draft Payment Entry {existing_pe.name} "
+                        f"for JE {je_name} (settlement {je_dict['cheque_no']}).\n"
+                        f"{frappe.get_traceback()}"
+                    ),
+                )
             continue
         
         # Prepare Payment Entry
@@ -1710,10 +2077,15 @@ def create_clearing_payment_entries():
             pe.submit()
             frappe.db.commit()
             print(f"[CLEAR] Created Payment Entry {pe.name} for JE {je_name}")
-        except Exception as e:
-            frappe.log_error(
-                f"Failed to create Payment Entry for JE {je_name}: {str(e)}",
-                "Clearing Transfer Error"
+        except Exception:
+            _rollback_for_error()
+            _log_error_resilient(
+                "Clearing Transfer Error",
+                (
+                    f"Failed to create Payment Entry for JE {je_name} "
+                    f"(settlement {je_dict['cheque_no']}).\n"
+                    f"{frappe.get_traceback()}"
+                ),
             )
 
 
@@ -1802,7 +2174,8 @@ def shorten_remarks(doc, method):
 @frappe.whitelist()
 def run_daily_settlement_sync():
     """Daily scheduler entry: processes newest 4 reports."""
-    setting = frappe.get_single("Amazon SP API Settings")
+    # "Amazon SP API Settings" is a normal (non-Single) DocType here, so frappe.get_single()
+    # raised DoesNotExistError and the scheduled sync never reached process_settlements().
     process_settlements()
 
 def _clear_je_invoice_reference(row):
@@ -2082,8 +2455,8 @@ def _reconcile_submitted_journal_line(
     against_voucher_type: str,
     against_voucher: str,
     allocated_amount: float,
-) -> bool:
-    """Use ERPNext's reconciliation engine instead of mutating a submitted JE row directly."""
+) -> float:
+    """Reconcile a submitted JE row and return the amount actually allocated."""
     line = frappe.db.get_value(
         "Journal Entry Account",
         line_name,
@@ -2094,7 +2467,7 @@ def _reconcile_submitted_journal_line(
         as_dict=True,
     )
     if not line:
-        return False
+        return 0.0
 
     if flt(line.credit_in_account_currency) > 0:
         dr_or_cr = "credit_in_account_currency"
@@ -2103,11 +2476,11 @@ def _reconcile_submitted_journal_line(
         dr_or_cr = "debit_in_account_currency"
         available = flt(line.debit_in_account_currency)
     else:
-        return False
+        return 0.0
 
     apply = min(flt(allocated_amount), available)
     if apply < 0.01:
-        return False
+        return 0.0
 
     args = frappe._dict({
         "voucher_type": "Journal Entry",
@@ -2130,14 +2503,14 @@ def _reconcile_submitted_journal_line(
     try:
         reconcile_against_document([args])
         frappe.db.commit()
-        return True
+        return apply
     except Exception:
         _rollback_for_error()
         _log_error_resilient(
             f"Amazon Settlement Reconciliation {je_name} -> {against_voucher}",
             frappe.get_traceback(),
         )
-        return False
+        return 0.0
     finally:
         # reconcile_against_document sets this flag and only clears it on success.
         frappe.flags.ignore_party_validation = False
@@ -2229,7 +2602,7 @@ def _finish_pending_reclassification(
         return False
 
     print(f"[SETT] Resuming reconciliation of {je_name} -> {reclass_name} for {order_id}")
-    return _reconcile_submitted_journal_line(je_name, line.name, "Journal Entry", reclass_name, apply)
+    return bool(_reconcile_submitted_journal_line(je_name, line.name, "Journal Entry", reclass_name, apply))
 
 def _reclassify_legacy_receivable_mismatch_sale(
     rpt_id: str,
@@ -2360,20 +2733,25 @@ def _reclassify_legacy_receivable_mismatch_sale(
             return False
 
     # Consume the original unallocated settlement credit against the reclassification JE.
-    return _reconcile_submitted_journal_line(
+    return bool(_reconcile_submitted_journal_line(
         settlement_je, settlement_line.name, "Journal Entry", reclass_name, apply
-    )
+    ))
 
 def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, order_groups: dict, settlement_ccy: str, post_dt: str):
-    je_name = frappe.db.get_value("Journal Entry", {"cheque_no": rpt_id, "docstatus": 1}, "name")
+    # order_by matches process_settlements()'s submitted-JE lookup so a duplicated
+    # settlement JE cannot make the two passes operate on different documents.
+    je_name = frappe.db.get_value(
+        "Journal Entry", {"cheque_no": rpt_id, "docstatus": 1}, "name", order_by="creation asc"
+    )
     if not je_name:
         print(f"[SETT] No submitted first-pass JE for {rpt_id}; skipping allocation")
         return
 
-    # One Journal Entry scan per report rather than one cheque_no lookup per order.
-    # Include the earlier -FBM- prefix so a prior deployment cannot create a duplicate
-    # -AR- reclassification for the same report/order.
+    # One scan per report for reclassifications, existing references, and unallocated
+    # settlement lines. Fully reconciled historical reports then become nearly constant-time.
     reclass_index = _prefetch_reclassification_index(rpt_id)
+    referenced_invoice_pairs = _prefetch_report_sales_invoice_references(rpt_id)
+    credit_lines, debit_lines = _prefetch_unallocated_settlement_lines(je_name)
 
     SALES_TYPES = {"order", "order_retrocharge"}
     REFUND_TYPES = {"refund"}
@@ -2387,24 +2765,55 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
         if abs(refund_total) >= 0.01:
             refund_totals[order_id] = refund_total
 
+    # Only an order with an unreferenced settlement credit can need late sales allocation.
+    sale_candidate_ids = [
+        order_id for order_id, amount in sales_totals.items()
+        if amount >= 0.01 and order_id in credit_lines
+    ]
+    open_invoice_by_order = _prefetch_latest_sales_invoice_contexts(
+        sale_candidate_ids, open_only=True
+    )
+
+    # Refund revenue reversal is independent of JE allocation, so all positive refund orders
+    # remain CN-creation candidates. Their source invoices and existing report CNs are batched.
+    refund_candidate_ids = [
+        order_id for order_id, amount in refund_totals.items() if amount >= 0.01
+    ]
+    source_invoice_by_order = _prefetch_latest_sales_invoice_contexts(refund_candidate_ids)
+    existing_report_cn_by_order = _prefetch_existing_report_credit_notes(
+        rpt_id, refund_candidate_ids
+    )
+
+    # Only orders with an unreferenced settlement debit need open-CN reconciliation data.
+    refund_allocation_ids = [
+        order_id for order_id in refund_candidate_ids if order_id in debit_lines
+    ]
+    open_credit_notes_by_order = _prefetch_open_credit_note_contexts(refund_allocation_ids)
+
+    print(
+        f"[SETT] Late-allocation candidates for {rpt_id}: "
+        f"sales={len(sale_candidate_ids)}/{len(sales_totals)}, "
+        f"open_sales_invoices={len(open_invoice_by_order)}, "
+        f"refunds={len(refund_candidate_ids)}/{len(refund_totals)}, "
+        f"refund_lines={len(refund_allocation_ids)}, "
+        f"existing_report_cns={len(existing_report_cn_by_order)}"
+    )
+
     # Late sales: use ERPNext reconciliation if party/account already match.
     # Historical receivable party/account mismatches are repaired with a reclassification JE.
-    for order_id, sales_total_native in sales_totals.items():
-        if sales_total_native < 0.01:
-            # A net-negative order/retrocharge is not a payment against an open SI. It was
-            # intentionally booked as an unreferenced debit on first pass.
-            continue
-        # Resume a reclassification that was submitted but never reconciled. Must run
-        # before the open-invoice check, because that JE already closed the invoice.
+    for order_id in sale_candidate_ids:
+        sales_total_native = sales_totals[order_id]
+
+        # Resume a reclassification that was submitted but never reconciled. Gating this
+        # behind credit_lines is safe: the recovery helper itself requires that same line.
         if _finish_pending_reclassification(rpt_id, je_name, order_id, reclass_index):
             continue
 
-        si_name = get_open_sales_invoice(order_id)
-        if not si_name or is_already_referenced_by_report(rpt_id, si_name):
+        si = open_invoice_by_order.get(order_id)
+        si_name = si.name if si else None
+        if not si_name or (si_name, order_id) in referenced_invoice_pairs:
             continue
-
-        si = get_invoice_receivable_context(si_name)
-        if not si or si.docstatus != 1:
+        if si.docstatus != 1:
             continue
         if (
             (si.currency or "").upper() != (settlement_ccy or "").upper()
@@ -2419,10 +2828,14 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
                 ),
             )
             continue
+
         outstanding = max(flt(si.outstanding_amount), 0)
         if outstanding < 0.01:
             continue
 
+        # credit_lines is only the cheap steady-state gate. Re-read the live row: a
+        # concurrent worker or an earlier reconciliation may have shrunk or removed it,
+        # and _reclassify_legacy_receivable_mismatch_sale() posts a real JE for `apply`.
         line = frappe.db.get_value(
             "Journal Entry Account",
             {
@@ -2431,8 +2844,9 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
                 "credit_in_account_currency": [">", 0],
                 "reference_type": ["is", "not set"],
             },
-            ["name", "account", "party_type", "party", "exchange_rate", "credit_in_account_currency"],
+            ["name", "account", "party", "exchange_rate", "credit_in_account_currency", "idx"],
             as_dict=True,
+            order_by="idx asc",
         )
         if not line:
             continue
@@ -2441,29 +2855,30 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
         if apply < 0.01:
             continue
 
-        order_rows = order_groups.get(order_id, [])
-        first_row = order_rows[0] if order_rows else {}
-        marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
-        merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
-        fulfillment_channel = (get_sales_order_context(order_id).fulfillment_channel or "").upper()
-
         if line.party == si.customer and line.account == si.debit_to:
-            _reconcile_submitted_journal_line(je_name, line.name, "Sales Invoice", si_name, apply)
+            applied = _reconcile_submitted_journal_line(
+                je_name, line.name, "Sales Invoice", si_name, apply
+            )
+            if applied >= 0.01:
+                referenced_invoice_pairs.add((si_name, order_id))
         else:
+            # Sales Order/channel metadata is only needed for the exceptional legacy
+            # reclassification path; avoid another per-order query on the common path.
+            order_rows = order_groups.get(order_id, [])
+            first_row = order_rows[0] if order_rows else {}
+            marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
+            merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
+            fulfillment_channel = (get_sales_order_context(order_id).fulfillment_channel or "").upper()
             _reclassify_legacy_receivable_mismatch_sale(
                 rpt_id, je_name, line, si_name, order_id, apply, post_dt,
                 marketplace_name, merchant_order_id, fulfillment_channel, reclass_index,
             )
 
-    # Late refunds: the Credit Note must still be created (it is the revenue reversal and
-    # is idempotent per report), but the submitted JE row is never rewritten with
-    # frappe.db.set_value(). Allocation goes through ERPNext's reconciliation engine when
-    # the settlement row already carries the right party/account, and is surfaced for
-    # manual Payment Reconciliation otherwise.
-    for order_id, refund_total_native in refund_totals.items():
-        if refund_total_native < 0.01:
-            continue
-
+    # Late refunds: Credit Note creation still occurs even when no settlement debit remains.
+    # Existing report CNs are skipped before create_credit_note_for_refund(), avoiding a full
+    # source-invoice document load on every steady-state rerun.
+    for order_id in refund_candidate_ids:
+        refund_total_native = refund_totals[order_id]
         order_rows = order_groups.get(order_id, [])
         first_row = order_rows[0] if order_rows else {}
         marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
@@ -2473,18 +2888,39 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
             if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES
         ]
 
-        source_si = get_sales_invoice(order_id)
-        if source_si and refund_rows:
-            create_credit_note_for_refund(
+        source_si_ctx = source_invoice_by_order.get(order_id)
+        source_si = source_si_ctx.name if source_si_ctx else None
+        report_cn_name = existing_report_cn_by_order.get(order_id)
+
+        if source_si and refund_rows and not report_cn_name:
+            report_cn_name = create_credit_note_for_refund(
                 repo.amz_setting, source_si, refund_total_native, post_dt, order_id,
                 marketplace_name, merchant_order_id, refund_rows, rpt_id
             )
+            if report_cn_name:
+                existing_report_cn_by_order[order_id] = report_cn_name
 
-        for cn_name in get_open_credit_notes_for_order(order_id):
-            if is_already_referenced_by_report(rpt_id, cn_name):
+        # Revenue reversal above is independent of whether the old JE still has a debit.
+        # debit_lines is only the cheap steady-state gate. The live row is re-read inside
+        # the CN loop because ERPNext reconciliation can shrink or remove it after each CN.
+        if order_id not in debit_lines:
+            continue
+
+        cn_contexts = list(open_credit_notes_by_order.get(order_id, []))
+
+        # A newly created CN was not present in the bulk prefetch; fetch only that one new
+        # document context so it can still be reconciled in this same run.
+        if report_cn_name and all(cn.name != report_cn_name for cn in cn_contexts):
+            new_cn = get_invoice_receivable_context(report_cn_name)
+            if new_cn and new_cn.docstatus == 1 and flt(new_cn.outstanding_amount) < -0.01:
+                cn_contexts.append(new_cn)
+                cn_contexts.sort(key=lambda cn: (str(cn.posting_date or ""), cn.name))
+
+        for cn in cn_contexts:
+            cn_name = cn.name
+            if (cn_name, order_id) in referenced_invoice_pairs:
                 continue
-            cn = get_invoice_receivable_context(cn_name)
-            if not cn or cn.docstatus != 1:
+            if cn.docstatus != 1:
                 continue
             if (
                 (cn.currency or "").upper() != (settlement_ccy or "").upper()
@@ -2499,10 +2935,13 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
                     ),
                 )
                 continue
+
             outstanding = abs(flt(cn.outstanding_amount))
             if outstanding < 0.01:
                 continue
 
+            # Re-read the unallocated debit after every prior CN reconciliation. ERPNext may
+            # reduce the original row's balance or remove the row when it is fully consumed.
             line = frappe.db.get_value(
                 "Journal Entry Account",
                 {
@@ -2511,18 +2950,28 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
                     "debit_in_account_currency": [">", 0],
                     "reference_type": ["is", "not set"],
                 },
-                ["name", "account", "party", "debit_in_account_currency"],
+                ["name", "account", "party", "debit_in_account_currency", "idx"],
                 as_dict=True,
+                order_by="idx asc",
             )
             if not line:
                 break
 
-            apply = min(refund_total_native, outstanding, flt(line.debit_in_account_currency))
-            if apply < 0.01:
+            requested_apply = min(
+                refund_total_native,
+                outstanding,
+                flt(line.debit_in_account_currency),
+            )
+            if requested_apply < 0.01:
                 break
 
+            applied = 0.0
             if line.party == cn.customer and line.account == cn.debit_to:
-                _reconcile_submitted_journal_line(je_name, line.name, "Sales Invoice", cn_name, apply)
+                applied = _reconcile_submitted_journal_line(
+                    je_name, line.name, "Sales Invoice", cn_name, requested_apply
+                )
+                if applied >= 0.01:
+                    referenced_invoice_pairs.add((cn_name, order_id))
             else:
                 # Legacy row booked to the FBA customer. A reclassification would have to
                 # move a debit, which is the mirror of the sales case; leave it to a human.
@@ -2531,9 +2980,19 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
                     message=(
                         f"Settlement {rpt_id} row {line.name} is booked to {line.party}/{line.account} but "
                         f"Credit Note {cn_name} belongs to {cn.customer}/{cn.debit_to} (Amazon order {order_id}, "
-                        f"amount {apply}). Reconcile manually; the settlement job will not mutate submitted rows."
+                        f"amount {requested_apply}). Reconcile manually; the settlement job will not mutate submitted rows."
                     ),
                 )
-            refund_total_native = round(refund_total_native - apply, 2)
+                # Preserve existing behavior: do not try later CNs against the same mismatched
+                # legacy row, because no amount was consumed from the settlement debit.
+                break
+
+            if applied < 0.01:
+                # Reconciliation failed or another worker consumed the row concurrently.
+                # Re-read on the next outer run rather than decrementing by an amount that
+                # did not actually post.
+                break
+
+            refund_total_native = round(refund_total_native - applied, 2)
             if refund_total_native < 0.01:
                 break
