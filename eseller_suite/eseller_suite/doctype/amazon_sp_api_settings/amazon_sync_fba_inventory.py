@@ -655,7 +655,7 @@ def _erp_items_with_multiple_asins():
 
 
 def _allocate_shared_warehouse_gain(eligible, warehouse_gain):
-    """Deterministically allocate one integer warehouse-gain budget proportionally."""
+    """Deterministically allocate one integer downstream-gain budget proportionally."""
     keys = ("S", "R", "F")
     eligible = {key: max(int(eligible.get(key, 0)), 0) for key in keys}
     total_eligible = sum(eligible.values())
@@ -692,9 +692,17 @@ def _protect_snapshot_transition(old_snapshot, new_snapshot):
     shipped_to_receiving = min(shipped_drop, receiving_gain)
     remaining_shipped_drop = shipped_drop - shipped_to_receiving
 
-    eligible = {
+    fc_eligible = {
         "S": remaining_shipped_drop,
         "R": max(old_snapshot["R"] - new_snapshot["R"], 0),
+        "F": 0,
+    }
+    fc_gain = max(new_snapshot["F"] - old_snapshot["F"], 0)
+    fc_matched = _allocate_shared_warehouse_gain(fc_eligible, fc_gain)
+
+    eligible = {
+        "S": fc_eligible["S"] - fc_matched["S"],
+        "R": fc_eligible["R"] - fc_matched["R"],
         "F": max(old_snapshot["F"] - new_snapshot["F"], 0),
     }
     warehouse_gain = max(new_snapshot["C"] - old_snapshot["C"], 0)
@@ -709,6 +717,9 @@ def _protect_snapshot_transition(old_snapshot, new_snapshot):
 
     return main_target, protected_inbound, {
         "shipped_to_receiving": shipped_to_receiving,
+        "fc_gain": fc_gain,
+        "fc_eligible": fc_eligible,
+        "fc_matched": fc_matched,
         "warehouse_gain": warehouse_gain,
         "eligible": eligible,
         "matched": matched,
@@ -850,20 +861,46 @@ def _build_protected_inventory_targets(
         current_main = int(current_main_by_asin.get(asin, 0) or 0)
         current_inbound = int(current_inbound_by_asin.get(asin, 0) or 0)
 
-        if today_snapshot is not None and yesterday_snapshot is not None:
-            mode = "NORMAL TWO-REPORT"
-            main_target, inbound_target, diagnostics = _protect_snapshot_transition(
+        if (
+            yesterday_snapshot is not None
+            and today_snapshot is not None
+            and live_snapshot is not None
+        ):
+            mode = "YESTERDAY -> PROTECTED TODAY -> LIVE API"
+            _, _, report_diagnostics = _protect_snapshot_transition(
                 yesterday_snapshot, today_snapshot
             )
-            old_source = (
-                f"YESTERDAY report {yesterday_source['report'].get('reportId')}"
+            protected_today = dict(today_snapshot)
+            for key in ("S", "R", "F"):
+                protected_today[key] += report_diagnostics["carry"][key]
+            main_target, inbound_target, diagnostics = _protect_snapshot_transition(
+                protected_today, live_snapshot
             )
-            new_source = f"TODAY report {today_source['report'].get('reportId')}"
             if DEBUG:
                 print(
-                    f"[DEBUG] {asin} mode={mode} old={yesterday_snapshot} "
-                    f"new={today_snapshot} old_source={old_source} new_source={new_source} "
-                    f"S->R={diagnostics['shipped_to_receiving']} "
+                    f"[DEBUG] {asin} mode={mode} yesterday={yesterday_snapshot} "
+                    f"today={today_snapshot} protected_today={protected_today} "
+                    f"live={live_snapshot} first_carry={report_diagnostics['carry']} "
+                    f"first_S->F/R->F={report_diagnostics['fc_matched']} "
+                    f"second_S->R={diagnostics['shipped_to_receiving']} "
+                    f"second_S->F/R->F={diagnostics['fc_matched']} "
+                    f"warehouse_gain={diagnostics['warehouse_gain']} "
+                    f"eligible={diagnostics['eligible']} matched={diagnostics['matched']} "
+                    f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
+                )
+
+        elif today_snapshot is not None and live_snapshot is not None:
+            mode = "TODAY REPORT -> LIVE API"
+            main_target, inbound_target, diagnostics = _protect_snapshot_transition(
+                today_snapshot, live_snapshot
+            )
+            if DEBUG:
+                print(
+                    f"[DEBUG] {asin} mode={mode} old={today_snapshot} "
+                    f"new={live_snapshot} old_source=TODAY report "
+                    f"{today_source['report'].get('reportId')} "
+                    f"new_source=LIVE S->R={diagnostics['shipped_to_receiving']} "
+                    f"S->F/R->F={diagnostics['fc_matched']} "
                     f"warehouse_gain={diagnostics['warehouse_gain']} "
                     f"eligible={diagnostics['eligible']} matched={diagnostics['matched']} "
                     f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
@@ -880,32 +917,30 @@ def _build_protected_inventory_targets(
                     f"new={live_snapshot} old_source=YESTERDAY report "
                     f"{yesterday_source['report'].get('reportId')} "
                     f"new_source=LIVE S->R={diagnostics['shipped_to_receiving']} "
+                    f"S->F/R->F={diagnostics['fc_matched']} "
                     f"warehouse_gain={diagnostics['warehouse_gain']} "
                     f"eligible={diagnostics['eligible']} matched={diagnostics['matched']} "
                     f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
                 )
 
-        elif today_snapshot is not None and live_snapshot is not None:
-            mode = "TODAY REPORT -> LIVE API WITH PROBLEM-CATEGORY FLOOR"
-            live_inbound = live_snapshot["S"] + live_snapshot["R"]
-            report_inbound_floor = today_snapshot["S"] + today_snapshot["R"]
-            protected_inbound = max(live_inbound, report_inbound_floor)
-            protected_fc = max(live_snapshot["F"], today_snapshot["F"])
-            main_target = live_snapshot["C"] + protected_fc
-            inbound_target = protected_inbound
-            shipped_drop = max(today_snapshot["S"] - live_snapshot["S"], 0)
-            receiving_gain = max(live_snapshot["R"] - today_snapshot["R"], 0)
-            shipped_to_receiving = min(shipped_drop, receiving_gain)
+        elif today_snapshot is not None and yesterday_snapshot is not None:
+            mode = "NORMAL TWO-REPORT"
+            main_target, inbound_target, diagnostics = _protect_snapshot_transition(
+                yesterday_snapshot, today_snapshot
+            )
+            old_source = (
+                f"YESTERDAY report {yesterday_source['report'].get('reportId')}"
+            )
+            new_source = f"TODAY report {today_source['report'].get('reportId')}"
             if DEBUG:
                 print(
-                    f"[DEBUG] {asin} mode={mode} today={today_snapshot} live={live_snapshot} "
-                    f"today_source={today_source['report'].get('reportId')} "
-                    f"live_source=LIVE S->R={shipped_to_receiving} "
-                    f"pre_floor_inbound={live_inbound} "
-                    f"pre_floor_fc={live_snapshot['F']} inbound_floor={report_inbound_floor} "
-                    f"fc_floor={today_snapshot['F']} protected_inbound={protected_inbound} "
-                    f"protected_fc={protected_fc} live_core={live_snapshot['C']} "
-                    f"main={main_target}"
+                    f"[DEBUG] {asin} mode={mode} old={yesterday_snapshot} "
+                    f"new={today_snapshot} old_source={old_source} new_source={new_source} "
+                    f"S->R={diagnostics['shipped_to_receiving']} "
+                    f"S->F/R->F={diagnostics['fc_matched']} "
+                    f"warehouse_gain={diagnostics['warehouse_gain']} "
+                    f"eligible={diagnostics['eligible']} matched={diagnostics['matched']} "
+                    f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
                 )
 
         else:
