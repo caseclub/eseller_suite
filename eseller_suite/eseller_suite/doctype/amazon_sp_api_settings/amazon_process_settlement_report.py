@@ -152,6 +152,7 @@ def get_open_sales_invoice(order_id: str) -> str | None:
 SETTLEMENT_SYNC_TIMEOUT_SECONDS = 3600
 SETTLEMENT_PREFETCH_BATCH_SIZE = 500
 SETTLEMENT_SYNC_JOB_ID = "amazon-settlement-sync"
+_GROSS_UP_REMARK = "Amazon seller-fee gross-up to customer AR"
 # amazon_order_id indexes are optional. The settlement hot path is designed to
 # remain efficient without schema changes by batching lookups and restricting
 # late-allocation work to orders that still have unallocated settlement lines.
@@ -539,6 +540,58 @@ def _append_ar_line(ar_lines: list, base: dict, amount: float, credit: bool):
     is_credit = credit if amount > 0 else not credit
     line["credit_in_account_currency" if is_credit else "debit_in_account_currency"] = abs(flt(amount))
     ar_lines.append(line)
+
+def _sales_settlement_components(order_rows: list[dict]) -> tuple[float, dict[str, float]]:
+    """
+    Return Amazon's net sale total plus classified negative ordinary-Order components.
+
+    Only clearly seller-side fees are eligible to gross customer AR back up. Marketplace-
+    facilitator/withheld tax, promotions, and unknown negative components are deliberately
+    excluded from the miscellaneous-fulfillment-fee gross-up because they can have different
+    accounting treatment. Negative order_retrocharge rows preserve their historical AR treatment.
+    """
+    net_sale_total = 0.0
+    negative = {
+        "seller_fee": 0.0,
+        "withheld_tax": 0.0,
+        "promotion": 0.0,
+        "unclassified": 0.0,
+    }
+    for row in order_rows:
+        transaction_type = (row.get("transaction-type") or "").strip().lower()
+        if transaction_type not in {"order", "order_retrocharge"}:
+            continue
+
+        amount = flt(row.get("amount"))
+        net_sale_total += amount
+        if transaction_type != "order" or amount >= 0:
+            continue
+
+        amount_type = re.sub(r"[^a-z0-9]+", "", (row.get("amount-type") or "").lower())
+        description = re.sub(r"[^a-z0-9]+", "", (row.get("amount-description") or "").lower())
+        magnitude = abs(amount)
+
+        # Classification order matters. Amazon's SalesTaxCollectionFee is a seller fee even
+        # though its label contains "tax"; true withheld/marketplace-facilitator taxes are not.
+        if "taxcollectionfee" in amount_type or "taxcollectionfee" in description:
+            negative["seller_fee"] += magnitude
+        elif "tax" in amount_type or "tax" in description or "withheld" in amount_type or "withheld" in description:
+            negative["withheld_tax"] += magnitude
+        elif "promotion" in amount_type or "promotion" in description:
+            negative["promotion"] += magnitude
+        elif (
+            "fee" in amount_type
+            or "fee" in description
+            or "commission" in amount_type
+            or "commission" in description
+            or "chargeback" in amount_type
+            or "chargeback" in description
+        ):
+            negative["seller_fee"] += magnitude
+        else:
+            negative["unclassified"] += magnitude
+
+    return net_sale_total, negative
 
 def cancel_sales_invoice(inv_name: str) -> bool:
     """
@@ -1266,12 +1319,9 @@ def build_je(
         print(f"[SETT] nothing to post for {rpt_id} (native_total = 0)")
         return None
     # ──────────────────────────────────────────────
-    # CHANGE: Replace single net order_totals with separate sales_totals and refund_totals (positive magnitudes).
-    # - sales_totals: sum positive "order" + "order_retrocharge" (treat retrocharge as sales adjustment, per original ORDER_NET_TYPES).
-    # - refund_totals: -sum negative "refund" (positive magnitude for clarity in AR debit lines and CN creation).
-    # - Still group rows for metadata/CN creation, but no netting.
-    # - Reasoning: Allows separate AR lines for sales (credit) and refunds (debit), so SIs get paid even if refunds > sales in same report.
-    # - Edge cases: Zero totals skipped; multiple SIs per order_id (rare, uses latest via get_sales_invoice); mixed currencies (preserved via per-line exchange_rate).
+    # Keep Amazon's net sale total for settlement balancing, but separately track negative
+    # ordinary Order rows. Those deductions may need to be grossed up against an open Sales
+    # Invoice instead of being allowed to reduce customer Accounts Receivable.
     # ──────────────────────────────────────────────
     SALES_TYPES = {"order", "order_retrocharge"}
     REFUND_TYPES = {"refund"}
@@ -1285,21 +1335,34 @@ def build_je(
                 order_groups[order_id].append(r)
     # Calculate separate totals per order
     sales_totals = {}
+    order_fee_deduction_totals = {}
+    order_negative_components = {}
     refund_totals = {}
     total_sales_native = 0.0
+    total_order_fee_deductions_native = 0.0
     total_refund_native = 0.0  # Positive magnitude
     for order_id, order_rows in order_groups.items():
-        sales_total = sum(float(r["amount"]) for r in order_rows if (r.get("transaction-type") or "").strip().lower() in SALES_TYPES)
+        sales_total, negative_components = _sales_settlement_components(order_rows)
+        seller_fee_deductions = negative_components["seller_fee"]
         refund_total = -sum(float(r["amount"]) for r in order_rows if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES)
-        if abs(sales_total) >= 0.01:
+
+        # Preserve net-negative order_retrocharge behavior, but also retain a net-zero/negative
+        # order when it has classified seller fees so those fees can still self-heal open AR.
+        if abs(sales_total) >= 0.01 or seller_fee_deductions >= 0.01:
             sales_totals[order_id] = sales_total
             total_sales_native += sales_total
+        if seller_fee_deductions >= 0.01:
+            order_fee_deduction_totals[order_id] = seller_fee_deductions
+            total_order_fee_deductions_native += seller_fee_deductions
+        if any(value >= 0.01 for value in negative_components.values()):
+            order_negative_components[order_id] = negative_components
         if abs(refund_total) >= 0.01:
             refund_totals[order_id] = refund_total
             total_refund_native += refund_total
-    # CHANGE: Recompute order_net_native as sales - refunds for fee calc (preserves original fees_usd logic without change).
+    # Preserve existing settlement residual math: it is based on Amazon's net order rows.
     order_net_native = total_sales_native - total_refund_native
-    print(f"Sales total: {total_sales_native}")
+    print(f"Sales total (net settlement): {total_sales_native}")
+    print(f"Seller-fee deductions eligible for AR gross-up: {total_order_fee_deductions_native}")
     print(f"Refund total (positive): {total_refund_native}")
     print(f"Net (for fees): {order_net_native}")
    
@@ -1383,6 +1446,12 @@ def build_je(
         # ──────────────────────────────────────────────
         non_ar_lines = []
         ar_lines = []
+        # Track seller-fee gross-up per Amazon order. Keeping it per-order gives late allocation
+        # an explicit marker that a newer first-pass JE already performed the repair.
+        order_fee_gross_up_by_order = defaultdict(float)
+        first_pass_remaining_outstanding = {}
+        nonfee_review_orders = []
+        nonfee_review_totals = defaultdict(float)
         # ──────────────────────────────────────────────
         # 1) Add clearing account line: Debit or Credit based on total
         # ──────────────────────────────────────────────
@@ -1462,6 +1531,11 @@ def build_je(
                 ctx.fulfillment_channel, is_refund=False,
             )
             remaining = sales_total_native
+            available_outstanding = max(flt(ctx.outstanding), 0)
+            if open_si_name:
+                available_outstanding = first_pass_remaining_outstanding.setdefault(
+                    open_si_name, available_outstanding
+                )
 
             # Only reference an invoice denominated in the settlement currency; a native
             # amount posted against a differently-denominated AR account is not meaningful.
@@ -1496,11 +1570,59 @@ def build_je(
                     unref_ctx.fulfillment_channel, is_refund=False,
                 )
 
+            # Gross up only negative ordinary-Order components that are clearly seller fees.
+            # This works even when Amazon's net order is zero/negative: adding the eligible fee
+            # back transforms only the fee portion while preserving retrocharges/other negatives.
+            fee_deduction = order_fee_deduction_totals.get(order_id, 0.0)
+            if si_name and not open_si_name and fee_deduction >= 0.01:
+                print(
+                    f"[SETT] Classified seller fees {fee_deduction:.2f} for {order_id} were not "
+                    "grossed up because the Sales Invoice is already closed; no speculative AR "
+                    "or expense correction is posted automatically"
+                )
+            if open_si_name and ccy_ok and available_outstanding > 0 and fee_deduction >= 0.01:
+                gross_up = min(
+                    fee_deduction,
+                    max(available_outstanding - remaining, 0.0),
+                )
+                if gross_up >= 0.01:
+                    remaining = round(remaining + gross_up, 2)
+                    order_fee_gross_up_by_order[order_id] += gross_up
+                    print(
+                        f"[SETT] Grossed up {order_id} AR by {gross_up:.2f} from classified "
+                        f"seller fees so {open_si_name} can be paid against gross AR"
+                    )
+
+                unused_fee = max(fee_deduction - gross_up, 0.0)
+                if unused_fee >= 0.01:
+                    print(
+                        f"[SETT] Conservative gross-up left {unused_fee:.2f} of classified seller "
+                        f"fees unused for {order_id}; invoice state caps automatic AR repair"
+                    )
+
+            excluded = order_negative_components.get(order_id, {})
+            excluded_nonfee = sum(
+                flt(excluded.get(bucket))
+                for bucket in ("withheld_tax", "promotion", "unclassified")
+            )
+            projected_shortfall = max(available_outstanding - max(remaining, 0.0), 0.0)
+            if open_si_name and ccy_ok and projected_shortfall >= 0.01 and excluded_nonfee >= 0.01:
+                print(
+                    f"[SETT] {order_id} still has projected invoice shortfall "
+                    f"{projected_shortfall:.2f} after seller-fee gross-up; excluded negative "
+                    f"Order components: withheld_tax={flt(excluded.get('withheld_tax')):.2f}, "
+                    f"promotion={flt(excluded.get('promotion')):.2f}, "
+                    f"unclassified={flt(excluded.get('unclassified')):.2f}"
+                )
+                nonfee_review_orders.append(order_id)
+                nonfee_review_totals["shortfall"] += projected_shortfall
+                for bucket in ("withheld_tax", "promotion", "unclassified"):
+                    nonfee_review_totals[bucket] += flt(excluded.get(bucket))
+
             # Reference only the amount ERPNext says is currently outstanding. Negative
-            # sales totals (net retrocharges) are never referenced: a debit against an SI
-            # would re-open an already-settled invoice.
-            if open_si_name and ccy_ok and remaining > 0 and ctx.outstanding > 0:
-                apply = min(remaining, ctx.outstanding)
+            # residual sales totals remain unreferenced debits instead of reopening an SI.
+            if open_si_name and ccy_ok and remaining > 0 and available_outstanding > 0:
+                apply = min(remaining, available_outstanding)
                 if apply >= 0.01:
                     ref_line = dict(base_line)
                     ref_line.update({
@@ -1509,10 +1631,29 @@ def build_je(
                     })
                     _append_ar_line(ar_lines, ref_line, apply, credit=True)
                     remaining = round(remaining - apply, 2)
+                    first_pass_remaining_outstanding[open_si_name] = max(
+                        available_outstanding - apply, 0.0
+                    )
 
             # Preserve any excess/unmatched settlement amount (either sign) as an
             # unreferenced party line instead of over-allocating or dropping it.
             _append_ar_line(ar_lines, base_line, remaining, credit=True)
+
+        if nonfee_review_orders:
+            sample = ", ".join(nonfee_review_orders[:20])
+            suffix = "" if len(nonfee_review_orders) <= 20 else f" (+{len(nonfee_review_orders) - 20} more)"
+            frappe.log_error(
+                title="Amazon Settlement Non-Fee Negative Component Review",
+                message=(
+                    f"Settlement {rpt_id}: {len(nonfee_review_orders)} order(s) retain projected "
+                    f"invoice shortfall after safe seller-fee gross-up. Aggregate shortfall="
+                    f"{nonfee_review_totals['shortfall']:.2f}; excluded negative Order components: "
+                    f"withheld_tax={nonfee_review_totals['withheld_tax']:.2f}, "
+                    f"promotion={nonfee_review_totals['promotion']:.2f}, "
+                    f"unclassified={nonfee_review_totals['unclassified']:.2f}. "
+                    f"Sample order IDs: {sample}{suffix}. Per-order detail is in the settlement log."
+                ),
+            )
 
         # Refund pass
         for order_id, refund_total_native in refund_totals.items():
@@ -1622,6 +1763,21 @@ def build_je(
                 "exchange_rate": 1,
                 "user_remark": desc.title(),
             })
+        # Seller-fee gross-up debits balance the extra AR credits above. Keep the order marker
+        # in user_remark, NOT amazon_order_id: _prefetch_unallocated_settlement_lines() treats
+        # an unreferenced debit with amazon_order_id as customer settlement inventory, and this
+        # non-party fee row would otherwise shadow the real refund/offset AR debit by idx order.
+        for order_id, gross_up_native in order_fee_gross_up_by_order.items():
+            gross_up_usd = round(gross_up_native * rate, 2)
+            if gross_up_usd < 0.01:
+                continue
+            non_ar_lines.append({
+                "account": repo.amz_setting.custom_amazon_miscellaneous_fulfillment_fees_account,
+                "debit_in_account_currency": gross_up_usd,
+                "exchange_rate": 1,
+                "user_remark": f"{_GROSS_UP_REMARK}::{order_id}",
+            })
+
         # ──────────────────────────────────────────────
         # 5) Add miscellaneous fees line if significant (unchanged)
         # ──────────────────────────────────────────────
@@ -2244,6 +2400,35 @@ def _revalidate_draft_settlement_allocations(je) -> bool:
     remaining_by_invoice = {}
     changed = False
 
+    # A first-pass seller-fee gross-up debit deliberately remains even if submit-time
+    # revalidation later detaches/caps its matching invoice credit. Track that race so it
+    # cannot silently leave a grossed-up customer advance without an explicit review signal.
+    gross_up_base_remaining_by_order = defaultdict(float)
+    marker_prefix = f"{_GROSS_UP_REMARK}::"
+    for marker_row in je.accounts:
+        remark = (marker_row.user_remark or "").strip()
+        if not remark.startswith(marker_prefix):
+            continue
+        order_id = remark[len(marker_prefix):].strip()
+        if order_id:
+            gross_up_base_remaining_by_order[order_id] += flt(marker_row.debit_in_account_currency)
+    gross_up_detach_events = []
+
+    def record_gross_up_detachment(source_row, detached_native: float):
+        order_id = (source_row.amazon_order_id or "").strip()
+        if not order_id or detached_native < 0.01:
+            return
+        remaining_base = gross_up_base_remaining_by_order.get(order_id, 0.0)
+        if remaining_base < 0.01:
+            return
+        row_rate = flt(source_row.exchange_rate) or 1
+        detached_base = max(flt(detached_native) * row_rate, 0.0)
+        stranded_base = min(detached_base, remaining_base)
+        if stranded_base < 0.01:
+            return
+        gross_up_base_remaining_by_order[order_id] = max(remaining_base - stranded_base, 0.0)
+        gross_up_detach_events.append((order_id, source_row.reference_name, stranded_base))
+
     for row in list(je.accounts):
         if row.reference_type != "Sales Invoice" or not row.reference_name:
             continue
@@ -2270,6 +2455,8 @@ def _revalidate_draft_settlement_allocations(je) -> bool:
             reason = "reference direction is invalid for the invoice/credit-note type"
 
         if reason:
+            if not is_return:
+                record_gross_up_detachment(row, row_amount)
             _clear_je_invoice_reference(row)
             changed = True
             print(f"[SETT] Detached stale reference {invoice_name} from {je.name}: {reason}")
@@ -2289,6 +2476,8 @@ def _revalidate_draft_settlement_allocations(je) -> bool:
             continue
 
         residual = round(row_amount - allowed, 9)
+        if not is_return:
+            record_gross_up_detachment(row, residual)
         if allowed < 0.01:
             # The invoice was paid/closed after this JE was drafted. Keep the entire amount
             # as an unreferenced customer line rather than failing submission or overpaying.
@@ -2301,6 +2490,24 @@ def _revalidate_draft_settlement_allocations(je) -> bool:
         print(
             f"[SETT] Revalidated {je.name} -> {invoice_name}: live outstanding={available_outstanding}, "
             f"referenced={allowed}, residual_unreferenced={residual}"
+        )
+
+    if gross_up_detach_events:
+        total_base = sum(event[2] for event in gross_up_detach_events)
+        sample = ", ".join(
+            f"{order_id}->{invoice_name or 'unknown'}"
+            for order_id, invoice_name, _ in gross_up_detach_events[:20]
+        )
+        suffix = "" if len(gross_up_detach_events) <= 20 else f" (+{len(gross_up_detach_events) - 20} more)"
+        frappe.log_error(
+            title="Amazon Settlement Gross-Up Submit-Time Detachment Review",
+            message=(
+                f"Journal Entry {je.name}: submit-time invoice revalidation detached/capped "
+                f"{len(gross_up_detach_events)} grossed-up sales allocation(s), potentially leaving "
+                f"{total_base:.2f} in company-currency gross-up value as unreferenced customer credit "
+                f"while the corresponding seller-fee debit remains. This can be legitimate when an "
+                f"invoice was paid elsewhere after build, but requires review. Sample: {sample}{suffix}."
+            ),
         )
 
     if changed:
@@ -2523,16 +2730,20 @@ def _legacy_reclass_cheque_no(rpt_id: str, order_id: str) -> str:
     """Backward-compatible ID used by the earlier FBM-specific patch."""
     return f"{rpt_id}-FBM-{hashlib.sha1(order_id.encode()).hexdigest()[:10]}"
 
+def _gross_up_cheque_no(rpt_id: str, order_id: str) -> str:
+    """Deterministic idempotency key for legacy net-settlement AR gross-up repairs."""
+    return f"{rpt_id}-GROSS-{hashlib.sha1(order_id.encode()).hexdigest()[:10]}"
+
 def _prefetch_reclassification_index(rpt_id: str) -> dict[str, frappe._dict]:
-    """Fetch current and legacy reclassification JEs once per settlement report."""
+    """Fetch current, legacy and gross-up receivable repair JEs once per report."""
     rows = frappe.db.sql(
         """
         SELECT name, cheque_no, docstatus
         FROM `tabJournal Entry`
         WHERE docstatus != 2
-          AND (cheque_no LIKE %s OR cheque_no LIKE %s)
+          AND (cheque_no LIKE %s OR cheque_no LIKE %s OR cheque_no LIKE %s)
         """,
-        (f"{rpt_id}-AR-%", f"{rpt_id}-FBM-%"),
+        (f"{rpt_id}-AR-%", f"{rpt_id}-FBM-%", f"{rpt_id}-GROSS-%"),
         as_dict=True,
     )
     return {row.cheque_no: row for row in rows}
@@ -2737,6 +2948,298 @@ def _reclassify_legacy_receivable_mismatch_sale(
         settlement_je, settlement_line.name, "Journal Entry", reclass_name, apply
     ))
 
+def _existing_gross_up(
+    rpt_id: str, order_id: str, repair_index: dict[str, frappe._dict] | None = None
+) -> frappe._dict:
+    ref = _gross_up_cheque_no(rpt_id, order_id)
+    if repair_index is not None:
+        return repair_index.get(ref) or frappe._dict()
+    return frappe.db.get_value(
+        "Journal Entry",
+        {"cheque_no": ref, "docstatus": ["!=", 2]},
+        ["name", "cheque_no", "docstatus"],
+        as_dict=True,
+    ) or frappe._dict()
+
+def _finish_pending_gross_up_offset(
+    rpt_id: str,
+    settlement_je: str,
+    order_id: str,
+    settlement_debit_line: frappe._dict | None,
+    repair_index: dict[str, frappe._dict] | None = None,
+) -> bool:
+    """Resume a crash-interrupted net-negative gross-up offset reconciliation."""
+    if not settlement_debit_line:
+        return False
+    existing = _existing_gross_up(rpt_id, order_id, repair_index)
+    if not existing or cint(existing.docstatus) != 1:
+        return False
+
+    offset_line = frappe.db.get_value(
+        "Journal Entry Account",
+        {
+            "parent": existing.name,
+            "amazon_order_id": order_id,
+            "credit_in_account_currency": [">", 0],
+            "reference_type": ["is", "not set"],
+        },
+        ["name", "account", "party", "credit_in_account_currency"],
+        as_dict=True,
+        order_by="idx asc",
+    )
+    if not offset_line:
+        return False
+    if (
+        offset_line.account != settlement_debit_line.account
+        or offset_line.party != settlement_debit_line.party
+    ):
+        frappe.log_error(
+            title="Amazon Settlement Gross-Up Offset Manual Review",
+            message=(
+                f"Cannot resume gross-up offset for {order_id}: source settlement debit "
+                f"{settlement_debit_line.name} party/account does not match correction "
+                f"{existing.name} line {offset_line.name}."
+            ),
+        )
+        return False
+
+    apply = min(
+        flt(settlement_debit_line.debit_in_account_currency),
+        flt(offset_line.credit_in_account_currency),
+    )
+    if apply < 0.01:
+        return False
+    print(
+        f"[SETT] Resuming gross-up offset reconciliation {settlement_je} -> "
+        f"{existing.name} for {order_id} amount={apply:.2f}"
+    )
+    return bool(_reconcile_submitted_journal_line(
+        settlement_je, settlement_debit_line.name, "Journal Entry", existing.name, apply
+    ))
+
+def _post_legacy_order_deduction_gross_up(
+    rpt_id: str,
+    settlement_je: str,
+    si_name: str,
+    order_id: str,
+    deduction_available: float,
+    settlement_debit_line: frappe._dict | None,
+    post_dt: str,
+    marketplace_name: str,
+    merchant_order_id: str,
+    fulfillment_channel: str | None,
+    repo: AmazonRepository,
+    repair_index: dict[str, frappe._dict] | None = None,
+) -> bool:
+    """
+    Repair a historical settlement that netted classified seller fees into customer AR.
+
+    The original submitted settlement JE cannot be rewritten. Post a deterministic correction
+    JE that debits the configured Amazon miscellaneous-fees account and credits the still-open
+    Sales Invoice for no more than both its live outstanding and the report's still-unused,
+    positively-classified seller-fee deductions.
+    """
+    si = get_invoice_receivable_context(si_name)
+    if not si or si.docstatus != 1:
+        return False
+
+    outstanding = max(flt(si.outstanding_amount), 0)
+
+    # A historical net-negative sale created an unreferenced customer debit. A complete repair
+    # may therefore need seller-fee credit both against the invoice and against that old debit.
+    sale_debit_available = 0.0
+    if (
+        settlement_debit_line
+        and settlement_debit_line.account == si.debit_to
+        and settlement_debit_line.party == si.customer
+    ):
+        sale_debit_available = max(flt(settlement_debit_line.debit_in_account_currency), 0)
+
+    repair_total = min(
+        max(flt(deduction_available), 0),
+        outstanding + sale_debit_available,
+    )
+    invoice_apply = min(outstanding, repair_total)
+    offset_apply = min(sale_debit_available, max(repair_total - invoice_apply, 0.0))
+    if repair_total < 0.01:
+        return False
+
+    existing = _existing_gross_up(rpt_id, order_id, repair_index)
+    if existing:
+        if cint(existing.docstatus) == 1:
+            return True
+        frappe.log_error(
+            title="Amazon Settlement Gross-Up Manual Review",
+            message=(
+                f"Draft gross-up JE {existing.name} exists for Amazon order {order_id}; "
+                "submit or delete it before retrying."
+            ),
+        )
+        return False
+
+    company = frappe.db.get_value("Journal Entry", settlement_je, "company")
+    company_currency = (frappe.get_cached_value("Company", company, "default_currency") or "").upper()
+    ar_currency = _get_account_currency(si.debit_to, company)
+    fee_account = repo.amz_setting.custom_amazon_miscellaneous_fulfillment_fees_account
+    fee_currency = _get_account_currency(fee_account, company)
+    if fee_currency != company_currency:
+        frappe.log_error(
+            title="Amazon Settlement Gross-Up Manual Review",
+            message=(
+                f"Cannot auto gross-up Amazon order {order_id}: fee account {fee_account} currency "
+                f"{fee_currency} != company currency {company_currency}."
+            ),
+        )
+        return False
+
+    settlement_line = frappe.db.get_value(
+        "Journal Entry Account",
+        {
+            "parent": settlement_je,
+            "amazon_order_id": order_id,
+            "credit_in_account_currency": [">", 0],
+        },
+        ["exchange_rate", "account"],
+        as_dict=True,
+        order_by="idx asc",
+    )
+    if not settlement_line and settlement_debit_line:
+        settlement_line = settlement_debit_line
+    if not settlement_line:
+        return False
+
+    rate = flt(settlement_line.exchange_rate) or 1
+    if offset_apply >= 0.01 and ar_currency != company_currency:
+        frappe.log_error(
+            title="Amazon Settlement Gross-Up Manual Review",
+            message=(
+                f"Cannot auto gross-up net-negative Amazon order {order_id} in foreign-currency AR "
+                f"{ar_currency}: the repair requires a split invoice/settlement-debit credit. "
+                f"Settlement JE={settlement_je}, SI={si_name}."
+            ),
+        )
+        return False
+    if ar_currency != company_currency and abs(rate - flt(si.conversion_rate)) > 0.000001:
+        frappe.log_error(
+            title="Amazon Settlement Gross-Up Manual Review",
+            message=(
+                f"Cannot auto gross-up Amazon order {order_id}: settlement exchange rate {rate} "
+                f"!= invoice conversion_rate {si.conversion_rate} for {ar_currency}. "
+                f"Settlement JE={settlement_je}, SI={si_name}."
+            ),
+        )
+        return False
+
+    base_amount = round(repair_total * rate, 9)
+    correction_ref = _gross_up_cheque_no(rpt_id, order_id)
+    correction_accounts = [{
+        "account": fee_account,
+        "exchange_rate": 1,
+        "debit_in_account_currency": base_amount,
+        "user_remark": "Legacy Amazon seller-fee gross-up",
+    }]
+
+    if invoice_apply >= 0.01:
+        target_line = {
+            "account": si.debit_to,
+            "party_type": "Customer",
+            "party": si.customer,
+            "exchange_rate": rate,
+            "credit_in_account_currency": invoice_apply,
+            "reference_type": "Sales Invoice",
+            "reference_name": si_name,
+            "amazon_order_id": order_id,
+        }
+        if fulfillment_channel is None:
+            fulfillment_channel = (get_sales_order_context(order_id).fulfillment_channel or "").upper()
+        stamp_marketplace_fields(
+            target_line, {}, marketplace_name, merchant_order_id,
+            fulfillment_channel, is_refund=False,
+        )
+        correction_accounts.append(target_line)
+
+    if offset_apply >= 0.01:
+        offset_line = {
+            "account": settlement_debit_line.account,
+            "party_type": "Customer",
+            "party": settlement_debit_line.party,
+            "exchange_rate": rate,
+            "credit_in_account_currency": offset_apply,
+            "amazon_order_id": order_id,
+            "is_advance": _ADV_YES,
+        }
+        stamp_marketplace_fields(
+            offset_line, {}, marketplace_name, merchant_order_id,
+            fulfillment_channel or "", is_refund=False,
+        )
+        stamped_remark = offset_line.get("user_remark") or "Amazon Order"
+        offset_line["user_remark"] = (
+            f"{stamped_remark}; Legacy seller-fee gross-up offset for net-negative settlement"
+        )
+        correction_accounts.append(offset_line)
+    correction_dt = max(getdate(post_dt), getdate(si.posting_date)).strftime("%Y-%m-%d")
+    correction = frappe.get_doc({
+        "doctype": "Journal Entry",
+        "voucher_type": "Journal Entry",
+        "company": company,
+        "posting_date": correction_dt,
+        "cheque_no": correction_ref,
+        "cheque_date": correction_dt,
+        "multi_currency": 1 if ar_currency != company_currency else 0,
+        "accounts": correction_accounts,
+        "user_remark": (
+            f"Amazon settlement seller-fee gross-up for {order_id}; "
+            f"source settlement {settlement_je}"
+        ),
+    })
+    try:
+        correction.insert(ignore_permissions=True)
+        correction.submit()
+        frappe.db.commit()
+        if repair_index is not None:
+            repair_index[correction_ref] = frappe._dict(
+                name=correction.name, cheque_no=correction_ref, docstatus=1
+            )
+        print(
+            f"[SETT] Grossed up legacy Amazon settlement {order_id}: "
+            f"{settlement_je} -> {correction.name} -> {si_name} "
+            f"invoice={invoice_apply:.2f} net_negative_offset={offset_apply:.2f} "
+            f"total={repair_total:.2f}"
+        )
+        if offset_apply >= 0.01:
+            offset_ok = _reconcile_submitted_journal_line(
+                settlement_je, settlement_debit_line.name, "Journal Entry", correction.name, offset_apply
+            )
+            if offset_ok < 0.01:
+                frappe.log_error(
+                    title="Amazon Settlement Gross-Up Offset Pending",
+                    message=(
+                        f"Gross-up JE {correction.name} submitted for {order_id}, but its "
+                        f"{offset_apply:.2f} net-negative offset did not reconcile against "
+                        f"settlement JE {settlement_je}. A later run will retry it."
+                    ),
+                )
+
+        unused = max(flt(deduction_available) - repair_total, 0.0)
+        if unused >= 0.01:
+            frappe.log_error(
+                title="Amazon Settlement Gross-Up Residual Manual Review",
+                message=(
+                    f"Gross-up JE {correction.name} used {repair_total:.2f} of {flt(deduction_available):.2f} "
+                    f"classified seller fees for Amazon order {order_id}. Remaining {unused:.2f} "
+                    "was intentionally not booked because live invoice/debit capacity capped the repair. "
+                    "The deterministic one-repair-per-report/order policy will not auto-post it later."
+                ),
+            )
+        return True
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(
+            title=f"Amazon Settlement Gross-Up {order_id}"[:140],
+            message=frappe.get_traceback(),
+        )
+        return False
+
 def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, order_groups: dict, settlement_ccy: str, post_dt: str):
     # order_by matches process_settlements()'s submitted-JE lookup so a duplicated
     # settlement JE cannot make the two passes operate on different documents.
@@ -2753,26 +3256,111 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
     referenced_invoice_pairs = _prefetch_report_sales_invoice_references(rpt_id)
     credit_lines, debit_lines = _prefetch_unallocated_settlement_lines(je_name)
 
+    # Cheap explicit marker for settlements created by the patched first-pass logic. If this
+    # marker exists, that original JE already performed its seller-fee gross-up and must never
+    # receive a second historical GROSS correction.
+    first_pass_grossed_orders = {
+        (row.user_remark or "").split("::", 1)[-1].strip()
+        for row in frappe.get_all(
+            "Journal Entry Account",
+            filters={
+                "parent": je_name,
+                "user_remark": ["like", f"{_GROSS_UP_REMARK}::%"],
+            },
+            fields=["user_remark"],
+            parent_doctype="Journal Entry",
+        )
+        if (row.user_remark or "").startswith(f"{_GROSS_UP_REMARK}::")
+    }
+    first_pass_grossed_orders.discard("")
+
+    # Retain a conservative inference for older/non-marker JEs that already contain more
+    # customer credit than Amazon's positive net order amount.
+    posted_sale_credit_by_order = defaultdict(float)
+    for row in frappe.get_all(
+        "Journal Entry Account",
+        filters={
+            "parent": je_name,
+            "party_type": "Customer",
+            "credit_in_account_currency": [">", 0],
+        },
+        fields=["amazon_order_id", "credit_in_account_currency"],
+        parent_doctype="Journal Entry",
+    ):
+        oid = (row.amazon_order_id or "").strip()
+        if oid:
+            posted_sale_credit_by_order[oid] += flt(row.credit_in_account_currency)
+
     SALES_TYPES = {"order", "order_retrocharge"}
     REFUND_TYPES = {"refund"}
     sales_totals = {}
+    order_fee_deduction_totals = {}
+    order_negative_components = {}
     refund_totals = {}
     for order_id, order_rows in order_groups.items():
-        sales_total = sum(float(r["amount"]) for r in order_rows if (r.get("transaction-type") or "").strip().lower() in SALES_TYPES)
+        sales_total, negative_components = _sales_settlement_components(order_rows)
+        seller_fee_deductions = negative_components["seller_fee"]
         refund_total = -sum(float(r["amount"]) for r in order_rows if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES)
-        if abs(sales_total) >= 0.01:
+        if abs(sales_total) >= 0.01 or seller_fee_deductions >= 0.01:
             sales_totals[order_id] = sales_total
+        if seller_fee_deductions >= 0.01:
+            order_fee_deduction_totals[order_id] = seller_fee_deductions
+        if any(value >= 0.01 for value in negative_components.values()):
+            order_negative_components[order_id] = negative_components
         if abs(refund_total) >= 0.01:
             refund_totals[order_id] = refund_total
 
-    # Only an order with an unreferenced settlement credit can need late sales allocation.
-    sale_candidate_ids = [
-        order_id for order_id, amount in sales_totals.items()
-        if amount >= 0.01 and order_id in credit_lines
-    ]
+    # Handle existing deterministic GROSS repairs before deciding which invoices need another
+    # batch lookup. Submitted repairs are terminal for this report+order, except that a crashed
+    # net-negative offset reconciliation may still need to be resumed. Drafts are surfaced and
+    # never duplicated. This keeps steady-state historical reports near constant-time.
+    gross_repair_terminal_orders = set()
+    for order_id in order_fee_deduction_totals:
+        gross_ref = _gross_up_cheque_no(rpt_id, order_id)
+        existing_gross = reclass_index.get(gross_ref)
+        if not existing_gross:
+            continue
+        gross_repair_terminal_orders.add(order_id)
+        if cint(existing_gross.docstatus) == 0:
+            frappe.log_error(
+                title="Amazon Settlement Gross-Up Manual Review",
+                message=(
+                    f"Draft gross-up JE {existing_gross.name} exists for Amazon order {order_id}; "
+                    "submit or delete it before retrying."
+                ),
+            )
+            continue
+        if sales_totals.get(order_id, 0.0) < -0.01 and order_id in debit_lines:
+            _finish_pending_gross_up_offset(
+                rpt_id, je_name, order_id, debit_lines.get(order_id), reclass_index
+            )
+
+    # Prefetch open invoices only for orders that can still change accounting: an unreferenced
+    # positive net credit, or a seller-fee repair that has neither a first-pass marker nor an
+    # existing deterministic GROSS JE. No Sales Order lookup occurs on this common path.
+    sale_prefetch_ids = []
+    for order_id in set(sales_totals) | set(order_fee_deduction_totals):
+        needs_unreferenced_credit = (
+            max(sales_totals.get(order_id, 0.0), 0.0) >= 0.01
+            and order_id in credit_lines
+        )
+        needs_gross_repair = (
+            order_fee_deduction_totals.get(order_id, 0.0) >= 0.01
+            and order_id not in first_pass_grossed_orders
+            and order_id not in gross_repair_terminal_orders
+        )
+        if needs_unreferenced_credit or needs_gross_repair:
+            sale_prefetch_ids.append(order_id)
+
     open_invoice_by_order = _prefetch_latest_sales_invoice_contexts(
-        sale_candidate_ids, open_only=True
+        sale_prefetch_ids, open_only=True
     )
+    sale_candidate_ids = [
+        order_id for order_id in sale_prefetch_ids if order_id in open_invoice_by_order
+    ]
+    # Sales Order metadata is only needed for exceptional reclassification/correction branches.
+    # Seed that cache in one batched lookup for the much smaller open-invoice subset.
+    _prefetch_sales_order_contexts(sale_candidate_ids)
 
     # Refund revenue reversal is independent of JE allocation, so all positive refund orders
     # remain CN-creation candidates. Their source invoices and existing report CNs are batched.
@@ -2792,28 +3380,34 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
 
     print(
         f"[SETT] Late-allocation candidates for {rpt_id}: "
-        f"sales={len(sale_candidate_ids)}/{len(sales_totals)}, "
+        f"sales={len(sale_candidate_ids)}/{len(sale_prefetch_ids)}, "
         f"open_sales_invoices={len(open_invoice_by_order)}, "
         f"refunds={len(refund_candidate_ids)}/{len(refund_totals)}, "
         f"refund_lines={len(refund_allocation_ids)}, "
         f"existing_report_cns={len(existing_report_cn_by_order)}"
     )
 
-    # Late sales: use ERPNext reconciliation if party/account already match.
-    # Historical receivable party/account mismatches are repaired with a reclassification JE.
+    # Late sales: consume any old unreferenced net settlement credit first, then repair
+    # historical JEs that left invoice AR open by netting classified seller fees into AR.
+    late_nonfee_review_orders = []
+    late_nonfee_review_totals = defaultdict(float)
     for order_id in sale_candidate_ids:
-        sales_total_native = sales_totals[order_id]
+        sales_total_native = sales_totals.get(order_id, 0.0)
+        positive_net_credit = max(sales_total_native, 0.0)
+        order_rows = order_groups.get(order_id, [])
+        first_row = order_rows[0] if order_rows else {}
+        marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
+        merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
 
-        # Resume a reclassification that was submitted but never reconciled. Gating this
-        # behind credit_lines is safe: the recovery helper itself requires that same line.
-        if _finish_pending_reclassification(rpt_id, je_name, order_id, reclass_index):
-            continue
+        # Only orders that still have an unreferenced credit can need reclassification recovery.
+        reconciliation_attempted = False
+        if order_id in credit_lines:
+            if _finish_pending_reclassification(rpt_id, je_name, order_id, reclass_index):
+                reconciliation_attempted = True
 
         si = open_invoice_by_order.get(order_id)
         si_name = si.name if si else None
-        if not si_name or (si_name, order_id) in referenced_invoice_pairs:
-            continue
-        if si.docstatus != 1:
+        if not si_name or si.docstatus != 1:
             continue
         if (
             (si.currency or "").upper() != (settlement_ccy or "").upper()
@@ -2833,46 +3427,104 @@ def allocate_late_documents_for_settlement(rpt_id: str, repo: AmazonRepository, 
         if outstanding < 0.01:
             continue
 
-        # credit_lines is only the cheap steady-state gate. Re-read the live row: a
-        # concurrent worker or an earlier reconciliation may have shrunk or removed it,
-        # and _reclassify_legacy_receivable_mismatch_sale() posts a real JE for `apply`.
-        line = frappe.db.get_value(
-            "Journal Entry Account",
-            {
-                "parent": je_name,
-                "amazon_order_id": order_id,
-                "credit_in_account_currency": [">", 0],
-                "reference_type": ["is", "not set"],
-            },
-            ["name", "account", "party", "exchange_rate", "credit_in_account_currency", "idx"],
-            as_dict=True,
-            order_by="idx asc",
-        )
-        if not line:
-            continue
-
-        apply = min(sales_total_native, outstanding, flt(line.credit_in_account_currency))
-        if apply < 0.01:
-            continue
-
-        if line.party == si.customer and line.account == si.debit_to:
-            applied = _reconcile_submitted_journal_line(
-                je_name, line.name, "Sales Invoice", si_name, apply
+        # Re-read a still-unreferenced original settlement credit only when the batch prefetch
+        # says one exists. This preserves concurrency safety without one JEA query per order.
+        line = None
+        if order_id in credit_lines and positive_net_credit >= 0.01:
+            line = frappe.db.get_value(
+                "Journal Entry Account",
+                {
+                    "parent": je_name,
+                    "amazon_order_id": order_id,
+                    "credit_in_account_currency": [">", 0],
+                    "reference_type": ["is", "not set"],
+                },
+                ["name", "account", "party", "exchange_rate", "credit_in_account_currency", "idx"],
+                as_dict=True,
+                order_by="idx asc",
             )
-            if applied >= 0.01:
-                referenced_invoice_pairs.add((si_name, order_id))
+
+        if line:
+            apply = min(positive_net_credit, outstanding, flt(line.credit_in_account_currency))
+            if apply >= 0.01:
+                reconciliation_attempted = True
+                if line.party == si.customer and line.account == si.debit_to:
+                    applied = _reconcile_submitted_journal_line(
+                        je_name, line.name, "Sales Invoice", si_name, apply
+                    )
+                    if applied >= 0.01:
+                        referenced_invoice_pairs.add((si_name, order_id))
+                else:
+                    fulfillment_channel = (
+                        get_sales_order_context(order_id).fulfillment_channel or ""
+                    ).upper()
+                    _reclassify_legacy_receivable_mismatch_sale(
+                        rpt_id, je_name, line, si_name, order_id, apply, post_dt,
+                        marketplace_name, merchant_order_id, fulfillment_channel, reclass_index,
+                    )
+
+        # Only re-read live outstanding if an earlier reconciliation could have changed it.
+        live_outstanding = outstanding
+        if reconciliation_attempted:
+            live_outstanding = max(flt(frappe.db.get_value(
+                "Sales Invoice", si_name, "outstanding_amount"
+            )), 0)
+
+        fee_deduction = order_fee_deduction_totals.get(order_id, 0.0)
+        if order_id in first_pass_grossed_orders:
+            deduction_available = 0.0
         else:
-            # Sales Order/channel metadata is only needed for the exceptional legacy
-            # reclassification path; avoid another per-order query on the common path.
-            order_rows = order_groups.get(order_id, [])
-            first_row = order_rows[0] if order_rows else {}
-            marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
-            merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
-            fulfillment_channel = (get_sales_order_context(order_id).fulfillment_channel or "").upper()
-            _reclassify_legacy_receivable_mismatch_sale(
-                rpt_id, je_name, line, si_name, order_id, apply, post_dt,
-                marketplace_name, merchant_order_id, fulfillment_channel, reclass_index,
+            posted_credit = posted_sale_credit_by_order.get(order_id, 0.0)
+            already_grossed = max(posted_credit - positive_net_credit, 0.0)
+            deduction_available = max(fee_deduction - already_grossed, 0.0)
+
+        gross_up_posted = False
+        if live_outstanding >= 0.01 and deduction_available >= 0.01:
+            sale_debit_line = (
+                debit_lines.get(order_id) if sales_total_native < -0.01 else None
             )
+            gross_up_posted = _post_legacy_order_deduction_gross_up(
+                rpt_id, je_name, si_name, order_id, deduction_available, sale_debit_line, post_dt,
+                marketplace_name, merchant_order_id, None, repo, reclass_index,
+            )
+            if gross_up_posted:
+                live_outstanding = max(flt(frappe.db.get_value(
+                    "Sales Invoice", si_name, "outstanding_amount"
+                )), 0)
+
+        excluded = order_negative_components.get(order_id, {})
+        excluded_nonfee = sum(
+            flt(excluded.get(bucket))
+            for bucket in ("withheld_tax", "promotion", "unclassified")
+        )
+        if live_outstanding >= 0.01 and excluded_nonfee >= 0.01:
+            print(
+                f"[SETT] {order_id} remains open but non-fee negative Order components are "
+                f"not eligible for automatic miscellaneous-fee gross-up: "
+                f"withheld_tax={flt(excluded.get('withheld_tax')):.2f}, "
+                f"promotion={flt(excluded.get('promotion')):.2f}, "
+                f"unclassified={flt(excluded.get('unclassified')):.2f}"
+            )
+            late_nonfee_review_orders.append(order_id)
+            late_nonfee_review_totals["outstanding"] += live_outstanding
+            for bucket in ("withheld_tax", "promotion", "unclassified"):
+                late_nonfee_review_totals[bucket] += flt(excluded.get(bucket))
+
+    if late_nonfee_review_orders:
+        sample = ", ".join(late_nonfee_review_orders[:20])
+        suffix = "" if len(late_nonfee_review_orders) <= 20 else f" (+{len(late_nonfee_review_orders) - 20} more)"
+        frappe.log_error(
+            title="Amazon Settlement Non-Fee Negative Component Review",
+            message=(
+                f"Settlement {rpt_id} late allocation: {len(late_nonfee_review_orders)} open order(s) "
+                f"remain after safe seller-fee repair. Aggregate live outstanding="
+                f"{late_nonfee_review_totals['outstanding']:.2f}; excluded negative Order components: "
+                f"withheld_tax={late_nonfee_review_totals['withheld_tax']:.2f}, "
+                f"promotion={late_nonfee_review_totals['promotion']:.2f}, "
+                f"unclassified={late_nonfee_review_totals['unclassified']:.2f}. "
+                f"Sample order IDs: {sample}{suffix}. Per-order detail is in the settlement log."
+            ),
+        )
 
     # Late refunds: Credit Note creation still occurs even when no settlement debit remains.
     # Existing report CNs are skipped before create_credit_note_for_refund(), avoiding a full
