@@ -2797,13 +2797,35 @@ def _mfn_finance_repair_cheque_no(order_id: str, si_name: str) -> str:
     return f"MFN-FIN-{hashlib.sha1(key).hexdigest()[:16]}"
 
 def _mfn_review_exists(order_id: str, si_name: str) -> bool:
-    return bool(frappe.db.exists(
+    """
+    Return True only for a current terminal MFN repair review marker.
+
+    The previous historical-repair algorithm considered only missing negative
+    Financial Events components.  That could incorrectly mark an invoice as
+    terminal when a missing positive buyer charge (for example ItemTax) offset
+    a missing negative marketplace-facilitator withholding.  Those specific
+    legacy markers are intentionally ignored once so the signed/net repair
+    logic can re-evaluate the invoice.
+    """
+    remarks_rows = frappe.get_all(
         "Amazon Failed Sync Record",
-        {
+        filters={
             "amazon_order_id": order_id,
             "remarks": ["like", f"{MFN_FINANCE_REVIEW_PREFIX} [{si_name}]%"],
         },
-    ))
+        pluck="remarks",
+        limit_page_length=20,
+    )
+    for remarks in remarks_rows:
+        text = str(remarks or "")
+        legacy_negative_only_marker = (
+            "classified missing components total" in text
+            and "does not exactly explain live outstanding" in text
+        )
+        if legacy_negative_only_marker:
+            continue
+        return True
+    return False
 
 def _mark_mfn_manual_review(order_id: str, si_name: str, reason: str) -> None:
     """Persist one terminal manual-review marker so unresolved history is not polled forever."""
@@ -2934,18 +2956,27 @@ def _post_exact_mfn_financial_event_repair(
         )
         return False
 
-    expected_negative = defaultdict(float)
+    # Compare Financial Events and the submitted SI with their ORIGINAL SIGNS.
+    #
+    # A historical malformed MFN invoice may be missing both sides of a tax pair:
+    #     + ItemTax
+    #     - MarketplaceFacilitatorTax-Principal
+    # Those two components have zero net AR effect and must offset each other before
+    # deciding whether the remaining outstanding is explained.  The previous repair
+    # logic inspected only negative components, which incorrectly treated the
+    # facilitator withholding as an additional shortfall.
+    expected_signed = defaultdict(float)
     postage_account = getattr(repo.amz_setting, "mfn_postage_fee_account_head", None)
     for bucket in ("charges", "fees", "tds", "service_fees"):
         for component in charges.get(bucket) or []:
             amount = flt(component.get("tax_amount"))
             account = component.get("account_head")
-            if amount >= -0.009 or not account:
+            if abs(amount) < 0.009 or not account:
                 continue
             if bucket == "service_fees" and postage_account and account == postage_account:
                 # Owned by the separate MFN postage JE, never by this SI repair.
                 continue
-            expected_negative[account] += abs(amount)
+            expected_signed[account] += amount
 
     # Promotions are represented upstream through Sales Order/Sales Invoice discount behavior.
     # If a promotion appears missing, a JE to an arbitrary fee account would be a guess.
@@ -2958,36 +2989,43 @@ def _post_exact_mfn_financial_event_repair(
         )
         return False
 
-    actual_negative = defaultdict(float)
+    actual_signed = defaultdict(float)
     for tax in si.taxes:
         amount = flt(tax.tax_amount)
-        if amount < -0.009 and tax.account_head:
-            actual_negative[tax.account_head] += abs(amount)
+        if abs(amount) >= 0.009 and tax.account_head:
+            actual_signed[tax.account_head] += amount
 
-    missing = {}
-    for account, expected in expected_negative.items():
-        delta = round(expected - actual_negative.get(account, 0.0), 2)
-        if delta >= 0.01:
-            missing[account] = delta
+    # Signed delta uses the same convention as Sales Taxes and Charges:
+    #   positive -> missing charge increases AR (repair credits component account, debits AR)
+    #   negative -> missing fee/withholding decreases AR (repair debits component account, credits AR)
+    missing_signed = {}
+    for account, expected in expected_signed.items():
+        delta = round(expected - actual_signed.get(account, 0.0), 2)
+        if abs(delta) >= 0.01:
+            missing_signed[account] = delta
 
-    if not missing:
+    if not missing_signed:
         _mark_mfn_manual_review(
             order_id, si_name,
-            f"Financial Events show no missing classified negative SI components; live outstanding is {outstanding:.2f}",
+            f"Financial Events show no missing classified SI components; live outstanding is {outstanding:.2f}",
         )
         return False
 
-    missing_total = round(sum(missing.values()), 2)
-    if abs(missing_total - outstanding) > 0.02:
-        detail = ", ".join(f"{acct}={amt:.2f}" for acct, amt in sorted(missing.items()))
+    net_missing_effect = round(sum(missing_signed.values()), 2)
+    ar_credit_needed = round(-net_missing_effect, 2)
+    if ar_credit_needed < 0.01 or abs(ar_credit_needed - outstanding) > 0.02:
+        detail = ", ".join(
+            f"{acct}={amount:+.2f}" for acct, amount in sorted(missing_signed.items())
+        )
         _mark_mfn_manual_review(
             order_id, si_name,
-            f"classified missing components total {missing_total:.2f} does not exactly explain "
-            f"live outstanding {outstanding:.2f}; {detail}",
+            f"signed missing components net AR effect {net_missing_effect:+.2f} requires "
+            f"AR credit {ar_credit_needed:.2f}, which does not exactly explain live outstanding "
+            f"{outstanding:.2f}; {detail}",
         )
         return False
 
-    for account in missing:
+    for account in missing_signed:
         account_ccy = _get_account_currency(account, si.company)
         if account_ccy != company_ccy:
             _mark_mfn_manual_review(
@@ -3017,10 +3055,10 @@ def _post_exact_mfn_financial_event_repair(
         return False
 
     live_outstanding = max(flt(frappe.db.get_value("Sales Invoice", si_name, "outstanding_amount")), 0)
-    if abs(live_outstanding - missing_total) > 0.02:
+    if abs(live_outstanding - ar_credit_needed) > 0.02:
         frappe.db.rollback(save_point="before_mfn_finance_repair")
         print(
-            f"[SETT] MFN repair race for {order_id}: expected outstanding {missing_total:.2f}, "
+            f"[SETT] MFN repair race for {order_id}: expected outstanding {ar_credit_needed:.2f}, "
             f"live now {live_outstanding:.2f}; retrying later"
         )
         return False
@@ -3034,19 +3072,29 @@ def _post_exact_mfn_financial_event_repair(
         je.cheque_date = je.posting_date
         je.user_remark = f"{MFN_FINANCE_REPAIR_REMARK}: {order_id} -> {si_name}"
         je.amazon_order_id = order_id
-        for account, amount in sorted(missing.items()):
-            je.append("accounts", {
+        for account, signed_amount in sorted(missing_signed.items()):
+            amount = abs(signed_amount)
+            line = {
                 "account": account,
-                "debit_in_account_currency": amount,
                 "exchange_rate": 1,
                 "amazon_order_id": order_id,
                 "user_remark": f"Missing MFN Financial Event component for {order_id}",
-            })
+            }
+            if signed_amount < 0:
+                # Missing negative Sales Taxes/Charges row: debit its account and credit AR.
+                line["debit_in_account_currency"] = amount
+            else:
+                # Missing positive Sales Taxes/Charges row: credit its account and debit AR.
+                line["credit_in_account_currency"] = amount
+            je.append("accounts", line)
+
+        # The signed component lines may include both debits and credits.  Their net
+        # effect must reduce the SI receivable by exactly the live outstanding amount.
         je.append("accounts", {
             "account": si.debit_to,
             "party_type": "Customer",
             "party": si.customer,
-            "credit_in_account_currency": missing_total,
+            "credit_in_account_currency": ar_credit_needed,
             "exchange_rate": 1,
             "reference_type": "Sales Invoice",
             "reference_name": si_name,
@@ -3059,7 +3107,7 @@ def _post_exact_mfn_financial_event_repair(
         frappe.db.commit()
         print(
             f"[SETT] Posted exact MFN Financial Events repair {je.name} for {order_id}: "
-            f"{missing_total:.2f} -> {si_name}"
+            f"{ar_credit_needed:.2f} -> {si_name}; net signed components {net_missing_effect:+.2f}"
         )
         return True
     except Exception:
