@@ -21,9 +21,10 @@ from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_se
     AmazonSPAPISettings,
 )
 from frappe import scrub
-from frappe.utils import getdate, add_days, get_datetime, nowdate, today
+from frappe.utils import getdate, add_days, add_to_date, get_datetime, now_datetime, nowdate, today
 from requests.exceptions import HTTPError
 from requests.exceptions import RequestException
+from erpnext.accounts.party import get_party_account
 
 try:
     # v14 / v15 (current)
@@ -51,6 +52,11 @@ SP_DOMAIN  = "sellingpartnerapi-na.amazon.com"
 SPAPI_CONNECT_TIMEOUT = 12.0   # time to establish connection
 SPAPI_READ_TIMEOUT    = 45.0   # time to read response body (orderItems/finances can be slow)
 SPAPI_TIMEOUT         = (SPAPI_CONNECT_TIMEOUT, SPAPI_READ_TIMEOUT)
+MFN_FINANCE_RETRY_INTERVAL_HOURS = 6
+MFN_FINANCE_RETRY_HORIZON_DAYS = 7
+MFN_FINANCE_RETRY_BATCH_SIZE = 25
+MFN_ZERO_FEE_MATURITY_HOURS = 48
+MFN_RECONCILIATION_MAX_TOLERANCE = 0.25
 
 def _get_lwa_token(settings):
     if AmazonRepository._token and time.time() < AmazonRepository._token_expires:
@@ -161,6 +167,32 @@ def _to_float(x, default=0.0):
 # ------------------------------------------------------------------
 # Convert CAD↔USD, MXN↔USD with ERPNext’s built-in exchanger
 # ------------------------------------------------------------------
+def _order_total(order) -> dict:
+    """Orders API may return OrderTotal as JSON null; normalise to a dict."""
+    return (order or {}).get("OrderTotal") or {}
+
+def _order_total_amount(order) -> float:
+    """Null-safe OrderTotal.Amount."""
+    return _to_float(_order_total(order).get("Amount"), 0.0)
+
+def _order_total_currency(order, default: str = "USD") -> str:
+    """Null-safe OrderTotal.CurrencyCode."""
+    return (_order_total(order).get("CurrencyCode") or default).upper()
+
+def _amazon_last_update_age_hours(order) -> float | None:
+    """Age of the current Orders API state, used only to bound zero-fee finalization."""
+    raw = (order or {}).get("LastUpdateDate")
+    if not raw:
+        return None
+    try:
+        stamp = dateutil.parser.isoparse(str(raw))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        return max((now_utc - stamp.astimezone(datetime.timezone.utc)).total_seconds() / 3600.0, 0.0)
+    except Exception:
+        return None
+
 def _fx_rate(from_ccy: str, to_ccy: str = "USD", posting_date: str | None = None) -> float:
     """
     Enhanced FX rate handler for Amazon order import:
@@ -231,6 +263,7 @@ def _list_orders(
     fulfillment_channels=None,     # e.g. "FBA,SellerFulfilled"
     max_results=25,
     amazon_order_ids=None,
+    use_last_updated=False,
 ):
     """
     Thin wrapper around GET /orders/v0/orders.
@@ -246,9 +279,9 @@ def _list_orders(
             "MaxResultsPerPage": str(max_results),
         }
         if updated_after:
-            qs["CreatedAfter"]  = updated_after
+            qs["LastUpdatedAfter" if use_last_updated else "CreatedAfter"] = updated_after
         if updated_before:
-            qs["CreatedBefore"] = updated_before
+            qs["LastUpdatedBefore" if use_last_updated else "CreatedBefore"] = updated_before
         if order_statuses:
             qs["OrderStatuses"] = order_statuses
         if fulfillment_channels:
@@ -376,6 +409,10 @@ class AmazonRepository:
             client_secret=self.amz_setting.get_password("client_secret"),
             refresh_token=self.amz_setting.refresh_token,
         )
+        # Track only Sales Orders submitted by this repository instance. Existing submitted
+        # MFN orders may contain stale economics from the pre-fix lifecycle and must not be
+        # handed back to the invoice submitter as though they were freshly finalized.
+        self._submitted_this_run = set()
 
     def return_as_list(self, input) -> list:
         if isinstance(input, list):
@@ -438,123 +475,399 @@ class AmazonRepository:
         return account_name
 
     def get_charges_and_fees(self, order_id) -> dict:
+        """
+        Return posted Amazon Financial Events for one order.
+
+        Financial Events has no authoritative per-order "complete" flag, so this method does
+        not claim completeness. It does, however, aggregate every returned page deterministically
+        and publishes a compact non-PII summary that the MFN lifecycle can use as a conservative
+        finalization signal.
+        """
+        empty = {
+            "charges": [],
+            "fees": [],
+            "tds": [],
+            "service_fees": [],
+            "principal_amounts": {},
+            "additional_discount": 0,
+            "financial_event_summary": {
+                "shipment_event_count": 0,
+                "shipment_item_count": 0,
+                "principal_count": 0,
+                "principal_total": 0.0,
+                "charge_count": 0,
+                "charge_total": 0.0,
+                "fee_count": 0,
+                "fee_total": 0.0,
+                "withheld_tax_count": 0,
+                "withheld_tax_total": 0.0,
+                "service_fee_count": 0,
+                "service_fee_total": 0.0,
+                "promotion_count": 0,
+                "promotion_total": 0.0,
+                "buyer_charge_total": 0.0,
+            },
+        }
         try:
             financial_events_payload = _list_financial_events(self.amz_setting, order_id)
-            # Print the Financial Events payload
-            #print(f"Financial events for {order_id}: {json.dumps(financial_events_payload, indent=2)}", flush=True)
         except RequestException as e:
-            frappe.log_error(message=f"SP-API finances fetch failed for {order_id}: {e}", title="Amazon Finances Fetch")
-            return {"charges": [], "fees": [], "tds": [], "service_fees": [], "principal_amounts": {}, "additional_discount": 0}
-        
-        charges_and_fees = {"charges": [], "fees": [], "tds": [], "service_fees":[], "principal_amounts":{}, "additional_discount": 0}
-  
+            frappe.log_error(
+                message=f"SP-API finances fetch failed for {order_id}: {e}",
+                title="Amazon Finances Fetch",
+            )
+            return empty
+
         if not (
-                financial_events_payload
-                and len(financial_events_payload.get("FinancialEvents", {}))
-            ):
-                return charges_and_fees
+            financial_events_payload
+            and len(financial_events_payload.get("FinancialEvents", {}))
+        ):
+            return empty
+
+        charges_and_fees = {
+            "charges": [],
+            "fees": [],
+            "tds": [],
+            "service_fees": [],
+            "principal_amounts": {},
+            "additional_discount": 0,
+            "financial_event_summary": dict(empty["financial_event_summary"]),
+        }
+        summary = charges_and_fees["financial_event_summary"]
+        principal_totals = {}
+        principal_qty = {}
+        promotion_discount = 0.0
 
         while True:
-            shipment_event_list = financial_events_payload.get("FinancialEvents", {}).get(
-                "ShipmentEventList", []
-            )
-            service_fee_event_list = financial_events_payload.get("FinancialEvents", {}).get(
-                "ServiceFeeEventList", []
-            )
+            financial_events = financial_events_payload.get("FinancialEvents", {}) or {}
+            shipment_event_list = financial_events.get("ShipmentEventList", []) or []
+            service_fee_event_list = financial_events.get("ServiceFeeEventList", []) or []
             next_token = financial_events_payload.get("NextToken")
-            principal_amounts = {}
-            promotion_discount = 0
-            seller_sku = ''
+            summary["shipment_event_count"] += len(shipment_event_list)
+
             for shipment_event in shipment_event_list:
-                if shipment_event:
-                    for shipment_item in shipment_event.get("ShipmentItemList", []):
-                        promotion_list = shipment_item.get("PromotionList", [])
-                        seller_sku = shipment_item.get("SellerSKU")
-                        qty = shipment_item.get("QuantityShipped")
-                        charges = shipment_item.get("ItemChargeList", [])
-                        fees = shipment_item.get("ItemFeeList", [])
-                        tds_list = shipment_item.get("ItemTaxWithheldList", [])
-                        tdss = []
-                        if tds_list:
-                            tdss = tds_list[0].get("TaxesWithheld", [])
+                if not shipment_event:
+                    continue
+                for shipment_item in shipment_event.get("ShipmentItemList", []) or []:
+                    summary["shipment_item_count"] += 1
+                    seller_sku = shipment_item.get("SellerSKU") or ""
+                    qty = _to_float(shipment_item.get("QuantityShipped"), 0.0)
+                    promotion_list = shipment_item.get("PromotionList", []) or []
+                    charges = shipment_item.get("ItemChargeList", []) or []
+                    fees = shipment_item.get("ItemFeeList", []) or []
+                    tds_list = shipment_item.get("ItemTaxWithheldList", []) or []
 
-                        for charge in charges:
-                            charge_type = charge.get("ChargeType")
-                            amount = charge.get("ChargeAmount", {}).get("CurrencyAmount", 0)
+                    for charge in charges:
+                        charge_type = charge.get("ChargeType")
+                        amount = _to_float(charge.get("ChargeAmount", {}).get("CurrencyAmount"), 0.0)
+                        if charge_type == "Principal":
+                            summary["principal_count"] += 1
+                            summary["principal_total"] += amount
+                            principal_totals[seller_sku] = principal_totals.get(seller_sku, 0.0) + amount
+                            principal_qty[seller_sku] = principal_qty.get(seller_sku, 0.0) + qty
+                            continue
+                        if abs(amount) < 0.000001:
+                            continue
+                        summary["charge_count"] += 1
+                        summary["charge_total"] += amount
+                        charges_and_fees["charges"].append({
+                            "charge_type": "Actual",
+                            "account_head": self.get_account(charge_type),
+                            "tax_amount": amount,
+                            "description": f"{charge_type} for {seller_sku if seller_sku else order_id}",
+                        })
 
-                            if charge_type != "Principal" and float(amount) != 0:
-                                charge_account = self.get_account(charge_type)
-                                charges_and_fees.get("charges").append(
-                                    {
-                                        "charge_type": "Actual",
-                                        "account_head": charge_account,
-                                        "tax_amount": amount,
-                                        "description": f"{charge_type} for {seller_sku if seller_sku else order_id}",
-                                    }
-                                )
-                            if charge_type == 'Principal':
-                                principal_amounts[seller_sku] = round((float(amount)/qty), 2)
+                    for fee in fees:
+                        fee_type = fee.get("FeeType")
+                        amount = _to_float(fee.get("FeeAmount", {}).get("CurrencyAmount"), 0.0)
+                        if abs(amount) < 0.000001:
+                            continue
+                        summary["fee_count"] += 1
+                        summary["fee_total"] += amount
+                        charges_and_fees["fees"].append({
+                            "charge_type": "Actual",
+                            "account_head": self.get_account(fee_type),
+                            "tax_amount": amount,
+                            "description": f"{fee_type} for {seller_sku if seller_sku else order_id}",
+                        })
 
-                        for fee in fees:
-                            fee_type = fee.get("FeeType")
-                            amount = fee.get("FeeAmount", {}).get("CurrencyAmount", 0)
-
-                            if float(amount) != 0:
-                                fee_account = self.get_account(fee_type)
-                                charges_and_fees.get("fees").append(
-                                    {
-                                        "charge_type": "Actual",
-                                        "account_head": fee_account,
-                                        "tax_amount": amount,
-                                        "description": f"{fee_type} for {seller_sku if seller_sku else order_id}",
-                                    }
-                                )
-
-                        for tds in tdss:
+                    for tds_group in tds_list:
+                        for tds in tds_group.get("TaxesWithheld", []) or []:
                             tds_type = tds.get("ChargeType")
-                            amount = tds.get("ChargeAmount", {}).get("CurrencyAmount", 0)
-                            if float(amount) != 0:
-                                tds_account = self.get_account(tds_type)
-                                charges_and_fees.get("tds").append(
-                                    {
-                                        "charge_type": "Actual",
-                                        "account_head": tds_account,
-                                        "tax_amount": amount,
-                                        "description": f"{tds_type} for {seller_sku if seller_sku else order_id}",
-                                    }
-                                )
+                            amount = _to_float(tds.get("ChargeAmount", {}).get("CurrencyAmount"), 0.0)
+                            if abs(amount) < 0.000001:
+                                continue
+                            summary["withheld_tax_count"] += 1
+                            summary["withheld_tax_total"] += amount
+                            charges_and_fees["tds"].append({
+                                "charge_type": "Actual",
+                                "account_head": self.get_account(tds_type),
+                                "tax_amount": amount,
+                                "description": f"{tds_type} for {seller_sku if seller_sku else order_id}",
+                            })
 
-                        for promotion in promotion_list:
-                            amount = promotion.get("PromotionAmount", {}).get("CurrencyAmount", 0)
-                            promotion_discount += float(amount)
-
-            charges_and_fees["principal_amounts"] = principal_amounts
-            charges_and_fees["additional_discount"] = promotion_discount
+                    for promotion in promotion_list:
+                        amount = _to_float(promotion.get("PromotionAmount", {}).get("CurrencyAmount"), 0.0)
+                        if abs(amount) < 0.000001:
+                            continue
+                        summary["promotion_count"] += 1
+                        summary["promotion_total"] += amount
+                        promotion_discount += amount
 
             for service_fee in service_fee_event_list:
-                if service_fee:
-                    for service_fee_item in service_fee.get("FeeList", []):
-                        fee_type = service_fee_item.get("FeeType")
-                        amount = service_fee_item.get("FeeAmount", {}).get("CurrencyAmount", 0)
-                        if float(amount) != 0:
-                            fee_account = self.get_account(fee_type)
-                            charges_and_fees.get("service_fees").append(
-                                {
-                                    "charge_type": "Actual",
-                                    "account_head": fee_account,
-                                    "tax_amount": amount,
-                                    "description": f"{fee_type} for {seller_sku if seller_sku else order_id}",
-                                }
-                            )
+                if not service_fee:
+                    continue
+                for service_fee_item in service_fee.get("FeeList", []) or []:
+                    fee_type = service_fee_item.get("FeeType")
+                    amount = _to_float(service_fee_item.get("FeeAmount", {}).get("CurrencyAmount"), 0.0)
+                    if abs(amount) < 0.000001:
+                        continue
+                    summary["service_fee_count"] += 1
+                    summary["service_fee_total"] += amount
+                    charges_and_fees["service_fees"].append({
+                        "charge_type": "Actual",
+                        "account_head": self.get_account(fee_type),
+                        "tax_amount": amount,
+                        "description": f"{fee_type} for {order_id}",
+                    })
 
             if not next_token:
                 break
-
             financial_events_payload = _list_financial_events(
                 self.amz_setting, order_id, next_token=next_token
             )
+            if not financial_events_payload:
+                frappe.logger().warning(
+                    f"Amazon Financial Events pagination ended early for {order_id}; "
+                    "keeping MFN accounting unfinalized until a later refresh"
+                )
+                break
 
+        for seller_sku, total in principal_totals.items():
+            qty = principal_qty.get(seller_sku, 0.0)
+            if qty:
+                charges_and_fees["principal_amounts"][seller_sku] = round(total / qty, 2)
+
+        charges_and_fees["additional_discount"] = promotion_discount
+        for key in (
+            "principal_total", "charge_total", "fee_total", "withheld_tax_total",
+            "service_fee_total", "promotion_total",
+        ):
+            summary[key] = round(summary[key], 2)
+        summary["buyer_charge_total"] = round(
+            summary["principal_total"] + summary["charge_total"] + summary["promotion_total"],
+            2,
+        )
         return charges_and_fees
+
+    def _mfn_financial_events_ready(self, order, items, charges_and_fees) -> tuple[bool, str]:
+        """
+        Conservative MFN accounting-finalization gate.
+
+        Amazon exposes no per-order completeness flag. The gate therefore proves the buyer side
+        of the order from posted shipment Financial Events and uses seller-fee presence only as
+        an early maturity signal. A genuinely zero-fee order is allowed after the current Amazon
+        order state has been stable for the documented 48-hour Financial Events lag window.
+        """
+        if (order.get("FulfillmentChannel") or "").upper() != "MFN":
+            return True, "not_mfn"
+
+        summary = charges_and_fees.get("financial_event_summary") or {}
+        shipment_items = int(summary.get("shipment_item_count") or 0)
+        if shipment_items <= 0:
+            return False, "no_shipment_financial_event"
+
+        order_total_obj = _order_total(order)
+        has_order_total = bool(order_total_obj) and order_total_obj.get("Amount") is not None
+        order_total = _order_total_amount(order)
+        merchandise_total = round(sum(_to_float(item.get("amount"), 0.0) for item in items), 2)
+        principal_total = round(_to_float(summary.get("principal_total"), 0.0), 2)
+        principal_count = int(summary.get("principal_count") or 0)
+
+        if abs(order_total) < 0.01 and order.get("ReplacedOrderId"):
+            return True, "zero_value_replacement"
+
+        zero_consideration = abs(order_total) < 0.01 and abs(merchandise_total) < 0.01
+        if not zero_consideration and principal_count <= 0:
+            return False, "no_principal_financial_event"
+
+        # Use a small, bounded line-count allowance rather than a percentage of order value.
+        # This tolerates independent cent-rounding on multi-line orders without allowing a large
+        # dollar discrepancy simply because the order itself is large.
+        tolerance = min(
+            MFN_RECONCILIATION_MAX_TOLERANCE,
+            max(0.02, round(0.01 * shipment_items, 2)),
+        )
+
+        buyer_charge_total = round(_to_float(summary.get("buyer_charge_total"), 0.0), 2)
+        if has_order_total:
+            if abs(buyer_charge_total - order_total) > tolerance:
+                return False, (
+                    f"buyer_charge_mismatch financial={buyer_charge_total:.2f} "
+                    f"orders_api={order_total:.2f} tolerance={tolerance:.2f}"
+                )
+        elif not zero_consideration:
+            if abs(principal_total - merchandise_total) > tolerance:
+                return False, (
+                    f"principal_mismatch financial={principal_total:.2f} "
+                    f"items={merchandise_total:.2f} tolerance={tolerance:.2f}"
+                )
+
+        # Seller fees can lag the shipment event. Do not make fee presence an accounting truth:
+        # if a fee exists, the order can mature immediately; if no fee exists, wait through the
+        # documented recent-event lag window and then permit a genuinely fee-free MFN order.
+        if principal_count > 0 and int(summary.get("fee_count") or 0) <= 0:
+            age_hours = _amazon_last_update_age_hours(order)
+            if age_hours is None or age_hours < MFN_ZERO_FEE_MATURITY_HOURS:
+                age_text = "unknown" if age_hours is None else f"{age_hours:.1f}h"
+                return False, (
+                    "no_posted_seller_fee_yet "
+                    f"last_update_age={age_text}; require {MFN_ZERO_FEE_MATURITY_HOURS}h "
+                    "before accepting a zero-fee order"
+                )
+
+        return True, "posted_financial_events_match_order"
+
+    def _mfn_postage_je_exists(self, order_id: str, fee_account: str, remark: str, cheque_no: str) -> bool:
+        """Deterministic-key first, then legacy remark/account shape for pre-fix vouchers."""
+        if frappe.db.exists("Journal Entry", {"cheque_no": cheque_no, "docstatus": ["!=", 2]}):
+            return True
+        return bool(frappe.db.sql(
+            """
+            SELECT je.name
+            FROM `tabJournal Entry` je
+            JOIN `tabJournal Entry Account` jea ON jea.parent = je.name
+            WHERE je.docstatus = 1
+              AND je.user_remark = %s
+              AND jea.amazon_order_id = %s
+              AND jea.account = %s
+              AND jea.debit_in_account_currency > 0
+            LIMIT 1
+            """,
+            (remark, order_id, fee_account),
+        ))
+
+    def _record_sync_review(self, order_id: str, remarks: str) -> None:
+        """One durable, non-duplicating operator-visible marker."""
+        remarks = remarks[:1000]
+        if frappe.db.exists(
+            "Amazon Failed Sync Record", {"amazon_order_id": order_id, "remarks": remarks}
+        ):
+            return
+        row = frappe.new_doc("Amazon Failed Sync Record")
+        row.amazon_order_id = order_id
+        row.remarks = remarks
+        row.save(ignore_permissions=True)
+
+    def _post_mfn_postage_service_fee(self, so, service_fee) -> None:
+        """
+        Post the configured MFN postage fee exactly once, outside SO/SI economics.
+
+        Must only be called AFTER the Sales Order has been successfully submitted, so a failed
+        Sales Order can never leave an orphan customer AR credit behind.
+        """
+        fee_account = service_fee.get("account_head")
+        native_amount = abs(_to_float(service_fee.get("tax_amount"), 0.0))
+        order_id = so.amazon_order_id
+        if not fee_account or native_amount < 0.01:
+            return
+
+        company = self.amz_setting.company
+        remark = f"Amazon MFN Postage Fee for Order {order_id}"
+        cheque_no = f"MFN-POST-{order_id}"
+
+        # Serialize all postage creation for this order on the submitted Sales Order row.
+        # That makes the existence check + insert idempotent without requiring a schema change.
+        if so.name:
+            frappe.db.sql("SELECT name FROM `tabSales Order` WHERE name=%s FOR UPDATE", (so.name,))
+        if self._mfn_postage_je_exists(order_id, fee_account, remark, cheque_no):
+            return
+
+        try:
+            receivable_account = get_party_account("Customer", so.customer, company)
+        except Exception:
+            receivable_account = None
+        if not receivable_account:
+            receivable_account = frappe.db.get_value(
+                "Company", company, "default_receivable_account"
+            )
+        if not receivable_account:
+            self._record_sync_review(
+                order_id, f"MFN postage JE skipped: no receivable account for {so.customer}"
+            )
+            return
+
+        # Financial Events amounts are in the marketplace/order currency. Convert per account so
+        # a CAD/MXN order never books its native amount straight into a USD ledger.
+        company_ccy = (frappe.get_cached_value("Company", company, "default_currency") or "").upper()
+        order_ccy = (so.currency or company_ccy).upper()
+        rate_to_company = (
+            1.0 if order_ccy == company_ccy
+            else _fx_rate(order_ccy, company_ccy, so.transaction_date)
+        )
+
+        def _row_values(account):
+            acct_ccy = (
+                frappe.get_cached_value("Account", account, "account_currency") or company_ccy
+            ).upper()
+            if acct_ccy == order_ccy:
+                return round(native_amount, 2), rate_to_company
+            if acct_ccy == company_ccy:
+                return round(native_amount * rate_to_company, 2), 1.0
+            return None, None
+
+        debit_amount, debit_rate = _row_values(fee_account)
+        credit_amount, credit_rate = _row_values(receivable_account)
+        if debit_amount is None or credit_amount is None:
+            self._record_sync_review(
+                order_id,
+                f"MFN postage JE skipped: account currency for {fee_account}/{receivable_account} "
+                f"is neither order currency {order_ccy} nor company currency {company_ccy}; "
+                "manual accounting review required",
+            )
+            return
+
+        frappe.db.savepoint("before_mfn_postage_je")
+        try:
+            if self._mfn_postage_je_exists(order_id, fee_account, remark, cheque_no):
+                return
+            jv_doc = frappe.new_doc("Journal Entry")
+            jv_doc.voucher_type = "Journal Entry"
+            jv_doc.company = company                      # was unset: JE would post to the wrong company
+            jv_doc.multi_currency = 1 if (order_ccy != company_ccy or debit_rate != 1 or credit_rate != 1) else 0
+            jv_doc.posting_date = so.transaction_date
+            jv_doc.cheque_no = cheque_no                  # deterministic idempotency key
+            jv_doc.cheque_date = so.transaction_date
+            jv_doc.user_remark = remark
+            jv_doc.amazon_order_id = order_id
+
+            debit = jv_doc.append("accounts")
+            debit.account = fee_account
+            debit.debit_in_account_currency = debit_amount
+            debit.exchange_rate = debit_rate
+            debit.user_remark = service_fee.get("description") or remark
+            debit.amazon_order_id = order_id
+
+            credit = jv_doc.append("accounts")
+            credit.account = receivable_account
+            credit.party_type = "Customer"
+            credit.party = so.customer
+            credit.credit_in_account_currency = credit_amount
+            credit.exchange_rate = credit_rate
+            credit.user_remark = remark
+            credit.amazon_order_id = order_id
+
+            jv_doc.flags.ignore_mandatory = True
+            jv_doc.save(ignore_permissions=True)
+            jv_doc.submit()
+        except Exception:
+            frappe.db.rollback(save_point="before_mfn_postage_je")
+            frappe.log_error(
+                title=f"Amazon MFN Postage Posting {order_id}"[:140],
+                message=frappe.get_traceback(),
+            )
+            self._record_sync_review(
+                order_id, "MFN postage JE failed to post; see Error Log. Sales Order economics unaffected."
+            )
 
     def create_item(self, order_item, order_id) -> str:
         def create_item_group(amazon_item) -> str:
@@ -776,6 +1089,7 @@ class AmazonRepository:
         drafts = frappe.get_all("Sales Order", filters={
             "docstatus": 0, # Draft
             "amazon_order_id": ["is", "set"],
+            "fulfillment_channel": ["!=", "MFN"],
             "creation": ["<", add_days(nowdate(), -age_days)]
         }, fields=["name", "amazon_order_id"])
        
@@ -940,7 +1254,7 @@ class AmazonRepository:
             # ------------------------------------------------------------------
             # 3. FBA / AFN  → single consolidated customer
             # ------------------------------------------------------------------
-            order_ccy = order.get("OrderTotal", {}).get("CurrencyCode") or "USD"
+            order_ccy = _order_total_currency(order)
             if order_ccy == "CAD":
                 MASTER = self.amz_setting.custom_amazon_cad_fba_default_customer or "Amazon FBA Customer - Canada"
             elif order_ccy == "MXN":
@@ -1037,14 +1351,70 @@ class AmazonRepository:
 
         order_id = order.get("AmazonOrderId")
         order_date = format_date_time_to_ist(order.get("PurchaseDate"))
-        amazon_order_amount = order.get("OrderTotal", {}).get("Amount", 0)
+        amazon_order_amount = _order_total_amount(order)
         so_id = None
         so_docstatus = 0
+        existing_order_status = None
+        existing_modified = None
+        existing_creation = None
         
         if frappe.db.exists("Sales Order", {"amazon_order_id": order_id}):
-            so_id, so_docstatus = frappe.db.get_value("Sales Order", filters={"amazon_order_id": order_id}, fieldname=["name", "docstatus"])
+            so_id, so_docstatus, existing_order_status, existing_modified, existing_creation = frappe.db.get_value(
+                "Sales Order",
+                filters={"amazon_order_id": order_id},
+                fieldname=["name", "docstatus", "amazon_order_status", "modified", "creation"],
+            )
+
+        channel_hint = (order.get("FulfillmentChannel") or "").upper()
+        incoming_status = order.get("OrderStatus")
+        if so_id and not so_docstatus and channel_hint == "MFN":
+            # Normal Orders sync may rediscover the same MFN order every run because this
+            # repository queries by CreatedAfter. Same-status drafts obey the retry cadence;
+            # status transitions (especially -> Shipped/InvoiceUnconfirmed) bypass it once.
+            same_status = existing_order_status == incoming_status
+            horizon_cutoff = get_datetime(add_days(nowdate(), -MFN_FINANCE_RETRY_HORIZON_DAYS))
+            if same_status and existing_creation and get_datetime(existing_creation) < horizon_cutoff:
+                remarks = (
+                    f"MFN financial accounting not finalized within "
+                    f"{MFN_FINANCE_RETRY_HORIZON_DAYS}-day Financial Events retry horizon"
+                )
+                if not frappe.db.exists(
+                    "Amazon Failed Sync Record",
+                    {"amazon_order_id": order_id, "remarks": remarks},
+                ):
+                    review = frappe.new_doc("Amazon Failed Sync Record")
+                    review.amazon_order_id = order_id
+                    review.remarks = remarks
+                    review.save(ignore_permissions=True)
+                print(
+                    f"[AMZ-MFN] Automatic finance refresh horizon expired for {order_id}; "
+                    "manual accounting review required",
+                    flush=True,
+                )
+                return so_id
+
+            retry_before = add_to_date(
+                now_datetime(), hours=-MFN_FINANCE_RETRY_INTERVAL_HOURS
+            )
+            if (
+                same_status
+                and existing_modified
+                and get_datetime(existing_modified) > get_datetime(retry_before)
+            ):
+                print(
+                    f"[AMZ-MFN] Deferring finance refresh for {order_id}; "
+                    f"status={incoming_status} was checked recently",
+                    flush=True,
+                )
+                return so_id
 
         if so_docstatus and so_id:
+            if (order.get("FulfillmentChannel") or "").upper() == "MFN":
+                print(
+                    f"[AMZ-MFN] {order_id} already has submitted Sales Order {so_id}; "
+                    "repository will not mutate submitted economics",
+                    flush=True,
+                )
             return so_id
         if not so_id:
             so = frappe.new_doc("Sales Order")
@@ -1062,7 +1432,7 @@ class AmazonRepository:
         delivery_date = format_date_time_to_ist(order.get("LatestShipDate"))
         transaction_date = format_date_time_to_ist(order.get("PurchaseDate"))
 
-        order_ccy = order.get("OrderTotal", {}).get("CurrencyCode") or "USD"
+        order_ccy = _order_total_currency(order)
         so.currency = order_ccy
 
 
@@ -1121,8 +1491,9 @@ class AmazonRepository:
 
             # Optional: Only rebuild if current SO lacks taxes but new data provides them
             # (Reduces over-rebuilding; remove if you want to always rebuild on presence)
-            if len(so.taxes) > 0 or (not has_new_taxes and not has_additional_discount):
-                # Also check if status changed (minimal robustness for non-tax updates)
+            if channel != "MFN" and (len(so.taxes) > 0 or (not has_new_taxes and not has_additional_discount)):
+                # AFN keeps the legacy low-churn guard. MFN intentionally rebuilds every draft
+                # refresh because an earlier Financial Events response may have been partial.
                 is_status_same = so.amazon_order_status == order.get("OrderStatus")
                 if is_status_same:
                     return so.name  # No changes; skip rebuild
@@ -1190,6 +1561,10 @@ class AmazonRepository:
             so.custom_additional_notes = f"Replacement for original Amazon Order ID: {so.replaced_order_id}"
 
         taxes_and_charges = self.amz_setting.taxes_charges
+        charges_and_fees = {}
+        mfn_finance_ready = channel != "MFN"
+        mfn_finance_reason = "not_mfn"
+        pending_postage_fees = []  # posted only after a successful so.submit()
 
         item_lookup = {item["item_code"]: item.get('total_order_value', 0) for item in items}
         for row in so.items:
@@ -1199,6 +1574,28 @@ class AmazonRepository:
 
         if taxes_and_charges:
             charges_and_fees = self.get_charges_and_fees(order_id)
+            if channel == "MFN":
+                mfn_finance_ready, mfn_finance_reason = self._mfn_financial_events_ready(
+                    order, items, charges_and_fees
+                )
+                summary = charges_and_fees.get("financial_event_summary") or {}
+                print(
+                    f"[AMZ-MFN-FIN] order={order_id} status={order.get('OrderStatus')} "
+                    f"ready={mfn_finance_ready} reason={mfn_finance_reason} "
+                    f"ship_events={int(summary.get('shipment_event_count') or 0)} "
+                    f"ship_items={int(summary.get('shipment_item_count') or 0)} "
+                    f"principal={_to_float(summary.get('principal_total')):.2f} "
+                    f"charges={int(summary.get('charge_count') or 0)}/"
+                    f"{_to_float(summary.get('charge_total')):.2f} "
+                    f"fees={int(summary.get('fee_count') or 0)}/"
+                    f"{_to_float(summary.get('fee_total')):.2f} "
+                    f"withheld={int(summary.get('withheld_tax_count') or 0)}/"
+                    f"{_to_float(summary.get('withheld_tax_total')):.2f} "
+                    f"service={int(summary.get('service_fee_count') or 0)}/"
+                    f"{_to_float(summary.get('service_fee_total')):.2f} "
+                    f"promotions={_to_float(summary.get('promotion_total')):.2f}",
+                    flush=True,
+                )
             
             if charges_and_fees.get("principal_amounts"):
                 principal_amounts = charges_and_fees.get("principal_amounts")
@@ -1224,46 +1621,42 @@ class AmazonRepository:
                 if tds:
                     so.append("taxes", tds)
             
+            # One lookup per order instead of one per service-fee row.
+            mfn_postage_fee_account_head = frappe.db.get_value(
+                "Amazon SP API Settings", self.amz_setting.name, "mfn_postage_fee_account_head"
+            )
             for service_fee in charges_and_fees.get("service_fees"):
-                if service_fee:
-                    mfn_postage_fee_account_head = frappe.db.get_value('Amazon SP API Settings', self.amz_setting.name, 'mfn_postage_fee_account_head')
-                    if( not service_fee.get("account_head") == mfn_postage_fee_account_head) or so.replaced_order_id:
-                        so.append("taxes", service_fee)
-                    elif not frappe.db.exists("Journal Entry Account", {
-                        "amazon_order_id": so.amazon_order_id,
-                        "account": service_fee.get("account_head"),
-                        "debit_in_account_currency": abs(_to_float(service_fee.get("tax_amount"), 0.0)),
-                    }):
-                        try:
-                            jv_doc = frappe.new_doc('Journal Entry')
-                            jv_doc.voucher_type = 'Journal Entry'
-                            jv_doc.posting_date = so.transaction_date
-                            jv_doc.user_remark = f'Amazon MFN Postage Fee for Order {so.amazon_order_id}'
-                            jv_doc.amazon_order_id = so.amazon_order_id
-                            tax_amount = abs(float(service_fee.get("tax_amount", 0)))
-                            jv_row = jv_doc.append('accounts')
-                            jv_row.account = service_fee.get("account_head")
-                            jv_row.debit = tax_amount
-                            jv_row.debit_in_account_currency = tax_amount
-                            jv_row.user_remark = row.get('description')
-                            jv_row.amazon_order_id = so.amazon_order_id
-                            default_receivable_account = frappe.db.get_value('Company', self.amz_setting.company, 'default_receivable_account')
-                            jv_row = jv_doc.append('accounts')
-                            jv_row.credit = abs(float(service_fee.get("tax_amount", 0)))
-                            jv_row.credit_in_account_currency = abs(float(service_fee.get("tax_amount", 0)))
-                            jv_row.user_remark = f'Amazon MFN Postage Fee for Order {so.amazon_order_id}'
-                            jv_row.amazon_order_id = so.amazon_order_id
-                            jv_row.party_type = 'Customer'
-                            jv_row.party = so.get('customer')
-                            jv_row.account = default_receivable_account
-                            jv_doc.flags.ignore_mandatory = True
-                            jv_doc.save(ignore_permissions=True)
-                            jv_doc.submit()
-                        except Exception as e:
-                            pass
+                if not service_fee:
+                    continue
+                is_separate_mfn_postage = (
+                    channel == "MFN"
+                    and not so.replaced_order_id
+                    and mfn_postage_fee_account_head
+                    and service_fee.get("account_head") == mfn_postage_fee_account_head
+                )
+                if is_separate_mfn_postage:
+                    # Preserve the existing ownership boundary: configured MFN postage is not
+                    # also placed on SO/SI. Queue it; it is only posted after the Sales Order
+                    # actually submits, so a failed SO cannot leave an orphan AR credit.
+                    if (
+                        mfn_finance_ready
+                        and order.get("OrderStatus") in ["Shipped", "InvoiceUnconfirmed"]
+                    ):
+                        pending_postage_fees.append(service_fee)
+                    else:
+                        print(
+                            f"[AMZ-MFN] Deferring separate postage posting for {order_id}; "
+                            f"finance reason={mfn_finance_reason}",
+                            flush=True,
+                        )
+                else:
+                    so.append("taxes", service_fee)
 
             if charges_and_fees.get("additional_discount"):
                 so.discount_amount = float(charges_and_fees.get("additional_discount")) * -1
+        elif channel == "MFN":
+            mfn_finance_ready = False
+            mfn_finance_reason = "taxes_and_charges_template_not_configured"
 
         so.flags.ignore_mandatory = True
         so.disable_rounded_total = 1
@@ -1296,10 +1689,16 @@ class AmazonRepository:
             }) if temp_transfer_required else True
 
             is_replacement_zero = (so.grand_total == 0 and so.replaced_order_id)
-            if order_status_valid and (channel == "MFN" or (has_taxes or is_replacement_zero)) and transfer_exists:
+            mfn_fulfilled = channel == "MFN" and order.get("OrderStatus") in ["Shipped", "InvoiceUnconfirmed"]
+            accounting_ready = (
+                (channel != "MFN" and (has_taxes or is_replacement_zero))
+                or (channel == "MFN" and mfn_fulfilled and (mfn_finance_ready or is_replacement_zero))
+            )
+            if order_status_valid and accounting_ready and transfer_exists:
                 try:
                     so.submit()
-                    is_fulfilled = (channel == "AFN") or (channel == "MFN" and order.get("OrderStatus") in ["Shipped", "InvoiceUnconfirmed"])
+                    self._submitted_this_run.add(so.name)
+                    is_fulfilled = (channel == "AFN") or mfn_fulfilled
                     if is_fulfilled:
                         for d in so.items:
                             d.delivered_qty = d.qty
@@ -1307,9 +1706,19 @@ class AmazonRepository:
                         so.db_set("status", "Completed")
                         so.db_set("delivery_date", nowdate())
                         so.db_update()
+                    # Separate postage ownership is only real once the SO economics are final.
+                    for service_fee in pending_postage_fees:
+                        self._post_mfn_postage_service_fee(so, service_fee)
                     frappe.db.commit()
                 except Exception as e:
                     frappe.log_error("Error submitting Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
+            elif channel == "MFN" and order_status_valid and transfer_exists:
+                print(
+                    f"[AMZ-MFN] Keeping {so.name} Draft for {order_id}: "
+                    f"status={order.get('OrderStatus')} fulfilled={mfn_fulfilled} "
+                    f"finance_ready={mfn_finance_ready} reason={mfn_finance_reason}",
+                    flush=True,
+                )
             
         elif not frappe.db.exists("Amazon Failed Sync Record", {"amazon_order_id":order_id}):
             remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
@@ -1328,6 +1737,71 @@ class AmazonRepository:
 
         return so.name
 
+    def _refresh_recent_mfn_drafts(
+        self,
+        *,
+        horizon_days: int = MFN_FINANCE_RETRY_HORIZON_DAYS,
+        retry_interval_hours: int = MFN_FINANCE_RETRY_INTERVAL_HOURS,
+        limit: int = MFN_FINANCE_RETRY_BATCH_SIZE,
+    ) -> list[str]:
+        """
+        Recheck only recent MFN drafts whose accounting has not finalized.
+
+        This provides a bounded retry path for Financial Events lag without turning settlement
+        processing into a permanent per-order Finances poller. Orders older than the horizon are
+        left Draft for manual review and are not automatically queried again by this helper.
+        """
+        cutoff = add_days(nowdate(), -horizon_days)
+        retry_before = add_to_date(now_datetime(), hours=-retry_interval_hours)
+        drafts = frappe.get_all(
+            "Sales Order",
+            filters={
+                "docstatus": 0,
+                "fulfillment_channel": "MFN",
+                "amazon_order_id": ["is", "set"],
+                "creation": [">=", cutoff],
+                "modified": ["<=", retry_before],
+            },
+            fields=["name", "amazon_order_id"],
+            order_by="modified asc",
+            limit_page_length=limit,
+        )
+        newly_submitted = []
+        for row in drafts:
+            try:
+                order = self._fetch_order_by_id(row.amazon_order_id)
+                if not order:
+                    print(f"[AMZ-MFN] Retry found no Orders API payload for {row.amazon_order_id}", flush=True)
+                    continue
+                so_name = self.create_sales_order(order)
+                if so_name in self._submitted_this_run:
+                    newly_submitted.append(so_name)
+            except (RequestException, HTTPError, SPAPIError) as exc:
+                frappe.logger().warning(
+                    f"MFN finance refresh deferred for {row.amazon_order_id}: {type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                frappe.log_error(
+                    title=f"Amazon MFN Finance Refresh {row.amazon_order_id}"[:140],
+                    message=frappe.get_traceback(),
+                )
+
+        expired_count = frappe.db.count(
+            "Sales Order",
+            filters={
+                "docstatus": 0,
+                "fulfillment_channel": "MFN",
+                "amazon_order_id": ["is", "set"],
+                "creation": ["<", cutoff],
+            },
+        )
+        if expired_count:
+            frappe.logger().warning(
+                f"{expired_count} MFN Sales Order draft(s) are older than the {horizon_days}-day "
+                "automatic Financial Events retry horizon and require manual accounting review"
+            )
+        return newly_submitted
+
     def _fetch_and_process_orders(self, statuses, channel, last_updated_after, last_updated_before, sales_orders):
         # ── first fetch ──────────────────────────────────────────────────
         orders_payload = _list_orders(
@@ -1337,6 +1811,9 @@ class AmazonRepository:
             order_statuses=",".join(statuses),
             fulfillment_channels=channel,  # Note: Pass as str, not list (e.g., "AFN")
             max_results=50,
+            # MFN must be rediscovered when an older order changes status to Shipped.
+            # Preserve the established AFN CreatedAfter behavior unchanged.
+            use_last_updated=(channel == "MFN"),
         )
 
         #print(f"Orders Payload: {orders_payload}", flush=True)
@@ -1353,10 +1830,26 @@ class AmazonRepository:
                 break
 
             for order in orders_list:
-                so = self.create_sales_order(order)
+                # One malformed order (or one failed accounting posting) must not abort the
+                # remaining orders and pages of the whole sync run.
+                try:
+                    so = self.create_sales_order(order)
+                except (RequestException, HTTPError, SPAPIError) as exc:
+                    frappe.logger().warning(
+                        f"Amazon order {order.get('AmazonOrderId')} deferred: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    so = None
+                except Exception:
+                    frappe.log_error(
+                        title=f"Amazon Order Import {order.get('AmazonOrderId')}"[:140],
+                        message=frappe.get_traceback(),
+                    )
+                    so = None
                 time.sleep(1.1)
                 if so:
-                    sales_orders.append(so)
+                    if channel != "MFN" or so in self._submitted_this_run:
+                        sales_orders.append(so)
 
             if not next_token:
                 break
@@ -1380,10 +1873,10 @@ class AmazonRepository:
             #"Unfulfillable",       #FBA stock-out, payment failure after shipping window, etc.
         ]
         mfn_statuses = [
-            "Unshipped",            #Payment authorised; MFN orders are ready for you to fulfil.
-            "PartiallyShipped",     #Multi-item order: at least one item shipped, others still pending.
-            #"Shipped",             #All items fulfilled (MFN) or Amazon has handed the FBA parcel to the carrier.
-            #"InvoiceUnconfirmed",  #Order is shipped but Amazon has not yet generated the official invoice.
+            "Unshipped",            # Operational visibility before seller fulfillment.
+            "PartiallyShipped",     # Keep refreshing while fulfillment is incomplete.
+            "Shipped",              # Financial-finalization candidate; still requires posted-event readiness.
+            "InvoiceUnconfirmed",   # Financial-finalization candidate; status alone is not sufficient.
         ]
         
         fulfillment_channels = ["AFN", "MFN"]
@@ -1407,7 +1900,18 @@ class AmazonRepository:
         # Fetch MFN orders
         self._fetch_and_process_orders(mfn_statuses, "MFN", created_after, last_updated_before, sales_orders)
 
-        frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit", sales_orders=sales_orders)
+        # Financial Events can lag. Recheck only recent MFN drafts on a bounded cadence, and
+        # pass an MFN SO to the invoice submitter only when this repository just finalized it.
+        for so_name in self._refresh_recent_mfn_drafts():
+            if so_name not in sales_orders:
+                sales_orders.append(so_name)
+
+        if sales_orders:
+            frappe.enqueue(
+                "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit",
+                sales_orders=sales_orders,
+                amz_setting_name=self.amz_setting.name,
+            )
         
         return sales_orders
 
@@ -1467,7 +1971,13 @@ def reprocess_single_draft_order(amz_setting_name: str, sales_order_name: str, a
             frappe.logger().warning(f"[{amazon_order_id}] SP-API returned no order data; keeping draft.")
             return
 
-        ar.create_sales_order(order)
+        so_name = ar.create_sales_order(order)
+        if so_name in ar._submitted_this_run:
+            frappe.enqueue(
+                "eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit",
+                sales_orders=[so_name],
+                amz_setting_name=ar.amz_setting.name,
+            )
         duration = time.time() - start_time
         print(f"[{amazon_order_id}] Successfully reprocessed in {duration:.1f}s", flush=True)
 
