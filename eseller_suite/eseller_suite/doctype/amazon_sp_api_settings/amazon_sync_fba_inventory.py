@@ -1042,6 +1042,326 @@ def _log_daily_report_errors(today_source, yesterday_source, reports, mode_by_as
     )
 
 
+def _log_temporary_consolidated_fallbacks_and_failures(
+    today_source,
+    yesterday_source,
+    report_candidates,
+    live_snapshots,
+    live_invalid_asins,
+    live_global_error,
+    current_main_by_asin,
+    current_inbound_by_asin,
+    main_targets,
+    inbound_targets,
+    mode_by_asin,
+):
+    """Temporarily consolidate source failures and non-normal per-ASIN modes."""
+    try:
+        MAX_ASIN_EXAMPLES_PER_GROUP = 10
+        MAX_ASIN_EXAMPLES_TOTAL = 50
+        normal_mode = "YESTERDAY -> PROTECTED TODAY -> LIVE API"
+        known_modes = {
+            normal_mode,
+            "TODAY REPORT -> LIVE API",
+            "YESTERDAY REPORT -> LIVE API",
+            "NORMAL TWO-REPORT",
+            "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE",
+        }
+
+        relevant_asins = sorted(
+            set(mode_by_asin)
+            | set(today_source["snapshots"])
+            | set(yesterday_source["snapshots"])
+            | set(today_source["invalid_asins"])
+            | set(yesterday_source["invalid_asins"])
+            | set(live_snapshots)
+            | set(live_invalid_asins)
+            | set(current_main_by_asin)
+            | set(current_inbound_by_asin)
+        )
+
+        def report_reason_and_category(source, asin):
+            reason = _source_asin_reason(source, asin)
+            if source["available"]:
+                if asin in source["invalid_asins"]:
+                    return reason, "ASIN invalid or malformed"
+                if asin in source["snapshots"]:
+                    return None, "valid source"
+                if reason:
+                    return reason, "ASIN absent"
+                return None, "other recorded failure"
+
+            error_text = str(source.get("error") or "")
+            if error_text.startswith("Reports API discovery failed"):
+                return reason, "source globally unavailable"
+            return reason, "source report unavailable"
+
+        def live_reason_and_category(asin):
+            if live_global_error:
+                return live_global_error, "source globally unavailable"
+            if asin in live_invalid_asins:
+                return live_invalid_asins[asin], "ASIN invalid or malformed"
+            if asin not in live_snapshots:
+                return "ASIN ABSENT from LIVE API", "ASIN absent"
+            if live_snapshots.get(asin) is not None:
+                return None, "valid source"
+            return None, "other recorded failure"
+
+        has_global_source_failure = bool(
+            not today_source["available"]
+            or today_source.get("error")
+            or not yesterday_source["available"]
+            or yesterday_source.get("error")
+            or live_global_error
+        )
+        has_invalid_asin = bool(
+            today_source["invalid_asins"]
+            or yesterday_source["invalid_asins"]
+            or live_invalid_asins
+        )
+        has_non_normal_mode = any(
+            mode != normal_mode for mode in mode_by_asin.values()
+        )
+        has_absent_asin = False
+        for asin in relevant_asins:
+            today_reason, today_category = report_reason_and_category(
+                today_source, asin
+            )
+            yesterday_reason, yesterday_category = report_reason_and_category(
+                yesterday_source, asin
+            )
+            live_reason, live_category = live_reason_and_category(asin)
+            if (
+                today_category == "ASIN absent"
+                or yesterday_category == "ASIN absent"
+                or live_category == "ASIN absent"
+            ):
+                has_absent_asin = True
+                break
+
+        if not (
+            has_global_source_failure
+            or has_invalid_asin
+            or has_absent_asin
+            or has_non_normal_mode
+        ):
+            return
+
+        mode_counts = defaultdict(int)
+        for mode in mode_by_asin.values():
+            mode_counts[mode] += 1
+        all_modes = sorted(known_modes | set(mode_counts))
+        non_normal_count = sum(
+            count for mode, count in mode_counts.items() if mode != normal_mode
+        )
+
+        def append_report_source_summary(lines, source):
+            report = source.get("report") or {}
+            label = source["label"]
+            lines.extend(
+                [
+                    f"{label} expected date: {source['expected_date']}",
+                    f"{label} availability: {bool(source['available'])}",
+                    f"{label} selected report ID: {report.get('reportId', '<none>')}",
+                    f"{label} createdTime: {report.get('createdTime', '<none>')}",
+                    f"{label} processingStatus: {report.get('processingStatus', '<none>')}",
+                    f"{label} has reportDocumentId: {bool(report.get('reportDocumentId'))}",
+                    f"{label} parsed snapshot count: {len(source['snapshots'])}",
+                    f"{label} invalid-ASIN count: {len(source['invalid_asins'])}",
+                    f"{label} source error: {source.get('error') or '<none>'}",
+                ]
+            )
+
+        lines = [
+            "TEMPORARY CONSOLIDATED INVENTORY FALLBACK/FAILURE DIAGNOSTIC",
+            f"Run timestamp (America/Los_Angeles): "
+            f"{datetime.now(ZoneInfo('America/Los_Angeles')).isoformat()}",
+            "",
+            "COMPLETE RUN SUMMARY (totals and global errors are not truncated)",
+        ]
+        append_report_source_summary(lines, today_source)
+        lines.append("")
+        append_report_source_summary(lines, yesterday_source)
+        lines.extend(
+            [
+                "",
+                f"LIVE valid snapshot count: {len(live_snapshots)}",
+                f"LIVE invalid-ASIN count: {len(live_invalid_asins)}",
+                f"LIVE global error: {live_global_error or '<none>'}",
+                "",
+                "All discovered report candidates "
+                "(complete; formatted with _report_candidate_summary()):",
+            ]
+        )
+        sorted_candidates = sorted(
+            report_candidates,
+            key=lambda report: (
+                str(report.get("createdTime") or ""),
+                str(report.get("reportId") or ""),
+                str(report.get("processingStatus") or ""),
+            ),
+        )
+        if sorted_candidates:
+            lines.extend(
+                f"- {_report_candidate_summary([report])}"
+                for report in sorted_candidates
+            )
+        else:
+            lines.append("- <none>")
+
+        lines.extend(["", "Complete per-ASIN operating-mode counts:"])
+        lines.extend(f"- {mode}: {mode_counts.get(mode, 0)}" for mode in all_modes)
+        lines.extend(
+            [
+                f"Total ASINs using any non-normal mode: {non_normal_count}",
+                "",
+                "GROUPED NON-NORMAL FALLBACKS/FAILURES",
+                "Group totals are complete; representative examples alone are truncated.",
+            ]
+        )
+
+        grouped_asins = defaultdict(list)
+        reason_details = {}
+        for asin in relevant_asins:
+            mode = mode_by_asin.get(asin, "<missing operating mode>")
+            if mode == normal_mode:
+                continue
+            today_reason, today_category = report_reason_and_category(
+                today_source, asin
+            )
+            yesterday_reason, yesterday_category = report_reason_and_category(
+                yesterday_source, asin
+            )
+            live_reason, live_category = live_reason_and_category(asin)
+            group_key = (
+                mode,
+                today_category,
+                yesterday_category,
+                live_category,
+            )
+            grouped_asins[group_key].append(asin)
+            reason_details[asin] = (
+                today_reason,
+                yesterday_reason,
+                live_reason,
+            )
+
+        examples_shown = 0
+        if not grouped_asins:
+            lines.append("- <none>")
+        for group_number, group_key in enumerate(sorted(grouped_asins), start=1):
+            mode, today_category, yesterday_category, live_category = group_key
+            group_asins = sorted(grouped_asins[group_key])
+            remaining_example_capacity = max(
+                MAX_ASIN_EXAMPLES_TOTAL - examples_shown, 0
+            )
+            example_count = min(
+                len(group_asins),
+                MAX_ASIN_EXAMPLES_PER_GROUP,
+                remaining_example_capacity,
+            )
+            example_asins = group_asins[:example_count]
+
+            lines.extend(
+                [
+                    "",
+                    f"Fallback/failure group {group_number}",
+                    f"Mode: {mode}",
+                    f"TODAY reason category: {today_category}",
+                    f"YESTERDAY reason category: {yesterday_category}",
+                    f"LIVE reason category: {live_category}",
+                    f"Total ASINs in group: {len(group_asins)}",
+                ]
+            )
+
+            for asin in example_asins:
+                today_reason, yesterday_reason, live_reason = reason_details[asin]
+                lines.extend(
+                    [
+                        f"  Representative ASIN: {asin}",
+                        f"    Exact selected mode: {mode}",
+                    ]
+                )
+                if today_reason:
+                    lines.append(f"    Exact TODAY reason: {today_reason}")
+                if yesterday_reason:
+                    lines.append(
+                        f"    Exact YESTERDAY reason: {yesterday_reason}"
+                    )
+                if live_reason:
+                    lines.append(f"    Exact LIVE reason: {live_reason}")
+                today_snapshot = today_source["snapshots"].get(asin)
+                yesterday_snapshot = yesterday_source["snapshots"].get(asin)
+                live_snapshot = live_snapshots.get(asin)
+                if today_snapshot is not None:
+                    lines.append(
+                        "    TODAY snapshot: "
+                        + json.dumps(today_snapshot, sort_keys=True)
+                    )
+                if yesterday_snapshot is not None:
+                    lines.append(
+                        "    YESTERDAY snapshot: "
+                        + json.dumps(yesterday_snapshot, sort_keys=True)
+                    )
+                if live_snapshot is not None:
+                    lines.append(
+                        "    LIVE snapshot: "
+                        + json.dumps(live_snapshot, sort_keys=True)
+                    )
+                lines.extend(
+                    [
+                        f"    Current ERP Main FBA quantity: "
+                        f"{int(current_main_by_asin.get(asin, 0) or 0)}",
+                        f"    Current ERP Inbound quantity: "
+                        f"{int(current_inbound_by_asin.get(asin, 0) or 0)}",
+                        f"    Final calculated Main FBA target: "
+                        f"{main_targets.get(asin, '<missing>')}",
+                        f"    Final calculated Inbound target: "
+                        f"{inbound_targets.get(asin, '<missing>')}",
+                    ]
+                )
+
+            examples_shown += example_count
+            omitted_count = len(group_asins) - example_count
+            if omitted_count:
+                if example_count == 0:
+                    lines.append(
+                        "TRUNCATED: no ASIN examples shown for this group because "
+                        "the overall 50-ASIN diagnostic limit was reached."
+                    )
+                elif example_count < min(
+                    len(group_asins), MAX_ASIN_EXAMPLES_PER_GROUP
+                ):
+                    lines.append(
+                        f"TRUNCATED: showing {example_count} of {len(group_asins)} "
+                        f"ASINs in this fallback group; {omitted_count} additional "
+                        "ASINs omitted because the overall 50-ASIN diagnostic limit "
+                        "was reached."
+                    )
+                else:
+                    lines.append(
+                        f"TRUNCATED: showing {example_count} of {len(group_asins)} "
+                        f"ASINs in this fallback group; {omitted_count} additional "
+                        "ASINs omitted."
+                    )
+
+        lines.extend(
+            [
+                "",
+                f"Detailed representative ASIN examples shown: {examples_shown}",
+                f"Per-group example limit: {MAX_ASIN_EXAMPLES_PER_GROUP}",
+                f"Overall example limit: {MAX_ASIN_EXAMPLES_TOTAL}",
+            ]
+        )
+        frappe.log_error(
+            "\n".join(lines),
+            "amazon sync temporary consolidated fallback and failure log",
+        )
+    except Exception:
+        # Temporary diagnostics must never change or abort the inventory sync.
+        return
+
+
 # ──────────────────────────────────────────
 # Inbound Processing
 # ──────────────────────────────────────────
@@ -1452,6 +1772,19 @@ def process_fba_inventory():
             today_source, yesterday_source, report_candidates, mode_by_asin
         )
         _log_degraded_asins(degradation_lines)
+        _log_temporary_consolidated_fallbacks_and_failures(
+            today_source,
+            yesterday_source,
+            report_candidates,
+            live_snapshots,
+            live_invalid_asins,
+            live_global_error,
+            current_main_by_asin,
+            current_inbound_by_asin,
+            asin_fulfillable,
+            final_inbound_by_asin,
+            mode_by_asin,
+        )
 
         if DEBUG:
             print(f"[DEBUG] Final main-FBA targets: {asin_fulfillable}")
