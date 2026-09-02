@@ -48,6 +48,10 @@ def parse_marketplaces(mkt_str: str) -> list[str]:
 MYI_ALL_REPORT_TYPE = "GET_FBA_MYI_ALL_INVENTORY_DATA"
 MYI_REPORT_LOOKBACK_HOURS = 48
 MYI_US_MARKETPLACE_ID = "ATVPDKIKX0DER"
+FINISHED_GOODS_WAREHOUSE = "Finished Goods Post Production - CC"
+MAX_INBOUND_FLOW_EXAMPLES_PER_GROUP = 10
+MAX_INBOUND_FLOW_EXAMPLES_TOTAL = 50
+MAX_DOCUMENT_NAMES_PER_GROUP = 10
 
 
 def _sp_response_data(response):
@@ -1042,6 +1046,118 @@ def _log_daily_report_errors(today_source, yesterday_source, reports, mode_by_as
     )
 
 
+def _new_inbound_flow_diagnostics(asin_inbound, settings):
+    """Create the run-local collector before any inventory documents are changed."""
+    return {
+        "active": False,
+        "prep_warehouse": settings.custom_amazon_fba_staging_area,
+        "finished_goods_warehouse": FINISHED_GOODS_WAREHOUSE,
+        "inbound_warehouse": settings.custom_amazon_inbound_warehouse,
+        "target_count": len(asin_inbound),
+        "valid_target_count": 0,
+        "positive_shortage_count": 0,
+        "shortages_exceeding_prep_count": 0,
+        "initial_short_after_prep_qty": 0,
+        "drafts_inspected": 0,
+        "drafts_eligible": 0,
+        "drafts_revalidation_ineligible": 0,
+        "drafts_debug_would_submit": 0,
+        "drafts_attempted": 0,
+        "drafts_submitted_verified": 0,
+        "drafts_failed_submission": 0,
+        "drafts_committed_unverified": 0,
+        "submitted_finished_to_prep_qty": 0,
+        "prep_valid_row_count": 0,
+        "prep_valid_row_qty": 0,
+        "finished_valid_row_count": 0,
+        "finished_valid_row_qty": 0,
+        "aggregated_entry_name": "<none>",
+        "aggregated_entry_status": "not created",
+        "aggregated_item_count": 0,
+        "aggregated_child_row_count": 0,
+        "aggregated_sources": [],
+        "prep_submitted_qty": 0,
+        "finished_submitted_qty": 0,
+        "reconciliation_shortage_count": 0,
+        "reconciliation_shortage_qty": 0,
+        "skipped_item_count": 0,
+        "valuation_attempted": 0,
+        "valuation_successful": 0,
+        "valuation_failed": 0,
+        "valuation_debug_drafts": 0,
+        "global_errors": [],
+        "events": [],
+        "items": {},
+    }
+
+
+def _concise_inventory_exception(exc):
+    return f"{type(exc).__name__}: {str(exc).strip() or '<no message>'}"
+
+
+def _record_inbound_flow_event(
+    diagnostics,
+    outcome,
+    item_state=None,
+    reason=None,
+    document_name=None,
+    quantity=0,
+):
+    """Record complete totals in memory; the logger truncates examples only."""
+    if diagnostics is None:
+        return
+    try:
+        diagnostics["active"] = True
+        event = {
+            "outcome": outcome,
+            "reason": reason or "<none>",
+            "document_name": document_name,
+            "event_quantity": quantity or 0,
+        }
+        if item_state:
+            for key in (
+                "asin",
+                "item_code",
+                "target_inbound_qty",
+                "initial_inbound_qty",
+                "initial_prep_qty",
+                "initial_finished_goods_qty",
+                "initial_positive_shortage",
+                "eligible_draft_names",
+                "draft_outcome",
+                "draft_expected_qty",
+                "fresh_inbound_qty",
+                "fresh_prep_qty",
+                "fresh_finished_goods_qty",
+                "requested_prep_qty",
+                "valid_prep_row_qty",
+                "submitted_prep_qty",
+                "requested_finished_qty",
+                "valid_finished_row_qty",
+                "submitted_finished_qty",
+                "aggregated_entry_name",
+                "aggregated_outcome",
+                "final_inbound_qty",
+                "reconciliation_qty",
+                "skipped",
+            ):
+                event[key] = item_state.get(key)
+        diagnostics["events"].append(event)
+    except Exception:
+        # This collector is temporary diagnostics and must never affect stock.
+        return
+
+
+def _record_inbound_flow_global_error(diagnostics, message):
+    if diagnostics is None:
+        return
+    try:
+        diagnostics["active"] = True
+        diagnostics["global_errors"].append(str(message))
+    except Exception:
+        return
+
+
 def _log_temporary_consolidated_fallbacks_and_failures(
     today_source,
     yesterday_source,
@@ -1054,6 +1170,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
     main_targets,
     inbound_targets,
     mode_by_asin,
+    inbound_flow_diagnostics=None,
 ):
     """Temporarily consolidate source failures and non-normal per-ASIN modes."""
     try:
@@ -1122,6 +1239,10 @@ def _log_temporary_consolidated_fallbacks_and_failures(
         has_non_normal_mode = any(
             mode != normal_mode for mode in mode_by_asin.values()
         )
+        has_inbound_flow_activity = bool(
+            inbound_flow_diagnostics
+            and inbound_flow_diagnostics.get("active")
+        )
         has_absent_asin = False
         for asin in relevant_asins:
             today_reason, today_category = report_reason_and_category(
@@ -1144,6 +1265,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
             or has_invalid_asin
             or has_absent_asin
             or has_non_normal_mode
+            or has_inbound_flow_activity
         ):
             return
 
@@ -1353,6 +1475,222 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 f"Overall example limit: {MAX_ASIN_EXAMPLES_TOTAL}",
             ]
         )
+
+        flow = inbound_flow_diagnostics or {}
+        lines.extend(
+            [
+                "",
+                "FINISHED GOODS / PREP / INBOUND FLOW SUMMARY",
+                "Summary totals are complete and are not truncated.",
+                f"Configured Prep warehouse: {flow.get('prep_warehouse', '<unavailable>')}",
+                f"Exact Finished Goods warehouse: "
+                f"{flow.get('finished_goods_warehouse', FINISHED_GOODS_WAREHOUSE)}",
+                f"Configured Inbound warehouse: "
+                f"{flow.get('inbound_warehouse', '<unavailable>')}",
+                f"Number of valid Inbound targets: {flow.get('valid_target_count', 0)}",
+                f"Number of positive Inbound shortages: "
+                f"{flow.get('positive_shortage_count', 0)}",
+                f"Number of shortages initially exceeding available Prep: "
+                f"{flow.get('shortages_exceeding_prep_count', 0)}",
+                f"Total quantity initially short after available Prep: "
+                f"{flow.get('initial_short_after_prep_qty', 0)}",
+                f"Draft Stock Entries inspected: {flow.get('drafts_inspected', 0)}",
+                f"Draft Stock Entries found eligible: {flow.get('drafts_eligible', 0)}",
+                f"Drafts becoming ineligible during pre-submit revalidation: "
+                f"{flow.get('drafts_revalidation_ineligible', 0)}",
+                f"Drafts that would be submitted in DEBUG mode: "
+                f"{flow.get('drafts_debug_would_submit', 0)}",
+                f"Draft submissions actually attempted: {flow.get('drafts_attempted', 0)}",
+                f"Drafts successfully submitted and verified: "
+                f"{flow.get('drafts_submitted_verified', 0)}",
+                f"Drafts failing submission: {flow.get('drafts_failed_submission', 0)}",
+                f"Committed drafts whose submitted state could not be verified: "
+                f"{flow.get('drafts_committed_unverified', 0)}",
+                f"Total submitted Finished Goods to Prep quantity: "
+                f"{flow.get('submitted_finished_to_prep_qty', 0)}",
+                f"Valid Prep to Inbound rows: {flow.get('prep_valid_row_count', 0)}; "
+                f"quantity: {flow.get('prep_valid_row_qty', 0)}",
+                f"Valid Finished Goods to Inbound rows: "
+                f"{flow.get('finished_valid_row_count', 0)}; "
+                f"quantity: {flow.get('finished_valid_row_qty', 0)}",
+                f"Aggregated Inbound Stock Entry name: "
+                f"{flow.get('aggregated_entry_name', '<none>')}",
+                f"Aggregated Inbound Stock Entry final status: "
+                f"{flow.get('aggregated_entry_status', 'not created')}",
+                f"Aggregated Inbound Stock Entry item count: "
+                f"{flow.get('aggregated_item_count', 0)}",
+                f"Aggregated Inbound Stock Entry child-row count: "
+                f"{flow.get('aggregated_child_row_count', 0)}",
+                "Aggregated source warehouses: "
+                + (", ".join(flow.get("aggregated_sources") or []) or "<none>"),
+                "Aggregated source mode: "
+                + (
+                    "both Prep and Finished Goods"
+                    if len(flow.get("aggregated_sources") or []) == 2
+                    else "one source warehouse"
+                    if len(flow.get("aggregated_sources") or []) == 1
+                    else "no source rows"
+                ),
+                f"Prep quantity successfully submitted: "
+                f"{flow.get('prep_submitted_qty', 0)}",
+                f"Finished Goods quantity successfully submitted: "
+                f"{flow.get('finished_submitted_qty', 0)}",
+                f"Shortages handed to final Inbound Stock Reconciliation: "
+                f"{flow.get('reconciliation_shortage_count', 0)}; "
+                f"quantity: {flow.get('reconciliation_shortage_qty', 0)}",
+                f"Items deliberately skipped because quantities could not be verified: "
+                f"{flow.get('skipped_item_count', 0)}",
+                f"Valuation corrections attempted: {flow.get('valuation_attempted', 0)}",
+                f"Valuation corrections successful: {flow.get('valuation_successful', 0)}",
+                f"Valuation corrections failed: {flow.get('valuation_failed', 0)}",
+                f"Valuation corrections left as DEBUG drafts: "
+                f"{flow.get('valuation_debug_drafts', 0)}",
+                "Concise global errors:",
+            ]
+        )
+        global_errors = flow.get("global_errors") or []
+        if global_errors:
+            lines.extend(f"- {error}" for error in global_errors)
+        else:
+            lines.append("- <none>")
+
+        lines.extend(
+            [
+                "",
+                "GROUPED FINISHED GOODS / PREP / INBOUND FLOW DETAILS",
+                "Group totals are complete; representative examples and document names are truncated.",
+            ]
+        )
+        grouped_flow_events = defaultdict(list)
+        for event in flow.get("events") or []:
+            grouped_flow_events[(event["outcome"], event["reason"])].append(event)
+
+        flow_examples_shown = 0
+        if not grouped_flow_events:
+            lines.append("- <none>")
+        for group_number, group_key in enumerate(sorted(grouped_flow_events), start=1):
+            outcome, reason = group_key
+            group_events = grouped_flow_events[group_key]
+            document_names = sorted({
+                event["document_name"]
+                for event in group_events
+                if event.get("document_name")
+            })
+            shown_document_names = document_names[:MAX_DOCUMENT_NAMES_PER_GROUP]
+            remaining_capacity = max(
+                MAX_INBOUND_FLOW_EXAMPLES_TOTAL - flow_examples_shown, 0
+            )
+            item_events = [event for event in group_events if event.get("item_code")]
+            example_count = min(
+                len(item_events),
+                MAX_INBOUND_FLOW_EXAMPLES_PER_GROUP,
+                remaining_capacity,
+            )
+            example_events = item_events[:example_count]
+            group_quantity = sum(
+                event.get("event_quantity", 0) or 0 for event in group_events
+            )
+            lines.extend(
+                [
+                    "",
+                    f"Inbound-flow group {group_number}",
+                    f"Outcome: {outcome}",
+                    f"Reason: {reason}",
+                    f"Total recorded outcomes in group: {len(group_events)}",
+                    f"Total affected item count in group: "
+                    f"{len({event.get('item_code') for event in item_events})}",
+                    f"Total outcome quantity in group: {group_quantity}",
+                    "Representative document names: "
+                    + (", ".join(shown_document_names) or "<none>"),
+                ]
+            )
+            omitted_documents = len(document_names) - len(shown_document_names)
+            if omitted_documents:
+                lines.append(
+                    f"TRUNCATED: showing {len(shown_document_names)} of "
+                    f"{len(document_names)} document names in this group; "
+                    f"{omitted_documents} additional document names omitted."
+                )
+
+            for event in example_events:
+                final_item_state = (flow.get("items") or {}).get(
+                    event.get("item_code"), {}
+                )
+                event = dict(event)
+                event.update(final_item_state)
+                eligible_names = event.get("eligible_draft_names") or []
+                eligible_name_text = (
+                    ", ".join(eligible_names[:MAX_DOCUMENT_NAMES_PER_GROUP])
+                    or "<none>"
+                )
+                if len(eligible_names) > MAX_DOCUMENT_NAMES_PER_GROUP:
+                    eligible_name_text += (
+                        f"; TRUNCATED: {len(eligible_names) - MAX_DOCUMENT_NAMES_PER_GROUP} "
+                        "additional eligible draft names omitted"
+                    )
+                lines.extend(
+                    [
+                        f"  Representative ASIN: {event.get('asin') or '<none>'}",
+                        f"    ERP item code: {event.get('item_code')}",
+                        f"    Target Inbound quantity: {event.get('target_inbound_qty')}",
+                        f"    Initial Inbound quantity: {event.get('initial_inbound_qty')}",
+                        f"    Initial Prep quantity: {event.get('initial_prep_qty')}",
+                        f"    Initial Finished Goods quantity: "
+                        f"{event.get('initial_finished_goods_qty')}",
+                        f"    Initial positive shortage: "
+                        f"{event.get('initial_positive_shortage')}",
+                        f"    Eligible draft Stock Entries: {eligible_name_text}",
+                        f"    Draft status/outcome: {event.get('draft_outcome') or '<none>'}",
+                        f"    Draft expected movement quantity: "
+                        f"{event.get('draft_expected_qty') or 0}",
+                        f"    Fresh post-draft Inbound quantity: {event.get('fresh_inbound_qty')}",
+                        f"    Fresh post-draft Prep quantity: {event.get('fresh_prep_qty')}",
+                        f"    Fresh post-draft Finished Goods quantity: "
+                        f"{event.get('fresh_finished_goods_qty')}",
+                        f"    Requested Prep transfer quantity: "
+                        f"{event.get('requested_prep_qty') or 0}",
+                        f"    Quantity represented by valid Prep rows: "
+                        f"{event.get('valid_prep_row_qty') or 0}",
+                        f"    Successfully submitted Prep quantity: "
+                        f"{event.get('submitted_prep_qty') or 0}",
+                        f"    Requested Finished Goods transfer quantity: "
+                        f"{event.get('requested_finished_qty') or 0}",
+                        f"    Quantity represented by valid Finished Goods rows: "
+                        f"{event.get('valid_finished_row_qty') or 0}",
+                        f"    Successfully submitted Finished Goods quantity: "
+                        f"{event.get('submitted_finished_qty') or 0}",
+                        f"    Aggregated Stock Entry: "
+                        f"{event.get('aggregated_entry_name') or '<none>'}",
+                        f"    Aggregated outcome: "
+                        f"{event.get('aggregated_outcome') or '<none>'}",
+                        f"    Final freshly read Inbound quantity: "
+                        f"{event.get('final_inbound_qty')}",
+                        f"    Quantity handed to Inbound Stock Reconciliation: "
+                        f"{event.get('reconciliation_qty') or 0}",
+                        f"    Deliberately skipped: {bool(event.get('skipped'))}",
+                        f"    Exact concise reason: {event.get('reason')}",
+                    ]
+                )
+
+            flow_examples_shown += example_count
+            omitted_items = len(item_events) - example_count
+            if omitted_items:
+                lines.append(
+                    f"TRUNCATED: showing {example_count} of {len(item_events)} "
+                    f"items in this group; {omitted_items} additional items omitted."
+                )
+
+        lines.extend(
+            [
+                "",
+                f"Detailed inbound-flow examples shown: {flow_examples_shown}",
+                f"Inbound-flow per-group example limit: "
+                f"{MAX_INBOUND_FLOW_EXAMPLES_PER_GROUP}",
+                f"Inbound-flow overall example limit: "
+                f"{MAX_INBOUND_FLOW_EXAMPLES_TOTAL}",
+                f"Document-name per-group limit: {MAX_DOCUMENT_NAMES_PER_GROUP}",
+            ]
+        )
         frappe.log_error(
             "\n".join(lines),
             "amazon sync temporary consolidated fallback and failure log",
@@ -1365,19 +1703,209 @@ def _log_temporary_consolidated_fallbacks_and_failures(
 # ──────────────────────────────────────────
 # Inbound Processing
 # ──────────────────────────────────────────
-def process_inbound_inventory(asin_inbound, settings):
+def _read_bin_actual_qty(item_code, warehouse):
+    return float(
+        frappe.db.get_value(
+            "Bin",
+            {"item_code": item_code, "warehouse": warehouse},
+            "actual_qty",
+        )
+        or 0
+    )
+
+
+def _stock_entry_item_quantities(stock_entry):
+    quantities = defaultdict(float)
+    for row in stock_entry.items or []:
+        quantities[row.item_code] += float(row.qty or 0)
+    return dict(quantities)
+
+
+def _eligible_finished_to_prep_draft(
+    stock_entry,
+    needed_item_codes,
+    company,
+    prep_wh,
+):
+    if (
+        stock_entry.docstatus != 0
+        or stock_entry.stock_entry_type != "Material Transfer"
+        or stock_entry.company != company
+        or frappe.utils.getdate(stock_entry.posting_date)
+        > frappe.utils.getdate(frappe.utils.today())
+        or not stock_entry.items
+    ):
+        return False
+    if any(
+        row.s_warehouse != FINISHED_GOODS_WAREHOUSE
+        or row.t_warehouse != prep_wh
+        for row in stock_entry.items
+    ):
+        return False
+    return any(row.item_code in needed_item_codes for row in stock_entry.items)
+
+
+def _source_valuation_reconciliation_rows(
+    item_code,
+    source_wh,
+    current_qty,
+    valuation_rate,
+    has_batch,
+    has_serial,
+):
+    rows = []
+    if has_serial:
+        serial_nos = frappe.db.sql_list(
+            """
+            SELECT name FROM `tabSerial No`
+            WHERE item_code = %s AND warehouse = %s
+            """,
+            (item_code, source_wh),
+        )
+        if len(serial_nos) == current_qty:
+            rows.append({
+                "item_code": item_code,
+                "warehouse": source_wh,
+                "qty": current_qty,
+                "valuation_rate": valuation_rate,
+                "serial_no": "\n".join(serial_nos),
+            })
+    elif has_batch:
+        batches = frappe.get_all(
+            "Batch", filters={"item": item_code}, fields=["name"]
+        )
+        for batch in batches:
+            batch_qty = float(
+                get_batch_qty(batch.name, source_wh, item_code) or 0
+            )
+            if batch_qty > 0:
+                rows.append({
+                    "item_code": item_code,
+                    "warehouse": source_wh,
+                    "qty": batch_qty,
+                    "valuation_rate": valuation_rate,
+                    "batch_no": batch.name,
+                })
+    else:
+        rows.append({
+            "item_code": item_code,
+            "warehouse": source_wh,
+            "qty": current_qty,
+            "valuation_rate": valuation_rate,
+        })
+    return rows
+
+
+def _valid_source_transfer_rows(
+    item_code,
+    source_wh,
+    inbound_wh,
+    requested_qty,
+    valuation_rate,
+    has_batch,
+    has_serial,
+):
+    rows = []
+    if requested_qty <= 0:
+        return rows, 0
+    if has_serial:
+        whole_requested_qty = int(requested_qty)
+        serial_nos = frappe.db.sql_list(
+            """
+            SELECT name FROM `tabSerial No`
+            WHERE item_code = %s AND warehouse = %s
+            LIMIT %s
+            """,
+            (item_code, source_wh, whole_requested_qty),
+        )
+        represented_qty = min(len(serial_nos), whole_requested_qty)
+        if represented_qty > 0:
+            rows.append({
+                "item_code": item_code,
+                "s_warehouse": source_wh,
+                "t_warehouse": inbound_wh,
+                "qty": represented_qty,
+                "basic_rate": valuation_rate,
+                "serial_no": "\n".join(serial_nos[:represented_qty]),
+            })
+        return rows, represented_qty
+    if has_batch:
+        remaining = requested_qty
+        batches = frappe.get_all(
+            "Batch",
+            filters={"item": item_code},
+            fields=["name"],
+            order_by="creation asc",
+        )
+        for batch in batches:
+            if remaining <= 0:
+                break
+            batch_qty = float(
+                get_batch_qty(batch.name, source_wh, item_code) or 0
+            )
+            if batch_qty > 0:
+                move_qty = min(batch_qty, remaining)
+                rows.append({
+                    "item_code": item_code,
+                    "s_warehouse": source_wh,
+                    "t_warehouse": inbound_wh,
+                    "qty": move_qty,
+                    "basic_rate": valuation_rate,
+                    "batch_no": batch.name,
+                })
+                remaining -= move_qty
+        return rows, requested_qty - remaining
+    rows.append({
+        "item_code": item_code,
+        "s_warehouse": source_wh,
+        "t_warehouse": inbound_wh,
+        "qty": requested_qty,
+        "basic_rate": valuation_rate,
+    })
+    return rows, requested_qty
+
+
+def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
     prep_wh = settings.custom_amazon_fba_staging_area
     inbound_wh = settings.custom_amazon_inbound_warehouse
     company = settings.company
     adjustment_account = settings.custom_amazon_inventory_adjustment_account
+    diagnostics = diagnostics or _new_inbound_flow_diagnostics(
+        asin_inbound, settings
+    )
 
     if DEBUG: print(f"[DEBUG] Starting inbound inventory processing for warehouse: {inbound_wh}")
 
-    # First pass: collect transfers for increases
-    transfer_items = []
-    prep_reconcile_items = []
-    transfer_pending = []
+    def mark_item_skipped(state, reason, document_name=None):
+        if state.get("skipped"):
+            return
+        state["skipped"] = True
+        state["failure_reason"] = reason
+        state["planned_rows"] = []
+        diagnostics["skipped_item_count"] += 1
+        _record_inbound_flow_event(
+            diagnostics,
+            "Item deliberately skipped to prevent double counting",
+            state,
+            reason,
+            document_name,
+        )
+
+    def read_three_quantities(state):
+        return (
+            _read_bin_actual_qty(state["item_code"], inbound_wh),
+            _read_bin_actual_qty(state["item_code"], prep_wh),
+            _read_bin_actual_qty(
+                state["item_code"], FINISHED_GOODS_WAREHOUSE
+            ),
+        )
+
+    item_states = {}
+    initially_needed_beyond_prep = set()
+
+    # Establish initial shortages only to decide whether existing drafts are relevant.
     for asin, target_qty in asin_inbound.items():
+        target_qty = float(target_qty or 0)
         if DEBUG: print(f"[DEBUG] Processing inbound ASIN: {asin} with target_qty: {target_qty}")
         item_code = frappe.db.get_value("Item", {"custom_asin": asin, "disabled": 0}, "name")
         if not item_code:
@@ -1388,215 +1916,750 @@ def process_inbound_inventory(asin_inbound, settings):
         if not frappe.get_value("Item", item_code, "is_stock_item"):
             if DEBUG: print(f"[DEBUG] Skipping non-stock item: {item_code}")
             continue
-
-        current_inbound = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": inbound_wh}, "actual_qty") or 0
-        diff = target_qty - current_inbound
-        if DEBUG: print(f"[DEBUG] Current inbound qty: {current_inbound}, diff: {diff}")
+        diagnostics["valid_target_count"] += 1
+        state = {
+            "asin": asin,
+            "item_code": item_code,
+            "target_inbound_qty": target_qty,
+            "eligible_draft_names": [],
+            "draft_outcome": None,
+            "draft_expected_qty": 0,
+            "requested_prep_qty": 0,
+            "valid_prep_row_qty": 0,
+            "submitted_prep_qty": 0,
+            "requested_finished_qty": 0,
+            "valid_finished_row_qty": 0,
+            "submitted_finished_qty": 0,
+            "aggregated_entry_name": None,
+            "aggregated_outcome": None,
+            "final_inbound_qty": None,
+            "reconciliation_qty": 0,
+            "skipped": False,
+            "planned_rows": [],
+            "has_batch": frappe.get_value("Item", item_code, "has_batch_no"),
+            "has_serial": frappe.get_value("Item", item_code, "has_serial_no"),
+        }
+        diagnostics["items"][item_code] = state
+        item_states[item_code] = state
+        try:
+            current_inbound, current_prep, current_finished = read_three_quantities(
+                state
+            )
+        except Exception as exc:
+            reason = "Initial warehouse quantity read failed: " + _concise_inventory_exception(exc)
+            mark_item_skipped(state, reason)
+            continue
+        state.update({
+            "initial_inbound_qty": current_inbound,
+            "initial_prep_qty": current_prep,
+            "initial_finished_goods_qty": current_finished,
+        })
+        diff = max(target_qty - current_inbound, 0)
+        state["initial_positive_shortage"] = diff
         if diff <= 0:
             continue
+        diagnostics["positive_shortage_count"] += 1
+        if diff > max(current_prep, 0):
+            diagnostics["active"] = True
+            diagnostics["shortages_exceeding_prep_count"] += 1
+            diagnostics["initial_short_after_prep_qty"] += (
+                diff - max(current_prep, 0)
+            )
+            initially_needed_beyond_prep.add(item_code)
+            _record_inbound_flow_event(
+                diagnostics,
+                "Positive Inbound shortage initially exceeded available Prep",
+                state,
+                "Available Prep could not completely cover the current shortage",
+                quantity=diff - max(current_prep, 0),
+            )
 
-        current_prep = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": prep_wh}, "actual_qty") or 0
-        transfer_qty = min(current_prep, diff)
-        if DEBUG: print(f"[DEBUG] Current prep qty: {current_prep}, transfer_qty: {transfer_qty}")
-        if transfer_qty <= 0:
-            continue
-
-        bin_data_prep = frappe.db.get_value(
-            "Bin",
-            {"item_code": item_code, "warehouse": prep_wh},
-            ["valuation_rate"],
-            as_dict=True
-        ) or {}
-        bin_rate = bin_data_prep.get("valuation_rate", 0)
-
-        item_valuation_rate = frappe.get_value("Item", item_code, "valuation_rate") or 0
-        val_rate = item_valuation_rate if item_valuation_rate > 0 else 0.01
-
-        has_batch = frappe.get_value("Item", item_code, "has_batch_no")
-        has_serial = frappe.get_value("Item", item_code, "has_serial_no")
-
-        reconcile_needed = (bin_rate != val_rate)
-
-        if reconcile_needed:
-            item_reconcile_items = []
-            if has_serial:
-                serial_nos = frappe.db.sql_list("""SELECT name FROM `tabSerial No` WHERE item_code = %s AND warehouse = %s""", (item_code, prep_wh))
-                if len(serial_nos) == current_prep:
-                    item_reconcile_items.append({
-                        "item_code": item_code,
-                        "warehouse": prep_wh,
-                        "qty": current_prep,
-                        "valuation_rate": val_rate,
-                        "serial_no": '\n'.join(serial_nos),
-                    })
-            elif has_batch:
-                batches = frappe.get_all("Batch", filters={"item": item_code}, fields=["name"])
-                for batch in batches:
-                    batch_qty = get_batch_qty(batch.name, prep_wh, item_code) or 0
-                    if batch_qty > 0:
-                        item_reconcile_items.append({
-                            "item_code": item_code,
-                            "warehouse": prep_wh,
-                            "qty": batch_qty,
-                            "valuation_rate": val_rate,
-                            "batch_no": batch.name,
-                        })
-            else:
-                item_reconcile_items.append({
-                    "item_code": item_code,
-                    "warehouse": prep_wh,
-                    "qty": current_prep,
-                    "valuation_rate": val_rate,
-                })
-            if item_reconcile_items:
-                prep_reconcile_items += item_reconcile_items
-                transfer_pending.append((item_code, transfer_qty, has_batch, has_serial, val_rate))
-            else:
-                if DEBUG: print(f"[DEBUG] Could not create reconcile items for {item_code}, skipping transfer")
-        else:
-            transfer_pending.append((item_code, transfer_qty, has_batch, has_serial, val_rate))
-
-    # Create and submit Prep Stock Reconciliation if needed
-    if prep_reconcile_items:
-        if DEBUG: print(f"[DEBUG] Creating Prep Stock Reconciliation with {len(prep_reconcile_items)} items...")
-        try:  # ADDED: Wrap for error logging
-            prep_sr = frappe.get_doc({
-                "doctype": "Stock Reconciliation",
-                "company": company,
-                "posting_date": frappe.utils.today(),
-                "purpose": "Stock Reconciliation",
-                "expense_account": adjustment_account,
-                "items": prep_reconcile_items,
-            })
-            prep_sr.insert(ignore_permissions=True)
-            if DEBUG: print(f"[DEBUG] Inserted Prep SR: {prep_sr.name}")
-            if DEBUG:
-                if DEBUG: print(f"[DEBUG] DEBUG mode: leaving Prep SR {prep_sr.name} as DRAFT (not submitted)")
-                frappe.db.commit()  # persist draft
-            else:
-                prep_sr.submit()
-                frappe.db.commit()
-                if DEBUG: print(f"[DEBUG] Submitted Prep SR: {prep_sr.name}")
-        except Exception:
-            frappe.log_error(frappe.get_traceback(), "Prep Stock Reconciliation Error")
-            raise  # Re-raise to propagate if needed
-
-    # Now process pending transfers
-    for item_code, transfer_qty, has_batch, has_serial, val_rate in transfer_pending:
-        current_prep = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": prep_wh}, "actual_qty") or 0
-        transfer_qty = min(current_prep, transfer_qty)
-        if transfer_qty <= 0:
-            continue
-        if has_serial:
-            serial_nos = frappe.db.sql_list("""SELECT name FROM `tabSerial No` WHERE item_code = %s AND warehouse = %s LIMIT %s""", (item_code, prep_wh, transfer_qty))
-            if len(serial_nos) == transfer_qty:
-                transfer_items.append({
-                    "item_code": item_code,
-                    "s_warehouse": prep_wh,
-                    "t_warehouse": inbound_wh,
-                    "qty": transfer_qty,
-                    "basic_rate": val_rate,
-                    "serial_no": '\n'.join(serial_nos),
-                })
-            else:
-                if DEBUG: print(f"[DEBUG] Insufficient serial nos for {item_code}, skipping transfer")
-        elif has_batch:
-            batches = frappe.get_all("Batch", filters={"item": item_code}, fields=["name"], order_by="creation asc")
-            remaining = transfer_qty
-            for batch in batches:
-                if remaining <= 0:
-                    break
-                batch_qty = get_batch_qty(batch.name, prep_wh, item_code) or 0
-                if batch_qty > 0:
-                    move_qty = min(batch_qty, remaining)
-                    transfer_items.append({
-                        "item_code": item_code,
-                        "s_warehouse": prep_wh,
-                        "t_warehouse": inbound_wh,
-                        "qty": move_qty,
-                        "basic_rate": val_rate,
-                        "batch_no": batch.name,
-                    })
-                    remaining -= move_qty
-            if remaining > 0:
-                if DEBUG: print(f"[DEBUG] Insufficient batch qty for {item_code}, transferred {transfer_qty - remaining}, remaining {remaining} will be handled by reconciliation")
-        else:
-            transfer_items.append({
-                "item_code": item_code,
-                "s_warehouse": prep_wh,
-                "t_warehouse": inbound_wh,
-                "qty": transfer_qty,
-                "basic_rate": val_rate,
-            })
-
-    # Create and submit Stock Entry if needed
-    if transfer_items:
-        if DEBUG: print(f"[DEBUG] Creating Stock Entry with {len(transfer_items)} items...")
-        se = frappe.get_doc({
-            "doctype": "Stock Entry",
-            "company": company,
-            "stock_entry_type": "Material Transfer",
-            "from_warehouse": prep_wh,
-            "to_warehouse": inbound_wh,
-            "posting_date": frappe.utils.today(),
-            "items": transfer_items,
-        })
-        se.insert(ignore_permissions=True)
-        if DEBUG: print(f"[DEBUG] Inserted SE: {se.name}")
+    # Existing Finished Goods-to-Prep drafts are considered only when useful.
+    eligible_drafts = []
+    if initially_needed_beyond_prep:
         try:
+            draft_rows = frappe.get_all(
+                "Stock Entry",
+                filters={
+                    "docstatus": 0,
+                    "stock_entry_type": "Material Transfer",
+                    "company": company,
+                    "posting_date": ["<=", frappe.utils.today()],
+                },
+                fields=["name", "posting_date", "posting_time", "creation"],
+                order_by="posting_date asc, posting_time asc, creation asc, name asc",
+            )
+            diagnostics["drafts_inspected"] = len(draft_rows)
+        except Exception as exc:
+            draft_rows = []
+            _record_inbound_flow_global_error(
+                diagnostics,
+                "Draft Stock Entry search failed: " + _concise_inventory_exception(exc),
+            )
+
+        for draft_row in draft_rows:
+            try:
+                draft = frappe.get_doc("Stock Entry", draft_row.name)
+                if not _eligible_finished_to_prep_draft(
+                    draft,
+                    initially_needed_beyond_prep,
+                    company,
+                    prep_wh,
+                ):
+                    continue
+                quantities = _stock_entry_item_quantities(draft)
+                relevant_codes = sorted(
+                    set(quantities) & initially_needed_beyond_prep
+                )
+                eligible_drafts.append((draft.name, relevant_codes))
+                diagnostics["drafts_eligible"] += 1
+                for item_code in relevant_codes:
+                    state = item_states[item_code]
+                    state["eligible_draft_names"].append(draft.name)
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "Eligible Finished Goods to Prep draft discovered",
+                        state,
+                        "Draft met all initial eligibility conditions",
+                        draft.name,
+                        quantities.get(item_code, 0),
+                    )
+            except Exception as exc:
+                _record_inbound_flow_global_error(
+                    diagnostics,
+                    f"Draft {draft_row.name} could not be inspected: "
+                    + _concise_inventory_exception(exc),
+                )
+
+    submitted_draft_baselines = {}
+    submitted_draft_qty_by_item = defaultdict(float)
+    submitted_draft_names_by_item = defaultdict(list)
+    for draft_name, initially_relevant_codes in eligible_drafts:
+        try:
+            draft = frappe.get_doc("Stock Entry", draft_name)
+            draft.reload()
+        except Exception as exc:
+            diagnostics["drafts_revalidation_ineligible"] += 1
+            reason = "Immediate draft reload failed: " + _concise_inventory_exception(exc)
+            for item_code in initially_relevant_codes:
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Eligible draft became ineligible during revalidation",
+                    item_states.get(item_code),
+                    reason,
+                    draft_name,
+                )
+            continue
+
+        currently_needed = set()
+        pre_submit_quantities = {}
+        for item_code, state in item_states.items():
+            if state.get("skipped"):
+                continue
+            try:
+                current_inbound, current_prep, current_finished = (
+                    read_three_quantities(state)
+                )
+            except Exception as exc:
+                mark_item_skipped(
+                    state,
+                    "Immediate pre-submit Bin reread failed: "
+                    + _concise_inventory_exception(exc),
+                    draft_name,
+                )
+                continue
+            pre_submit_quantities[item_code] = (
+                current_inbound,
+                current_prep,
+                current_finished,
+            )
+            if state["target_inbound_qty"] - current_inbound > max(current_prep, 0):
+                currently_needed.add(item_code)
+
+        if not _eligible_finished_to_prep_draft(
+            draft, currently_needed, company, prep_wh
+        ):
+            diagnostics["drafts_revalidation_ineligible"] += 1
+            for item_code in initially_relevant_codes:
+                state = item_states.get(item_code)
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Eligible draft became ineligible during revalidation",
+                    state,
+                    "Draft was no longer a valid, currently useful Finished Goods to Prep draft",
+                    draft_name,
+                )
+            continue
+
+        draft_quantities = _stock_entry_item_quantities(draft)
+        revalidated_codes = sorted(set(draft_quantities) & currently_needed)
+        for item_code in revalidated_codes:
+            state = item_states[item_code]
+            state["draft_outcome"] = "revalidated and eligible"
+            _record_inbound_flow_event(
+                diagnostics,
+                "Eligible draft revalidated",
+                state,
+                "Draft remained eligible immediately before submission",
+                draft_name,
+                draft_quantities.get(item_code, 0),
+            )
+
+        if DEBUG:
+            diagnostics["drafts_debug_would_submit"] += 1
+            for item_code in revalidated_codes:
+                state = item_states[item_code]
+                state["draft_outcome"] = "would submit in non-DEBUG mode"
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "DEBUG-only planned draft submission",
+                    state,
+                    "Would submit in non-DEBUG mode; no quantity was moved",
+                    draft_name,
+                    draft_quantities.get(item_code, 0),
+                )
+            continue
+
+        diagnostics["drafts_attempted"] += 1
+        for item_code in revalidated_codes:
+            _record_inbound_flow_event(
+                diagnostics,
+                "Draft submission attempted",
+                item_states[item_code],
+                "Submission attempted after immediate revalidation",
+                draft_name,
+                draft_quantities.get(item_code, 0),
+            )
+        savepoint_name = "amazon_finished_to_prep_" + re.sub(
+            r"[^A-Za-z0-9_]", "_", draft_name
+        )
+        committed = False
+        try:
+            frappe.db.savepoint(savepoint_name)
+            draft.submit()
+            frappe.db.commit()
+            committed = True
+            for item_code, quantities in pre_submit_quantities.items():
+                if item_code not in draft_quantities:
+                    continue
+                submitted_draft_baselines.setdefault(item_code, quantities)
+            draft.reload()
+            if draft.docstatus != 1:
+                raise RuntimeError(
+                    f"committed Stock Entry reloaded with docstatus={draft.docstatus}"
+                )
+            diagnostics["drafts_submitted_verified"] += 1
+            diagnostics["submitted_finished_to_prep_qty"] += sum(
+                draft_quantities.values()
+            )
+            for item_code, moved_qty in draft_quantities.items():
+                if item_code not in item_states:
+                    continue
+                submitted_draft_qty_by_item[item_code] += moved_qty
+                submitted_draft_names_by_item[item_code].append(draft_name)
+                state = item_states[item_code]
+                state["draft_expected_qty"] += moved_qty
+                state["draft_outcome"] = "submitted, committed, and docstatus verified"
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Eligible draft submitted and verified",
+                    state,
+                    "Submission committed and reloaded with docstatus 1",
+                    draft_name,
+                    moved_qty,
+                )
+        except Exception as exc:
+            reason = _concise_inventory_exception(exc)
+            if committed:
+                diagnostics["drafts_committed_unverified"] += 1
+                outcome = "Submitted draft could not be verified"
+                reason = "Committed state could not be safely verified: " + reason
+                for item_code in set(draft_quantities) & set(item_states):
+                    state = item_states[item_code]
+                    state["draft_outcome"] = "committed state could not be verified"
+                    mark_item_skipped(state, reason, draft_name)
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        outcome,
+                        state,
+                        reason,
+                        draft_name,
+                        draft_quantities.get(item_code, 0),
+                    )
+            else:
+                diagnostics["drafts_failed_submission"] += 1
+                try:
+                    frappe.db.rollback(save_point=savepoint_name)
+                except Exception as rollback_exc:
+                    _record_inbound_flow_global_error(
+                        diagnostics,
+                        f"Draft {draft_name} savepoint rollback failed: "
+                        + _concise_inventory_exception(rollback_exc),
+                    )
+                for item_code in revalidated_codes:
+                    state = item_states[item_code]
+                    state["draft_outcome"] = "submission failed"
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "Eligible draft failed submission",
+                        state,
+                        reason,
+                        draft_name,
+                        draft_quantities.get(item_code, 0),
+                    )
+
+    # Always allocate from fresh Bins after draft processing. Submitted-draft
+    # deltas are verified before either source can be used.
+    for item_code, state in item_states.items():
+        if state.get("skipped"):
+            continue
+        try:
+            current_inbound, current_prep, current_finished = read_three_quantities(
+                state
+            )
+        except Exception as exc:
+            mark_item_skipped(
+                state,
+                "Fresh post-draft Bin reread failed: "
+                + _concise_inventory_exception(exc),
+                (submitted_draft_names_by_item.get(item_code) or [None])[-1],
+            )
+            continue
+        state.update({
+            "fresh_inbound_qty": current_inbound,
+            "fresh_prep_qty": current_prep,
+            "fresh_finished_goods_qty": current_finished,
+        })
+        moved_qty = submitted_draft_qty_by_item.get(item_code, 0)
+        if moved_qty:
+            baseline = submitted_draft_baselines.get(item_code)
+            delta_verified = bool(
+                baseline
+                and current_prep >= baseline[1] + moved_qty
+                and current_finished <= baseline[2] - moved_qty
+            )
+            if not delta_verified:
+                reason = (
+                    "Fresh post-draft quantities did not safely reflect the "
+                    f"submitted movement of {moved_qty}"
+                )
+                mark_item_skipped(
+                    state,
+                    reason,
+                    (submitted_draft_names_by_item.get(item_code) or [None])[-1],
+                )
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Fresh Bin reread or submitted-draft delta verification failed",
+                    state,
+                    reason,
+                    (submitted_draft_names_by_item.get(item_code) or [None])[-1],
+                    moved_qty,
+                )
+
+    def add_source_transfer_rows(source_wh, request_key, valid_key, states):
+        correction_rows = []
+        correction_states = []
+        ready_states = []
+        failed_corrections = set()
+
+        for state in states:
+            requested_qty = state.get(request_key, 0)
+            if state.get("skipped") or requested_qty <= 0:
+                continue
+            item_code = state["item_code"]
+            try:
+                current_qty = _read_bin_actual_qty(item_code, source_wh)
+                bin_data = frappe.db.get_value(
+                    "Bin",
+                    {"item_code": item_code, "warehouse": source_wh},
+                    ["valuation_rate"],
+                    as_dict=True,
+                ) or {}
+                bin_rate = bin_data.get("valuation_rate", 0)
+                item_valuation_rate = (
+                    frappe.get_value("Item", item_code, "valuation_rate") or 0
+                )
+                valuation_rate = (
+                    item_valuation_rate if item_valuation_rate > 0 else 0.01
+                )
+            except Exception as exc:
+                mark_item_skipped(
+                    state,
+                    f"Fresh {source_wh} quantity/rate read failed: "
+                    + _concise_inventory_exception(exc),
+                )
+                continue
+
+            state["transfer_valuation_rate"] = valuation_rate
+            if bin_rate != valuation_rate:
+                diagnostics["valuation_attempted"] += 1
+                try:
+                    item_rows = _source_valuation_reconciliation_rows(
+                        item_code,
+                        source_wh,
+                        current_qty,
+                        valuation_rate,
+                        state["has_batch"],
+                        state["has_serial"],
+                    )
+                except Exception as exc:
+                    item_rows = []
+                    reason = "Valuation correction rows failed: " + _concise_inventory_exception(exc)
+                else:
+                    reason = "No valid batch or serial valuation rows could be constructed"
+                if not item_rows:
+                    diagnostics["valuation_failed"] += 1
+                    failed_corrections.add(item_code)
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "Source valuation correction failed",
+                        state,
+                        reason,
+                        quantity=requested_qty,
+                    )
+                    continue
+                correction_rows.extend(item_rows)
+                correction_states.append(state)
+            ready_states.append(state)
+
+        if correction_rows:
+            source_label = (
+                "Prep" if source_wh == prep_wh else "Finished Goods"
+            )
+            try:
+                source_sr = frappe.get_doc({
+                    "doctype": "Stock Reconciliation",
+                    "company": company,
+                    "posting_date": frappe.utils.today(),
+                    "purpose": "Stock Reconciliation",
+                    "expense_account": adjustment_account,
+                    "items": correction_rows,
+                })
+                source_sr.insert(ignore_permissions=True)
+                if DEBUG:
+                    frappe.db.commit()
+                    diagnostics["valuation_debug_drafts"] += len(correction_states)
+                    for state in correction_states:
+                        _record_inbound_flow_event(
+                            diagnostics,
+                            "DEBUG-only valuation correction draft",
+                            state,
+                            "Valuation correction was inserted as a draft and not submitted",
+                            source_sr.name,
+                        )
+                else:
+                    source_sr.submit()
+                    frappe.db.commit()
+                    diagnostics["valuation_successful"] += len(correction_states)
+                    for state in correction_states:
+                        _record_inbound_flow_event(
+                            diagnostics,
+                            "Source valuation correction submitted",
+                            state,
+                            "Valuation correction was submitted before transfer allocation",
+                            source_sr.name,
+                        )
+            except Exception as exc:
+                diagnostics["valuation_failed"] += len(correction_states)
+                reason = "Source valuation correction failed: " + _concise_inventory_exception(exc)
+                for state in correction_states:
+                    failed_corrections.add(state["item_code"])
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "Source valuation correction failed",
+                        state,
+                        reason,
+                        getattr(locals().get("source_sr"), "name", None),
+                        state.get(request_key, 0),
+                    )
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"{source_label} Stock Reconciliation Error",
+                )
+                raise
+
+        for state in ready_states:
+            item_code = state["item_code"]
+            if state.get("skipped") or item_code in failed_corrections:
+                continue
+            try:
+                current_qty = _read_bin_actual_qty(item_code, source_wh)
+            except Exception as exc:
+                mark_item_skipped(
+                    state,
+                    f"Fresh {source_wh} quantity reread after valuation handling failed: "
+                    + _concise_inventory_exception(exc),
+                )
+                continue
+            requested_qty = min(max(current_qty, 0), state.get(request_key, 0))
+            try:
+                rows, represented_qty = _valid_source_transfer_rows(
+                    item_code,
+                    source_wh,
+                    inbound_wh,
+                    requested_qty,
+                    state["transfer_valuation_rate"],
+                    state["has_batch"],
+                    state["has_serial"],
+                )
+            except Exception as exc:
+                rows, represented_qty = [], 0
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Transfer row construction failed",
+                    state,
+                    _concise_inventory_exception(exc),
+                    quantity=requested_qty,
+                )
+            state[valid_key] = represented_qty
+            state["planned_rows"].extend(rows)
+            if represented_qty < requested_qty:
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Batch or serial restrictions reduced transferable quantity",
+                    state,
+                    f"Requested {requested_qty}; valid rows represented {represented_qty}",
+                    quantity=requested_qty - represented_qty,
+                )
+
+    allocatable_states = []
+    for state in item_states.values():
+        if state.get("skipped"):
+            continue
+        diff = state["target_inbound_qty"] - state.get("fresh_inbound_qty", 0)
+        if diff <= 0:
+            continue
+        state["post_draft_shortage"] = diff
+        state["requested_prep_qty"] = min(
+            max(state.get("fresh_prep_qty", 0), 0), diff
+        )
+        allocatable_states.append(state)
+
+    add_source_transfer_rows(
+        prep_wh,
+        "requested_prep_qty",
+        "valid_prep_row_qty",
+        allocatable_states,
+    )
+
+    for state in allocatable_states:
+        if state.get("skipped"):
+            continue
+        remaining_diff = (
+            state["post_draft_shortage"] - state["valid_prep_row_qty"]
+        )
+        if state["valid_prep_row_qty"] and remaining_diff > 0:
+            _record_inbound_flow_event(
+                diagnostics,
+                "Prep supplied only part of the shortage",
+                state,
+                "Valid Prep rows did not cover the full post-draft shortage",
+                quantity=remaining_diff,
+            )
+        state["requested_finished_qty"] = min(
+            max(state.get("fresh_finished_goods_qty", 0), 0),
+            max(remaining_diff, 0),
+        )
+
+    add_source_transfer_rows(
+        FINISHED_GOODS_WAREHOUSE,
+        "requested_finished_qty",
+        "valid_finished_row_qty",
+        allocatable_states,
+    )
+
+    transfer_items = []
+    for state in allocatable_states:
+        if state.get("skipped"):
+            continue
+        transfer_items.extend(state["planned_rows"])
+        if state["valid_finished_row_qty"] > 0:
+            _record_inbound_flow_event(
+                diagnostics,
+                "Finished Goods supplied remaining Inbound shortage",
+                state,
+                "Finished Goods rows were added after valid Prep-row quantity was applied",
+                quantity=state["valid_finished_row_qty"],
+            )
+
+    prep_rows = [
+        row for row in transfer_items if row["s_warehouse"] == prep_wh
+    ]
+    finished_rows = [
+        row
+        for row in transfer_items
+        if row["s_warehouse"] == FINISHED_GOODS_WAREHOUSE
+    ]
+    diagnostics["prep_valid_row_count"] = len(prep_rows)
+    diagnostics["prep_valid_row_qty"] = sum(row["qty"] for row in prep_rows)
+    diagnostics["finished_valid_row_count"] = len(finished_rows)
+    diagnostics["finished_valid_row_qty"] = sum(
+        row["qty"] for row in finished_rows
+    )
+
+    # Submit the same existing-style run-level aggregate, now with explicit
+    # child-row warehouses for one or both sources.
+    if transfer_items:
+        diagnostics["active"] = True
+        sources = sorted({row["s_warehouse"] for row in transfer_items})
+        diagnostics["aggregated_sources"] = sources
+        diagnostics["aggregated_item_count"] = len({
+            row["item_code"] for row in transfer_items
+        })
+        diagnostics["aggregated_child_row_count"] = len(transfer_items)
+        if DEBUG: print(f"[DEBUG] Creating Stock Entry with {len(transfer_items)} items...")
+        se = None
+        inserted = False
+        try:
+            stock_entry_values = {
+                "doctype": "Stock Entry",
+                "company": company,
+                "stock_entry_type": "Material Transfer",
+                "to_warehouse": inbound_wh,
+                "posting_date": frappe.utils.today(),
+                "items": transfer_items,
+            }
+            if len(sources) == 1:
+                stock_entry_values["from_warehouse"] = sources[0]
+            se = frappe.get_doc(stock_entry_values)
+            se.insert(ignore_permissions=True)
+            inserted = True
+            diagnostics["aggregated_entry_name"] = se.name
+            diagnostics["aggregated_entry_status"] = "inserted as draft"
+            for state in allocatable_states:
+                if not state.get("planned_rows") or state.get("skipped"):
+                    continue
+                state["aggregated_entry_name"] = se.name
+                state["aggregated_outcome"] = "inserted as draft"
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Aggregated Stock Entry inserted as draft",
+                    state,
+                    "Valid source rows were included in the run-level document",
+                    se.name,
+                    state["valid_prep_row_qty"]
+                    + state["valid_finished_row_qty"],
+                )
             if DEBUG:
-                print(f"[DEBUG] DEBUG mode: leaving SE {se.name} as DRAFT (not submitted)")
                 frappe.db.commit()
+                diagnostics["aggregated_entry_status"] = "DEBUG draft; not submitted"
+                for state in allocatable_states:
+                    if not state.get("planned_rows") or state.get("skipped"):
+                        continue
+                    state["aggregated_outcome"] = "DEBUG draft; not submitted"
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "DEBUG-only aggregated transfer draft",
+                        state,
+                        "Transfer rows were planned but no quantity was submitted",
+                        se.name,
+                        state["valid_prep_row_qty"]
+                        + state["valid_finished_row_qty"],
+                    )
             else:
                 se.submit()
                 frappe.db.commit()
-                if DEBUG: print(f"[DEBUG] Submitted SE: {se.name}")
-        except NegativeStockError as e:
-            if DEBUG: print(f"[DEBUG] NegativeStockError during submit: {str(e)}")
-            # Safely delete draft
-            try:
-                se.reload()  # Reload to get current status
-                if se.docstatus == 0:
-                    se.delete()
-                elif se.docstatus == 1:
-                    se.cancel()
-                    se.delete()
-                frappe.db.commit()
-            except Exception as del_e:
-                if DEBUG: print(f"[DEBUG] Error during cleanup delete: {str(del_e)}")
-                frappe.log_error(frappe.get_traceback(), "Stock Entry Cleanup Error")
-            if DEBUG: print("[DEBUG] Deleted draft SE, falling back to reconciliation")
-            frappe.log_error(frappe.get_traceback(), "Stock Entry NegativeStockError")  # ADDED: Log specific error
-        except Exception as e:
-            if DEBUG: print(f"[DEBUG] Unexpected error during SE submit: {str(e)}")
-            # Safely delete
-            try:
-                se.reload()  # Reload to get current status
-                if se.docstatus == 0:
-                    se.delete()
-                elif se.docstatus == 1:
-                    se.cancel()
-                    se.delete()
-                frappe.db.commit()
-            except Exception as del_e:
-                if DEBUG: print(f"[DEBUG] Error during cleanup delete: {str(del_e)}")
-                frappe.log_error(frappe.get_traceback(), "Stock Entry Cleanup Error")
-            frappe.log_error(frappe.get_traceback(), "Stock Entry Submit Error")  # ADDED: Log with traceback
-            raise
+                diagnostics["aggregated_entry_status"] = "submitted"
+                diagnostics["prep_submitted_qty"] = diagnostics["prep_valid_row_qty"]
+                diagnostics["finished_submitted_qty"] = diagnostics["finished_valid_row_qty"]
+                for state in allocatable_states:
+                    if not state.get("planned_rows") or state.get("skipped"):
+                        continue
+                    state["submitted_prep_qty"] = state["valid_prep_row_qty"]
+                    state["submitted_finished_qty"] = state["valid_finished_row_qty"]
+                    state["aggregated_outcome"] = "submitted"
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "Aggregated Stock Entry submitted",
+                        state,
+                        "Run-level transfer submitted successfully",
+                        se.name,
+                        state["submitted_prep_qty"]
+                        + state["submitted_finished_qty"],
+                    )
+        except Exception as exc:
+            submit_traceback = frappe.get_traceback()
+            failure_reason = _concise_inventory_exception(exc)
+            diagnostics["aggregated_entry_status"] = (
+                "submission failed" if inserted else "insertion failed"
+            )
+            if se and getattr(se, "name", None):
+                diagnostics["aggregated_entry_name"] = se.name
+            for state in allocatable_states:
+                if not state.get("planned_rows") or state.get("skipped"):
+                    continue
+                state["aggregated_entry_name"] = diagnostics["aggregated_entry_name"]
+                state["aggregated_outcome"] = diagnostics["aggregated_entry_status"]
+                state["submitted_prep_qty"] = 0
+                state["submitted_finished_qty"] = 0
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Aggregated Stock Entry submission failed",
+                    state,
+                    failure_reason,
+                    getattr(se, "name", None),
+                    state["valid_prep_row_qty"]
+                    + state["valid_finished_row_qty"],
+                )
+            cleanup_succeeded = False
+            if inserted:
+                try:
+                    se.reload()
+                    if se.docstatus == 0:
+                        se.delete()
+                    elif se.docstatus == 1:
+                        se.cancel()
+                        se.delete()
+                    frappe.db.commit()
+                    cleanup_succeeded = True
+                    diagnostics["aggregated_entry_status"] += "; cleaned up"
+                except Exception as cleanup_exc:
+                    _record_inbound_flow_global_error(
+                        diagnostics,
+                        "Aggregated Stock Entry cleanup failed: "
+                        + _concise_inventory_exception(cleanup_exc),
+                    )
+                    frappe.log_error(
+                        frappe.get_traceback(), "Stock Entry Cleanup Error"
+                    )
+            if cleanup_succeeded:
+                for state in allocatable_states:
+                    if not state.get("planned_rows") or state.get("skipped"):
+                        continue
+                    state["aggregated_outcome"] = diagnostics["aggregated_entry_status"]
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "Aggregated Stock Entry cleaned up after failure",
+                        state,
+                        "Failed run-level transfer document was cleaned up",
+                        getattr(se, "name", None),
+                    )
+            if isinstance(exc, NegativeStockError):
+                frappe.log_error(
+                    submit_traceback, "Stock Entry NegativeStockError"
+                )
+            else:
+                frappe.log_error(submit_traceback, "Stock Entry Submit Error")
 
     # Second pass: collect reconciliations where qty doesn't match
     reconcile_items = []
-    for asin, target_qty in asin_inbound.items():
-        item_code = frappe.db.get_value("Item", {"custom_asin": asin, "disabled": 0}, "name")
-        if not item_code:
+    for state in item_states.values():
+        if state.get("skipped"):
             continue
-
-        # ADDED: Skip if not a stock item
-        if not frappe.get_value("Item", item_code, "is_stock_item"):
-            if DEBUG: print(f"[DEBUG] Skipping non-stock item: {item_code}")
+        item_code = state["item_code"]
+        target_qty = state["target_inbound_qty"]
+        try:
+            current_inbound = _read_bin_actual_qty(item_code, inbound_wh)
+        except Exception as exc:
+            mark_item_skipped(
+                state,
+                "Final fresh Inbound quantity read failed: "
+                + _concise_inventory_exception(exc),
+                diagnostics.get("aggregated_entry_name"),
+            )
             continue
-
-        current_inbound = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": inbound_wh}, "actual_qty") or 0
+        state["final_inbound_qty"] = current_inbound
         if current_inbound == target_qty:
             if DEBUG: print(f"[DEBUG] Inbound qty matches for {item_code}: {current_inbound} == {target_qty}")
             continue
@@ -1613,6 +2676,19 @@ def process_inbound_inventory(asin_inbound, settings):
         else:
             item_dict["valuation_rate"] = 0.01
         reconcile_items.append(item_dict)
+        remaining_shortage = max(target_qty - current_inbound, 0)
+        if remaining_shortage > 0:
+            state["reconciliation_qty"] = remaining_shortage
+            diagnostics["reconciliation_shortage_count"] += 1
+            diagnostics["reconciliation_shortage_qty"] += remaining_shortage
+            _record_inbound_flow_event(
+                diagnostics,
+                "Remaining shortage handed to Inbound Stock Reconciliation",
+                state,
+                "Fresh Inbound quantity remained below the protected target",
+                diagnostics.get("aggregated_entry_name"),
+                remaining_shortage,
+            )
 
     # Fetch Amazon items in inbound warehouse with positive qty not reported by Amazon, assume 0
     inbound_amazon_items = frappe.db.sql("""
@@ -1676,6 +2752,8 @@ def process_inbound_inventory(asin_inbound, settings):
 # Orchestrator
 # ──────────────────────────────────────────
 def process_fba_inventory():
+    temporary_log_inputs = None
+    inbound_flow_diagnostics = None
     try:  # ADDED: High-level wrap for entire function
         repo = AmazonRepository("q3opu7c5ac")
         settings = repo.amz_setting
@@ -1772,7 +2850,14 @@ def process_fba_inventory():
             today_source, yesterday_source, report_candidates, mode_by_asin
         )
         _log_degraded_asins(degradation_lines)
-        _log_temporary_consolidated_fallbacks_and_failures(
+        try:
+            inbound_flow_diagnostics = _new_inbound_flow_diagnostics(
+                final_inbound_by_asin, settings
+            )
+        except Exception:
+            # Temporary diagnostic initialization must not affect inventory.
+            inbound_flow_diagnostics = None
+        temporary_log_inputs = (
             today_source,
             yesterday_source,
             report_candidates,
@@ -1957,11 +3042,21 @@ def process_fba_inventory():
                 )
                 raise
 
-        process_inbound_inventory(final_inbound_by_asin, settings)
+        process_inbound_inventory(
+            final_inbound_by_asin,
+            settings,
+            inbound_flow_diagnostics,
+        )
 
     except Exception:
         frappe.log_error(frappe.get_traceback(), "FBA Inventory Process Error")
         raise
+    finally:
+        if temporary_log_inputs is not None:
+            _log_temporary_consolidated_fallbacks_and_failures(
+                *temporary_log_inputs,
+                inbound_flow_diagnostics=inbound_flow_diagnostics,
+            )
 
 # ──────────────────────────────────────────
 # Scheduler wrapper
