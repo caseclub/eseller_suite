@@ -1351,6 +1351,10 @@ class AmazonRepository:
 
         order_id = order.get("AmazonOrderId")
         order_date = format_date_time_to_ist(order.get("PurchaseDate"))
+        order_total_obj = _order_total(order)
+        has_authoritative_order_total = (
+            bool(order_total_obj) and order_total_obj.get("Amount") is not None
+        )
         amazon_order_amount = _order_total_amount(order)
         so_id = None
         so_docstatus = 0
@@ -1441,7 +1445,9 @@ class AmazonRepository:
         so.amazon_order_status = order.get("OrderStatus")
         so.fulfillment_channel = order.get("FulfillmentChannel")
         so.replaced_order_id = order.get("ReplacedOrderId") or ''
-        if amazon_order_amount:
+        # Preserve Amazon Orders API OrderTotal exactly, including legitimate zero-value
+        # replacements. Do not later replace it with an item-only subtotal.
+        if has_authoritative_order_total:
             so.amazon_order_amount = amazon_order_amount
         so.amazon_order_status = order.get("OrderStatus")
         so.customer = customer_name
@@ -1553,7 +1559,10 @@ class AmazonRepository:
                     "cancelled_item_qty": zero_item.get("actual_qty")
                 })
 
-        if total_order_value:
+        # get_order_items().total_order_value is intentionally item-level (ItemPrice +
+        # ItemTax) and excludes order-level components such as ShippingPrice. Use it only
+        # as a fallback when the Orders API did not provide OrderTotal at all.
+        if not has_authoritative_order_total and total_order_value:
             so.amazon_order_amount = total_order_value
 
         # Add replacement note if applicable
@@ -1722,6 +1731,19 @@ class AmazonRepository:
             
         elif not frappe.db.exists("Amazon Failed Sync Record", {"amazon_order_id":order_id}):
             remarks = 'Failed to create Sales Order for {0}. Sales Order grand Total = {1}'.format(order_id, so.grand_total)
+            if channel == "AFN":
+                summary = charges_and_fees.get("financial_event_summary") or {}
+                remarks += (
+                    f"; AFN net-negative diagnostics: currency={order_ccy}, "
+                    f"orders_api_total={amazon_order_amount:.2f}, "
+                    f"principal={_to_float(summary.get('principal_total')):.2f}, "
+                    f"buyer_charges={_to_float(summary.get('charge_total')):.2f}, "
+                    f"seller_fees={_to_float(summary.get('fee_total')):.2f}, "
+                    f"withheld_tax={_to_float(summary.get('withheld_tax_total')):.2f}, "
+                    f"service_fees={_to_float(summary.get('service_fee_total')):.2f}, "
+                    f"promotions={_to_float(summary.get('promotion_total')):.2f}"
+                )
+                print(f"[AMZ-AFN-NEGATIVE] {order_id}: {remarks}", flush=True)
             failed_sync_record = frappe.new_doc('Amazon Failed Sync Record')
             failed_sync_record.amazon_order_id = order_id
             failed_sync_record.remarks = remarks
