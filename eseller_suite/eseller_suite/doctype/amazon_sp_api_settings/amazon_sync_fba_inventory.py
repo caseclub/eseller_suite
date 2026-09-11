@@ -308,27 +308,49 @@ def _normalize_report_header(value):
 
 
 def _parse_manage_inventory_report(report_bytes):
-    """Return valid raw C/S/R/F snapshots plus per-ASIN parse failures."""
+    """Return valid raw snapshots, per-ASIN failures, and schema metadata."""
     text = report_bytes.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text), delimiter="\t")
     if not reader.fieldnames:
         raise ValueError("MYI ALL report has no header row")
 
     reader.fieldnames = [_normalize_report_header(name) for name in reader.fieldnames]
-    required_headers = {
+    report_headers = set(reader.fieldnames)
+    fundamental_headers = {
         "asin",
         "condition",
-        "afn-warehouse-quantity",
         "afn-inbound-shipped-quantity",
         "afn-inbound-receiving-quantity",
-        "afn-researching-quantity",
-        "afn-fc-transfer-quantity",
     }
-    missing_headers = sorted(required_headers - set(reader.fieldnames))
+    fc_transfer_header = "afn-fc-transfer-quantity"
+    partial_report = fc_transfer_header not in report_headers
+    core_headers = (
+        {
+            "afn-fulfillable-quantity",
+            "afn-unsellable-quantity",
+            "afn-reserved-quantity",
+        }
+        if partial_report
+        else {
+            "afn-warehouse-quantity",
+            "afn-researching-quantity",
+            fc_transfer_header,
+        }
+    )
+    missing_headers = sorted(
+        (fundamental_headers | core_headers) - report_headers
+    )
     if missing_headers:
         raise ValueError(
             "MYI ALL report is missing required columns: " + ", ".join(missing_headers)
         )
+
+    schema_metadata = {
+        "partial": partial_report,
+        "missing_headers": [fc_transfer_header] if partial_report else [],
+        "unavailable_components": ["F"] if partial_report else [],
+        "parsed_row_count": 0,
+    }
 
     raw_by_asin = {}
     invalid_asins = {}
@@ -354,9 +376,6 @@ def _parse_manage_inventory_report(report_bytes):
 
         try:
             quantities = {
-                "warehouse": _parse_required_nonnegative_quantity(
-                    row.get("afn-warehouse-quantity"), "afn-warehouse-quantity", asin
-                ),
                 "S": _parse_required_nonnegative_quantity(
                     row.get("afn-inbound-shipped-quantity"),
                     "afn-inbound-shipped-quantity",
@@ -367,24 +386,48 @@ def _parse_manage_inventory_report(report_bytes):
                     "afn-inbound-receiving-quantity",
                     asin,
                 ),
-                "researching": _parse_required_nonnegative_quantity(
-                    row.get("afn-researching-quantity"),
-                    "afn-researching-quantity",
-                    asin,
-                ),
-                "F": _parse_required_nonnegative_quantity(
-                    row.get("afn-fc-transfer-quantity"),
-                    "afn-fc-transfer-quantity",
-                    asin,
-                ),
             }
+            if partial_report:
+                quantities["C"] = sum(
+                    _parse_required_nonnegative_quantity(
+                        row.get(field_name), field_name, asin
+                    )
+                    for field_name in (
+                        "afn-fulfillable-quantity",
+                        "afn-unsellable-quantity",
+                        "afn-reserved-quantity",
+                    )
+                )
+            else:
+                quantities.update(
+                    {
+                        "warehouse": _parse_required_nonnegative_quantity(
+                            row.get("afn-warehouse-quantity"),
+                            "afn-warehouse-quantity",
+                            asin,
+                        ),
+                        "researching": _parse_required_nonnegative_quantity(
+                            row.get("afn-researching-quantity"),
+                            "afn-researching-quantity",
+                            asin,
+                        ),
+                        "F": _parse_required_nonnegative_quantity(
+                            row.get(fc_transfer_header),
+                            fc_transfer_header,
+                            asin,
+                        ),
+                    }
+                )
         except ValueError as exc:
             invalid_asins[asin] = str(exc)
             raw_by_asin.pop(asin, None)
             continue
 
         aggregate = raw_by_asin.setdefault(
-            asin, {"warehouse": 0, "S": 0, "R": 0, "researching": 0, "F": 0}
+            asin,
+            {"C": 0, "S": 0, "R": 0, "F": None}
+            if partial_report
+            else {"warehouse": 0, "S": 0, "R": 0, "researching": 0, "F": 0},
         )
         for key, value in quantities.items():
             aggregate[key] += value
@@ -392,6 +435,14 @@ def _parse_manage_inventory_report(report_bytes):
 
     snapshots = {}
     for asin, aggregate in raw_by_asin.items():
+        if partial_report:
+            snapshots[asin] = {
+                "C": aggregate["C"],
+                "S": aggregate["S"],
+                "R": aggregate["R"],
+                "F": None,
+            }
+            continue
         # A negative derived Core is intentionally floored to zero. Because F is
         # added back later, this can only bias the protected result high, which
         # is the desired conservative failure direction.
@@ -406,12 +457,14 @@ def _parse_manage_inventory_report(report_bytes):
             "F": aggregate["F"],
         }
 
+    schema_metadata["parsed_row_count"] = parsed_rows
     if DEBUG:
         print(
             f"[DEBUG] Parsed {parsed_rows} MYI ALL New-condition rows into "
-            f"{len(snapshots)} valid ASIN snapshots; invalid ASINs={len(invalid_asins)}"
+            f"{len(snapshots)} valid ASIN snapshots; invalid ASINs={len(invalid_asins)}; "
+            f"schema={'partial C/S/R' if partial_report else 'complete C/S/R/F'}"
         )
-    return snapshots, invalid_asins
+    return snapshots, invalid_asins, schema_metadata
 
 
 def _download_manage_inventory_report(report, settings):
@@ -452,6 +505,10 @@ def _empty_report_source(label, expected_date):
         "report": None,
         "snapshots": {},
         "invalid_asins": {},
+        "partial": False,
+        "missing_headers": [],
+        "unavailable_components": [],
+        "parsed_row_count": 0,
         "error": None,
     }
 
@@ -481,9 +538,14 @@ def _load_daily_manage_inventory_sources(settings):
             source["error"] = selection_error
             continue
         try:
-            snapshots, invalid_asins = _download_manage_inventory_report(selected, settings)
+            (
+                snapshots,
+                invalid_asins,
+                schema_metadata,
+            ) = _download_manage_inventory_report(selected, settings)
             source["snapshots"] = snapshots
             source["invalid_asins"] = invalid_asins
+            source.update(schema_metadata)
             source["available"] = True
         except Exception as exc:
             source["error"] = (
@@ -732,6 +794,74 @@ def _protect_snapshot_transition(old_snapshot, new_snapshot):
     }
 
 
+def _snapshot_is_complete(snapshot):
+    return snapshot is not None and snapshot.get("F") is not None
+
+
+def _protect_partial_snapshot_transition(partial_snapshot, current_snapshot):
+    """Conservatively overlay known partial C/S/R onto a complete current snapshot."""
+    if not _snapshot_is_complete(current_snapshot):
+        raise ValueError("partial MYI protection requires a complete current snapshot")
+    if partial_snapshot is None or partial_snapshot.get("F") is not None:
+        raise ValueError("partial MYI protection requires an unknown F component")
+
+    shipped_drop = max(partial_snapshot["S"] - current_snapshot["S"], 0)
+    receiving_gain = max(current_snapshot["R"] - partial_snapshot["R"], 0)
+    shipped_to_receiving = min(shipped_drop, receiving_gain)
+    eligible = {
+        "S": shipped_drop - shipped_to_receiving,
+        "R": max(partial_snapshot["R"] - current_snapshot["R"], 0),
+        "F": 0,
+    }
+    core_gain = max(current_snapshot["C"] - partial_snapshot["C"], 0)
+    matched = _allocate_shared_warehouse_gain(eligible, core_gain)
+    carry = {
+        key: eligible[key] - matched[key]
+        for key in ("S", "R")
+    }
+
+    return (
+        current_snapshot["C"] + current_snapshot["F"],
+        current_snapshot["S"]
+        + current_snapshot["R"]
+        + carry["S"]
+        + carry["R"],
+        {
+            "shipped_to_receiving": shipped_to_receiving,
+            "core_gain": core_gain,
+            "eligible": eligible,
+            "matched": matched,
+            "carry": carry,
+        },
+    )
+
+
+def _is_expected_live_only_asin(
+    asin,
+    today_source,
+    yesterday_source,
+    live_snapshots,
+    live_invalid_asins,
+    live_global_error,
+):
+    """Return whether report absence is routine coverage for a valid LIVE ASIN."""
+    if (
+        live_global_error
+        or asin in live_invalid_asins
+        or not _snapshot_is_complete(live_snapshots.get(asin))
+    ):
+        return False
+    for source in (today_source, yesterday_source):
+        if (
+            not source["available"]
+            or source.get("error")
+            or asin in source["invalid_asins"]
+            or asin in source["snapshots"]
+        ):
+            return False
+    return True
+
+
 def _source_asin_reason(source, asin):
     report = source.get("report") or {}
     identity = (
@@ -862,19 +992,25 @@ def _build_protected_inventory_targets(
             else None
         )
         live_snapshot = live_snapshots.get(asin) if not live_global_error else None
+        today_complete_snapshot = (
+            today_snapshot if _snapshot_is_complete(today_snapshot) else None
+        )
+        yesterday_complete_snapshot = (
+            yesterday_snapshot if _snapshot_is_complete(yesterday_snapshot) else None
+        )
         current_main = int(current_main_by_asin.get(asin, 0) or 0)
         current_inbound = int(current_inbound_by_asin.get(asin, 0) or 0)
 
         if (
-            yesterday_snapshot is not None
-            and today_snapshot is not None
+            yesterday_complete_snapshot is not None
+            and today_complete_snapshot is not None
             and live_snapshot is not None
         ):
             mode = "YESTERDAY -> PROTECTED TODAY -> LIVE API"
             _, _, report_diagnostics = _protect_snapshot_transition(
-                yesterday_snapshot, today_snapshot
+                yesterday_complete_snapshot, today_complete_snapshot
             )
-            protected_today = dict(today_snapshot)
+            protected_today = dict(today_complete_snapshot)
             for key in ("S", "R", "F"):
                 protected_today[key] += report_diagnostics["carry"][key]
             main_target, inbound_target, diagnostics = _protect_snapshot_transition(
@@ -893,10 +1029,10 @@ def _build_protected_inventory_targets(
                     f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
                 )
 
-        elif today_snapshot is not None and live_snapshot is not None:
+        elif today_complete_snapshot is not None and live_snapshot is not None:
             mode = "TODAY REPORT -> LIVE API"
             main_target, inbound_target, diagnostics = _protect_snapshot_transition(
-                today_snapshot, live_snapshot
+                today_complete_snapshot, live_snapshot
             )
             if DEBUG:
                 print(
@@ -910,10 +1046,10 @@ def _build_protected_inventory_targets(
                     f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
                 )
 
-        elif yesterday_snapshot is not None and live_snapshot is not None:
+        elif yesterday_complete_snapshot is not None and live_snapshot is not None:
             mode = "YESTERDAY REPORT -> LIVE API"
             main_target, inbound_target, diagnostics = _protect_snapshot_transition(
-                yesterday_snapshot, live_snapshot
+                yesterday_complete_snapshot, live_snapshot
             )
             if DEBUG:
                 print(
@@ -927,10 +1063,13 @@ def _build_protected_inventory_targets(
                     f"carry={diagnostics['carry']} main={main_target} inbound={inbound_target}"
                 )
 
-        elif today_snapshot is not None and yesterday_snapshot is not None:
+        elif (
+            today_complete_snapshot is not None
+            and yesterday_complete_snapshot is not None
+        ):
             mode = "NORMAL TWO-REPORT"
             main_target, inbound_target, diagnostics = _protect_snapshot_transition(
-                yesterday_snapshot, today_snapshot
+                yesterday_complete_snapshot, today_complete_snapshot
             )
             old_source = (
                 f"YESTERDAY report {yesterday_source['report'].get('reportId')}"
@@ -951,8 +1090,8 @@ def _build_protected_inventory_targets(
             mode = "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE"
             main_target, inbound_target, diagnostics = _mode4_targets(
                 asin,
-                today_snapshot,
-                yesterday_snapshot,
+                today_complete_snapshot,
+                yesterday_complete_snapshot,
                 live_snapshot,
                 current_main,
                 current_inbound,
@@ -969,42 +1108,93 @@ def _build_protected_inventory_targets(
                     f"main={main_target} inbound={inbound_target}"
                 )
 
+        base_mode = mode
+        partial_overlays = []
+        if _snapshot_is_complete(live_snapshot):
+            for label, partial_snapshot in (
+                ("YESTERDAY", yesterday_snapshot),
+                ("TODAY", today_snapshot),
+            ):
+                if partial_snapshot is None or partial_snapshot.get("F") is not None:
+                    continue
+                (
+                    partial_main,
+                    partial_inbound,
+                    partial_diagnostics,
+                ) = _protect_partial_snapshot_transition(
+                    partial_snapshot, live_snapshot
+                )
+                main_target = max(main_target, partial_main)
+                inbound_target = max(inbound_target, partial_inbound)
+                partial_overlays.append(label)
+                if DEBUG:
+                    print(
+                        f"[DEBUG] {asin} partial_overlay={label} "
+                        f"partial={partial_snapshot} live={live_snapshot} "
+                        f"S->R={partial_diagnostics['shipped_to_receiving']} "
+                        f"core_gain={partial_diagnostics['core_gain']} "
+                        f"eligible={partial_diagnostics['eligible']} "
+                        f"matched={partial_diagnostics['matched']} "
+                        f"carry={partial_diagnostics['carry']} "
+                        f"base_mode={base_mode} main={main_target} "
+                        f"inbound={inbound_target}"
+                    )
+
+        if partial_overlays == ["YESTERDAY", "TODAY"]:
+            mode = "PARTIAL YESTERDAY + PARTIAL TODAY (C/S/R) -> LIVE API"
+        elif partial_overlays == ["YESTERDAY"]:
+            mode = (
+                "PARTIAL YESTERDAY (C/S/R) -> TODAY -> LIVE API"
+                if today_complete_snapshot is not None
+                else "PARTIAL YESTERDAY (C/S/R) -> LIVE API"
+            )
+        elif partial_overlays == ["TODAY"]:
+            mode = (
+                "YESTERDAY -> PARTIAL TODAY (C/S/R) -> LIVE API"
+                if yesterday_complete_snapshot is not None
+                else "PARTIAL TODAY (C/S/R) -> LIVE API"
+            )
+
         main_targets[asin] = max(int(main_target), 0)
         inbound_targets[asin] = max(int(inbound_target), 0)
         mode_by_asin[asin] = mode
 
-        if mode == "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE":
-            # If both otherwise-valid daily reports simply omit this ASIN, that
-            # absence is routine and should not create an Error Log entry. Mode 4
-            # protection still applies; only the per-ASIN reporting is suppressed.
-            routine_both_report_absence = (
-                today_source["available"]
-                and yesterday_source["available"]
-                and asin not in today_source["snapshots"]
-                and asin not in yesterday_source["snapshots"]
-                and asin not in today_source["invalid_asins"]
-                and asin not in yesterday_source["invalid_asins"]
+        expected_live_only = _is_expected_live_only_asin(
+            asin,
+            today_source,
+            yesterday_source,
+            live_snapshots,
+            live_invalid_asins,
+            live_global_error,
+        )
+        reasons = []
+        for source in (today_source, yesterday_source):
+            if asin in source["invalid_asins"]:
+                reasons.append(_source_asin_reason(source, asin))
+        if asin in live_invalid_asins:
+            reasons.append(live_invalid_asins[asin])
+
+        if (
+            base_mode == "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE"
+            and not expected_live_only
+            and live_snapshot is None
+            and not live_global_error
+        ):
+            for source in (today_source, yesterday_source):
+                if (
+                    source["available"]
+                    and asin not in source["snapshots"]
+                    and asin not in source["invalid_asins"]
+                ):
+                    reasons.append(_source_asin_reason(source, asin))
+            if asin not in live_snapshots and asin not in live_invalid_asins:
+                reasons.append("ASIN ABSENT from LIVE API")
+
+        reasons = [reason for reason in reasons if reason]
+        if reasons:
+            degradation_lines.append(
+                f"ASIN {asin}: mode={mode}; " + "; ".join(reasons)
             )
-            if not routine_both_report_absence:
-                today_reason = _source_asin_reason(today_source, asin)
-                yesterday_reason = _source_asin_reason(yesterday_source, asin)
-                if live_global_error:
-                    live_reason = live_global_error
-                elif asin in live_invalid_asins:
-                    live_reason = live_invalid_asins[asin]
-                elif asin not in live_snapshots:
-                    live_reason = "ASIN ABSENT from LIVE API"
-                else:
-                    live_reason = None
-                reasons = [
-                    reason
-                    for reason in (today_reason, yesterday_reason, live_reason)
-                    if reason
-                ]
-                degradation_lines.append(
-                    f"ASIN {asin}: mode={mode}; "
-                    + "; ".join(reasons or ["fallback selected"])
-                )
 
     return main_targets, inbound_targets, mode_by_asin, degradation_lines
 
@@ -1012,34 +1202,76 @@ def _build_protected_inventory_targets(
 def _log_degraded_asins(lines):
     if not lines:
         return
-    chunk_size = 40
-    for index in range(0, len(lines), chunk_size):
-        chunk = lines[index:index + chunk_size]
-        frappe.log_error(
-            "\n".join(chunk),
-            "FBA MYI Per-ASIN Degraded Protection",
+
+    grouped_counts = defaultdict(int)
+    for line in lines:
+        mode_match = re.search(r"\bmode=([^;]+)", line)
+        mode = mode_match.group(1) if mode_match else "<unknown mode>"
+        categories = []
+        for label in ("TODAY", "YESTERDAY", "LIVE API"):
+            if f"ABSENT from {label}" in line:
+                categories.append(f"absent from {label}")
+        if any(
+            marker in line
+            for marker in (": missing ", ": blank ", ": malformed ", ": invalid ")
+        ):
+            categories.append("invalid or malformed source quantity")
+        grouped_counts[(mode, tuple(categories or ["other ASIN-specific reason"]))] += 1
+
+    representative_lines = lines[:40]
+    log_lines = [
+        f"Total affected ASINs: {len(lines)}",
+        "Grouped reason/mode counts:",
+    ]
+    for (mode, categories), count in sorted(grouped_counts.items()):
+        log_lines.append(
+            f"- {mode} | {', '.join(categories)}: {count}"
         )
+    log_lines.extend(["", "Representative ASIN lines (maximum 40):"])
+    log_lines.extend(representative_lines)
+    omitted_count = len(lines) - len(representative_lines)
+    if omitted_count:
+        log_lines.append(f"{omitted_count} additional ASINs omitted")
+
+    frappe.log_error(
+        "\n".join(log_lines),
+        "FBA MYI Per-ASIN Degraded Protection",
+    )
 
 
 def _log_daily_report_errors(today_source, yesterday_source, reports, mode_by_asin):
-    failed = [
+    affected_sources = [
         source
         for source in (today_source, yesterday_source)
-        if not source["available"]
+        if not source["available"] or source.get("partial")
     ]
-    if not failed:
+    if not affected_sources:
         return
 
     mode_counts = defaultdict(int)
     for mode in mode_by_asin.values():
         mode_counts[mode] += 1
-    failed_text = "\n".join(
-        f"{source['label']} expected {source['expected_date']}: "
-        f"{source['error'] or 'unavailable'}"
-        for source in failed
-    )
+    issue_lines = []
+    for source in affected_sources:
+        if source.get("partial"):
+            report = source.get("report") or {}
+            issue_lines.append(
+                f"{source['label']} expected {source['expected_date']}: "
+                f"report {report.get('reportId', '<no-id>')}"
+                f"@{report.get('createdTime', '<no-time>')} parsed partially; "
+                f"missing headers={source.get('missing_headers') or []}; "
+                f"unavailable components={source.get('unavailable_components') or []}; "
+                f"partial valid ASIN snapshots={len(source['snapshots'])}; "
+                f"invalid ASINs={len(source['invalid_asins'])}"
+            )
+        else:
+            issue_lines.append(
+                f"{source['label']} expected {source['expected_date']}: "
+                f"{source['error'] or 'unavailable'}"
+            )
+    issue_text = "\n".join(issue_lines)
     frappe.log_error(
-        f"{failed_text}\n"
+        f"{issue_text}\n"
         f"Discovered candidates: {_report_candidate_summary(reports)}\n"
         f"Per-ASIN operating modes: {dict(mode_counts)}",
         "FBA MYI Daily Report Protection Error",
@@ -1183,6 +1415,11 @@ def _log_temporary_consolidated_fallbacks_and_failures(
             "YESTERDAY REPORT -> LIVE API",
             "NORMAL TWO-REPORT",
             "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE",
+            "YESTERDAY -> PARTIAL TODAY (C/S/R) -> LIVE API",
+            "PARTIAL YESTERDAY (C/S/R) -> TODAY -> LIVE API",
+            "PARTIAL YESTERDAY (C/S/R) -> LIVE API",
+            "PARTIAL TODAY (C/S/R) -> LIVE API",
+            "PARTIAL YESTERDAY + PARTIAL TODAY (C/S/R) -> LIVE API",
         }
 
         relevant_asins = sorted(
@@ -1196,6 +1433,19 @@ def _log_temporary_consolidated_fallbacks_and_failures(
             | set(current_main_by_asin)
             | set(current_inbound_by_asin)
         )
+        expected_live_only_asins = [
+            asin
+            for asin in relevant_asins
+            if _is_expected_live_only_asin(
+                asin,
+                today_source,
+                yesterday_source,
+                live_snapshots,
+                live_invalid_asins,
+                live_global_error,
+            )
+        ]
+        expected_live_only_set = set(expected_live_only_asins)
 
         def report_reason_and_category(source, asin):
             reason = _source_asin_reason(source, asin)
@@ -1227,8 +1477,10 @@ def _log_temporary_consolidated_fallbacks_and_failures(
         has_global_source_failure = bool(
             not today_source["available"]
             or today_source.get("error")
+            or today_source.get("partial")
             or not yesterday_source["available"]
             or yesterday_source.get("error")
+            or yesterday_source.get("partial")
             or live_global_error
         )
         has_invalid_asin = bool(
@@ -1245,6 +1497,8 @@ def _log_temporary_consolidated_fallbacks_and_failures(
         )
         has_absent_asin = False
         for asin in relevant_asins:
+            if asin in expected_live_only_set:
+                continue
             today_reason, today_category = report_reason_and_category(
                 today_source, asin
             )
@@ -1265,6 +1519,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
             or has_invalid_asin
             or has_absent_asin
             or has_non_normal_mode
+            or expected_live_only_asins
             or has_inbound_flow_activity
         ):
             return
@@ -1273,22 +1528,48 @@ def _log_temporary_consolidated_fallbacks_and_failures(
         for mode in mode_by_asin.values():
             mode_counts[mode] += 1
         all_modes = sorted(known_modes | set(mode_counts))
-        non_normal_count = sum(
-            count for mode, count in mode_counts.items() if mode != normal_mode
+        genuine_non_normal_count = sum(
+            1
+            for asin, mode in mode_by_asin.items()
+            if mode != normal_mode and asin not in expected_live_only_set
         )
 
         def append_report_source_summary(lines, source):
             report = source.get("report") or {}
             label = source["label"]
+            schema_status = (
+                "partial"
+                if source.get("partial")
+                else "complete"
+                if source["available"]
+                else "unavailable"
+            )
+            full_snapshot_count = (
+                len(source["snapshots"])
+                if source["available"] and not source.get("partial")
+                else 0
+            )
+            partial_snapshot_count = (
+                len(source["snapshots"])
+                if source.get("partial")
+                else 0
+            )
             lines.extend(
                 [
                     f"{label} expected date: {source['expected_date']}",
                     f"{label} availability: {bool(source['available'])}",
+                    f"{label} schema status: {schema_status}",
                     f"{label} selected report ID: {report.get('reportId', '<none>')}",
                     f"{label} createdTime: {report.get('createdTime', '<none>')}",
                     f"{label} processingStatus: {report.get('processingStatus', '<none>')}",
                     f"{label} has reportDocumentId: {bool(report.get('reportDocumentId'))}",
                     f"{label} parsed snapshot count: {len(source['snapshots'])}",
+                    f"{label} full snapshot count: {full_snapshot_count}",
+                    f"{label} partial snapshot count: {partial_snapshot_count}",
+                    f"{label} missing headers: "
+                    f"{source.get('missing_headers') or '<none>'}",
+                    f"{label} unavailable components: "
+                    f"{source.get('unavailable_components') or '<none>'}",
                     f"{label} invalid-ASIN count: {len(source['invalid_asins'])}",
                     f"{label} source error: {source.get('error') or '<none>'}",
                 ]
@@ -1333,11 +1614,19 @@ def _log_temporary_consolidated_fallbacks_and_failures(
 
         lines.extend(["", "Complete per-ASIN operating-mode counts:"])
         lines.extend(f"- {mode}: {mode_counts.get(mode, 0)}" for mode in all_modes)
+        expected_examples = expected_live_only_asins[:2]
+        expected_examples_text = ", ".join(expected_examples) or "<none>"
         lines.extend(
             [
-                f"Total ASINs using any non-normal mode: {non_normal_count}",
+                f"Total ASINs using any genuine non-normal fallback/failure mode: "
+                f"{genuine_non_normal_count}",
+                f"Expected LIVE-only ASIN coverage: "
+                f"{len(expected_live_only_asins)} ASINs absent from both usable "
+                f"reports but valid in LIVE; representative examples: "
+                f"{expected_examples_text}",
                 "",
                 "GROUPED NON-NORMAL FALLBACKS/FAILURES",
+                "Expected LIVE-only coverage is excluded from these groups and totals.",
                 "Group totals are complete; representative examples alone are truncated.",
             ]
         )
@@ -1345,6 +1634,8 @@ def _log_temporary_consolidated_fallbacks_and_failures(
         grouped_asins = defaultdict(list)
         reason_details = {}
         for asin in relevant_asins:
+            if asin in expected_live_only_set:
+                continue
             mode = mode_by_asin.get(asin, "<missing operating mode>")
             if mode == normal_mode:
                 continue
