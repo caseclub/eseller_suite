@@ -97,6 +97,16 @@ def _sleep_with_db_check(seconds: float) -> None:
 # ──────────────────────────────────────────
 # 1. — Helpers
 # ──────────────────────────────────────────
+# Amazon's displayable customer order id is 19 characters: 3 digits-7 digits-7 digits.
+# Settlement reports can also populate the order-id column with opaque FBA/fee transaction
+# identifiers. Those values are not customer orders and must not trigger order-linked warnings.
+_AMAZON_ORDER_ID_RE = re.compile(r"^\d{3}-\d{7}-\d{7}$")
+
+
+def _is_canonical_amazon_order_id(value) -> bool:
+    return bool(_AMAZON_ORDER_ID_RE.fullmatch(str(value or "").strip()))
+
+
 def get_currency_accounts_map(settings):
     return {
         "USD": {
@@ -1404,16 +1414,25 @@ def build_je(
     }
    
     # ──────────────────────────────────────────────
-    # Calculate reimbursements: Sum positive reimbursement amounts
+    # Classify reimbursements once and retain the row ownership for the later
+    # residual-risk audit. Preserve the report sign so reversals remain valid.
     # ──────────────────────────────────────────────
-    reimb_native = sum(
-        float(r["amount"])
-        for r in rows
-        if (desc := (r.get("amount-description") or "").strip().upper()) in REIMBURSEMENT_WHITE_LIST
-        or "REIMBURSEMENT" in desc
-        or "REIMBURSEMENT" in (r.get("amount-type") or "").strip().upper()
-        and float(r["amount"]) > 0
-    )
+    def _is_reimbursement_row(row: dict) -> bool:
+        desc = (row.get("amount-description") or "").strip().upper()
+        amount_type = (row.get("amount-type") or "").strip().upper()
+        return (
+            desc in REIMBURSEMENT_WHITE_LIST
+            or "REIMBURSEMENT" in desc
+            or "REIMBURSEMENT" in amount_type
+        )
+
+    reimbursement_row_ids = set()
+    reimb_native = 0.0
+    for r in rows:
+        if _is_reimbursement_row(r):
+            reimbursement_row_ids.add(id(r))
+            reimb_native += float(r["amount"])
+
     # ───────────────────────────────────────────────
     # Define fee account mapping for special fees
     # ───────────────────────────────────────────────
@@ -1427,20 +1446,37 @@ def build_je(
         "DISPOSALCOMPLETE": repo.amz_setting.custom_amazon_disposal_service_fee_account,
         "LIQUIDATIONSBROKERAGEFEE": repo.amz_setting.custom_amazon_liquidation_brokerage_fee_account
     }
-       
+
     # ──────────────────────────────────────────────
-    # Calculate special fees: Sum negative non-order fees into buckets
+    # Calculate mapped special fees.
+    #
+    # Amazon sometimes puts an opaque FBA/fee transaction token in the order-id
+    # column. A non-empty value alone does not make the row order-linked. Only a
+    # canonical Amazon customer order id is protected from settlement-side fee
+    # classification and left for the residual-risk audit below.
+    #
+    # Reimbursement ownership takes precedence over the fee map so an overlapping
+    # description (for example COMPENSATED_CLAWBACK) cannot be counted twice.
     # ──────────────────────────────────────────────
     special_fee_native = defaultdict(float)
+    special_fee_row_ids = set()
     for r in rows:
         amt = float(r["amount"])
-        if amt >= 0: # fees are negative
+        if amt >= 0:  # fees are negative
             continue
-        if (r.get("order-id") or "").strip(): # skip order-level rows
+        if id(r) in reimbursement_row_ids:
+            continue
+        t_type = (r.get("transaction-type") or "").strip().lower()
+        if t_type in SALES_TYPES.union(REFUND_TYPES):
+            continue
+        if _is_canonical_amazon_order_id(r.get("order-id")):
+            # Genuine customer-order-linked non-order rows are intentionally not
+            # guessed into a fee account. The audit below will surface them.
             continue
         desc = (r.get("amount-description") or "").strip().upper()
         if desc in FEE_ACCOUNT_MAP:
-            special_fee_native[desc] += abs(amt) # store as positive
+            special_fee_native[desc] += abs(amt)  # store as positive
+            special_fee_row_ids.add(id(r))
 
     if first_pass:
         rate = fx_rate(settlement_ccy, post_dt)
@@ -1632,18 +1668,23 @@ def build_je(
                 "user_remark": desc.title(),
             })
         # ──────────────────────────────────────────────
-        # 5) Add miscellaneous fees line if significant (unchanged)
+        # 5) Add miscellaneous fees line if significant
         # ──────────────────────────────────────────────
         if abs(fees_usd) >= 0.01:
-            # The residual is a balancing bucket, not a classification. Any settlement row that
-            # carries an order-id but is NOT an order/refund row (e.g. an order-linked shipping
-            # label purchase) is invisible to order_net_native and lands here silently, which is
-            # exactly how a fee already owned upstream gets booked a second time. Surface it.
+            # The residual is a balancing bucket. Alert only when a row is BOTH:
+            #   1) linked to a genuine Amazon customer order id, and
+            #   2) still unowned by an explicit settlement classifier.
+            #
+            # This deliberately ignores opaque FBA/fee transaction identifiers in
+            # the order-id column and rows already classified as reimbursements or
+            # mapped special fees. Those cases are not unclassified order activity.
             unclassified_order_rows = [
                 r for r in rows
-                if (r.get("order-id") or "").strip()
+                if _is_canonical_amazon_order_id(r.get("order-id"))
                 and (r.get("transaction-type") or "").strip().lower()
                 not in SALES_TYPES.union(REFUND_TYPES)
+                and id(r) not in reimbursement_row_ids
+                and id(r) not in special_fee_row_ids
                 and abs(float(r["amount"])) >= 0.01
             ]
             if unclassified_order_rows:
@@ -1657,9 +1698,10 @@ def build_je(
                     "Amazon Settlement Unclassified Order-Linked Rows",
                     f"Settlement {rpt_id}: residual {fees_usd:.2f} will be booked to the generic "
                     f"miscellaneous fulfillment fees account while "
-                    f"{len(unclassified_order_rows)} order-linked non-order row(s) exist. If any of "
-                    f"these is already owned upstream (SO/SI or the separate MFN postage JE), this "
-                    f"residual double-books it. Sample: {sample}",
+                    f"{len(unclassified_order_rows)} genuine Amazon order-linked row(s) remain "
+                    f"unclassified after order/refund, reimbursement, and mapped-fee handling. "
+                    f"Review these for possible upstream ownership (SO/SI or separate MFN postage JE). "
+                    f"Sample: {sample}",
                 )
             line = {
                 "account": repo.amz_setting.custom_amazon_miscellaneous_fulfillment_fees_account,
