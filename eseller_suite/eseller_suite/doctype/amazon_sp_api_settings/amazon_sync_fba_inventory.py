@@ -1317,6 +1317,8 @@ def _new_inbound_flow_diagnostics(asin_inbound, settings):
         "valuation_successful": 0,
         "valuation_failed": 0,
         "valuation_debug_drafts": 0,
+        "trigger_reasons": {},
+        "inventory_documents": {},
         "global_errors": [],
         "events": [],
         "items": {},
@@ -1325,6 +1327,114 @@ def _new_inbound_flow_diagnostics(asin_inbound, settings):
 
 def _concise_inventory_exception(exc):
     return f"{type(exc).__name__}: {str(exc).strip() or '<no message>'}"
+
+
+def _record_inventory_trigger(diagnostics, code, summary, identifier=None):
+    """Record one deterministic, deduplicated consolidated-log trigger."""
+    if diagnostics is None:
+        return
+    try:
+        triggers = diagnostics.setdefault("trigger_reasons", {})
+        trigger = triggers.setdefault(
+            code,
+            {"summary": summary, "count": 0, "identifiers": []},
+        )
+        if identifier is None:
+            trigger["count"] += 1
+            return
+        identifier = str(identifier)
+        if identifier not in trigger["identifiers"]:
+            trigger["identifiers"].append(identifier)
+            trigger["count"] += 1
+    except Exception:
+        # Diagnostics must never affect inventory processing.
+        return
+
+
+def _upsert_inventory_document(
+    diagnostics,
+    doctype,
+    document_id,
+    purpose,
+    origin,
+    status,
+    source_warehouses=None,
+    target_warehouse=None,
+    movement_quantity=None,
+    affected_item_count=None,
+    reconciliation_metrics=None,
+):
+    """Register an inventory document once and update its final known state."""
+    if diagnostics is None:
+        return
+    try:
+        document_id = str(document_id or "<not assigned>")
+        key = (doctype, document_id)
+        if document_id == "<not assigned>":
+            key = (
+                doctype,
+                document_id,
+                purpose,
+                tuple(sorted(source_warehouses or [])),
+                target_warehouse,
+            )
+        documents = diagnostics.setdefault("inventory_documents", {})
+        record = documents.setdefault(
+            key,
+            {
+                "doctype": doctype,
+                "document_id": document_id,
+                "purpose": purpose,
+                "origin": origin,
+                "status": status,
+                "source_warehouses": [],
+                "target_warehouse": None,
+                "movement_quantity": 0,
+                "affected_item_count": 0,
+                "changed_row_count": 0,
+                "total_increase_qty": 0,
+                "total_decrease_qty": 0,
+                "net_quantity_delta": 0,
+                "quantity_changed": False,
+            },
+        )
+        record.update({
+            "purpose": purpose,
+            "origin": origin,
+            "status": status,
+        })
+        for warehouse in source_warehouses or []:
+            if warehouse and warehouse not in record["source_warehouses"]:
+                record["source_warehouses"].append(warehouse)
+        if target_warehouse is not None:
+            record["target_warehouse"] = target_warehouse
+        if movement_quantity is not None:
+            record["movement_quantity"] = float(movement_quantity or 0)
+        if affected_item_count is not None:
+            record["affected_item_count"] = int(affected_item_count or 0)
+        if reconciliation_metrics is not None:
+            record.update(reconciliation_metrics)
+    except Exception:
+        return
+
+
+def _reconciliation_quantity_metrics(items, current_quantities):
+    """Summarize per-row proposed quantity changes without netting rows first."""
+    deltas = []
+    for row in items:
+        key = (row["item_code"], row["warehouse"])
+        current_qty = float(current_quantities[key])
+        deltas.append(float(row.get("qty") or 0) - current_qty)
+    changed_deltas = [delta for delta in deltas if abs(delta) > 1e-9]
+    total_increase = sum(delta for delta in changed_deltas if delta > 0)
+    total_decrease = sum(-delta for delta in changed_deltas if delta < 0)
+    return {
+        "changed_row_count": len(changed_deltas),
+        "total_increase_qty": total_increase,
+        "total_decrease_qty": total_decrease,
+        "net_quantity_delta": sum(changed_deltas),
+        "quantity_changed": bool(changed_deltas),
+    }
 
 
 def _record_inbound_flow_event(
@@ -1474,54 +1584,135 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 return None, "valid source"
             return None, "other recorded failure"
 
-        has_global_source_failure = bool(
-            not today_source["available"]
-            or today_source.get("error")
-            or today_source.get("partial")
-            or not yesterday_source["available"]
-            or yesterday_source.get("error")
-            or yesterday_source.get("partial")
-            or live_global_error
-        )
-        has_invalid_asin = bool(
-            today_source["invalid_asins"]
-            or yesterday_source["invalid_asins"]
-            or live_invalid_asins
-        )
-        has_non_normal_mode = any(
-            mode != normal_mode for mode in mode_by_asin.values()
-        )
-        has_inbound_flow_activity = bool(
-            inbound_flow_diagnostics
-            and inbound_flow_diagnostics.get("active")
-        )
-        has_absent_asin = False
-        for asin in relevant_asins:
-            if asin in expected_live_only_set:
-                continue
-            today_reason, today_category = report_reason_and_category(
-                today_source, asin
-            )
-            yesterday_reason, yesterday_category = report_reason_and_category(
-                yesterday_source, asin
-            )
-            live_reason, live_category = live_reason_and_category(asin)
-            if (
-                today_category == "ASIN absent"
-                or yesterday_category == "ASIN absent"
-                or live_category == "ASIN absent"
-            ):
-                has_absent_asin = True
-                break
+        trigger_reasons = {}
 
-        if not (
-            has_global_source_failure
-            or has_invalid_asin
-            or has_absent_asin
-            or has_non_normal_mode
-            or expected_live_only_asins
-            or has_inbound_flow_activity
-        ):
+        def add_trigger(code, text):
+            trigger_reasons.setdefault(code, text)
+
+        source_trigger_codes = {
+            "TODAY": ("01", "03", "05", "07"),
+            "YESTERDAY": ("02", "04", "06", "08"),
+        }
+        for source in (today_source, yesterday_source):
+            unavailable_code, processing_code, partial_code, invalid_code = (
+                source_trigger_codes[source["label"]]
+            )
+            report = source.get("report") or {}
+            report_id = report.get("reportId", "<none>")
+            if not source["available"]:
+                add_trigger(
+                    unavailable_code,
+                    f"{source['label']} report unavailable: "
+                    f"{source.get('error') or 'no usable report'}",
+                )
+                if source.get("report") and source.get("error"):
+                    add_trigger(
+                        processing_code,
+                        f"{source['label']} report {report_id} failed during "
+                        f"download, decryption, decoding, or parsing: "
+                        f"{source['error']}",
+                    )
+            if source.get("partial"):
+                add_trigger(
+                    partial_code,
+                    f"{source['label']} report {report_id} has a partial schema "
+                    f"or unavailable inventory components: "
+                    f"missing_headers={source.get('missing_headers') or []}; "
+                    f"unavailable_components="
+                    f"{source.get('unavailable_components') or []}",
+                )
+            if source["invalid_asins"]:
+                add_trigger(
+                    invalid_code,
+                    f"{source['label']} report {report_id} contains "
+                    f"{len(source['invalid_asins'])} invalid ASIN row(s)",
+                )
+
+        if live_global_error:
+            add_trigger(
+                "09",
+                "LIVE inventory source is globally unavailable or incomplete: "
+                + str(live_global_error),
+            )
+        if live_invalid_asins:
+            add_trigger(
+                "10",
+                f"LIVE inventory source contains {len(live_invalid_asins)} "
+                "invalid ASIN row(s)",
+            )
+
+        non_expected_asins = [
+            asin for asin in relevant_asins if asin not in expected_live_only_set
+        ]
+        for source, code in ((today_source, "11"), (yesterday_source, "12")):
+            absent = [
+                asin
+                for asin in non_expected_asins
+                if source["available"]
+                and asin not in source["snapshots"]
+                and asin not in source["invalid_asins"]
+            ]
+            if absent:
+                add_trigger(
+                    code,
+                    f"{len(absent)} non-expected ASIN(s) are absent from "
+                    f"{source['label']} even though that source is available",
+                )
+        live_missing_or_invalid = [
+            asin
+            for asin in non_expected_asins
+            if not live_global_error
+            and (
+                asin in live_invalid_asins
+                or asin not in live_snapshots
+                or not _snapshot_is_complete(live_snapshots.get(asin))
+            )
+        ]
+        if live_missing_or_invalid:
+            add_trigger(
+                "13",
+                f"{len(live_missing_or_invalid)} ASIN(s) required by the run "
+                "are absent or invalid in LIVE",
+            )
+
+        mode_trigger_codes = {
+            "TODAY REPORT -> LIVE API": "14",
+            "YESTERDAY REPORT -> LIVE API": "15",
+            "NORMAL TWO-REPORT": "16",
+            "PARTIAL TODAY (C/S/R) -> LIVE API": "17",
+            "PARTIAL YESTERDAY (C/S/R) -> LIVE API": "18",
+            "YESTERDAY -> PARTIAL TODAY (C/S/R) -> LIVE API": "19",
+            "PARTIAL YESTERDAY (C/S/R) -> TODAY -> LIVE API": "20",
+            "PARTIAL YESTERDAY + PARTIAL TODAY (C/S/R) -> LIVE API": "21",
+            "PROBLEM-CATEGORY INCREASE-ONLY SAFETY MODE": "22",
+        }
+        non_expected_mode_counts = defaultdict(int)
+        for asin, mode in mode_by_asin.items():
+            if asin not in expected_live_only_set:
+                non_expected_mode_counts[mode] += 1
+        for mode, code in mode_trigger_codes.items():
+            count = non_expected_mode_counts.get(mode, 0)
+            if count:
+                explanation = (
+                    " because LIVE was unavailable"
+                    if mode == "NORMAL TWO-REPORT"
+                    else ""
+                )
+                add_trigger(
+                    code,
+                    f"Mode {mode} was used for {count} non-expected ASIN(s)"
+                    f"{explanation}",
+                )
+
+        flow = inbound_flow_diagnostics or {}
+        for code, trigger in sorted((flow.get("trigger_reasons") or {}).items()):
+            identifiers = sorted(trigger.get("identifiers") or [])
+            detail = f"; occurrences={trigger.get('count', 0)}"
+            if identifiers:
+                detail += "; identifiers=" + ", ".join(identifiers)
+            add_trigger(code, trigger.get("summary", code) + detail)
+
+        if not trigger_reasons:
             return
 
         mode_counts = defaultdict(int)
@@ -1529,9 +1720,9 @@ def _log_temporary_consolidated_fallbacks_and_failures(
             mode_counts[mode] += 1
         all_modes = sorted(known_modes | set(mode_counts))
         genuine_non_normal_count = sum(
-            1
-            for asin, mode in mode_by_asin.items()
-            if mode != normal_mode and asin not in expected_live_only_set
+            count
+            for mode, count in non_expected_mode_counts.items()
+            if mode != normal_mode
         )
 
         def append_report_source_summary(lines, source):
@@ -1580,8 +1771,68 @@ def _log_temporary_consolidated_fallbacks_and_failures(
             f"Run timestamp (America/Los_Angeles): "
             f"{datetime.now(ZoneInfo('America/Los_Angeles')).isoformat()}",
             "",
-            "COMPLETE RUN SUMMARY (totals and global errors are not truncated)",
+            "REPORT TRIGGER REASONS",
         ]
+        for number, code in enumerate(sorted(trigger_reasons), start=1):
+            lines.append(f"{number}. {trigger_reasons[code]}")
+
+        lines.extend(
+            [
+                "",
+                "STOCK ENTRIES AND STOCK RECONCILIATIONS",
+            ]
+        )
+        document_records = sorted(
+            (flow.get("inventory_documents") or {}).values(),
+            key=lambda record: (
+                record.get("doctype", ""),
+                record.get("document_id", ""),
+                record.get("purpose", ""),
+            ),
+        )
+        if not document_records:
+            lines.append("- <none>")
+        for record in document_records:
+            source_warehouses = sorted(record.get("source_warehouses") or [])
+            lines.extend(
+                [
+                    f"- DocType: {record['doctype']}",
+                    f"  Document ID: {record['document_id']}",
+                    f"  Purpose: {record['purpose']}",
+                    f"  Origin: {record['origin']}",
+                    f"  Final known status/outcome: {record['status']}",
+                    "  Source warehouse(s): "
+                    + (", ".join(source_warehouses) or "<none>"),
+                    f"  Target warehouse: "
+                    f"{record.get('target_warehouse') or '<none>'}",
+                    f"  Total relevant movement quantity: "
+                    f"{record.get('movement_quantity', 0)}",
+                    f"  Affected-item count: "
+                    f"{record.get('affected_item_count', 0)}",
+                ]
+            )
+            if record["doctype"] == "Stock Reconciliation":
+                lines.extend(
+                    [
+                        f"  Changed-row count: "
+                        f"{record.get('changed_row_count', 0)}",
+                        f"  Total increase quantity: "
+                        f"{record.get('total_increase_qty', 0)}",
+                        f"  Total decrease quantity: "
+                        f"{record.get('total_decrease_qty', 0)}",
+                        f"  Net quantity delta: "
+                        f"{record.get('net_quantity_delta', 0)}",
+                        f"  Any quantity changed: "
+                        f"{bool(record.get('quantity_changed'))}",
+                    ]
+                )
+
+        lines.extend(
+            [
+            "",
+            "COMPLETE RUN SUMMARY (totals and global errors are not truncated)",
+            ]
+        )
         append_report_source_summary(lines, today_source)
         lines.append("")
         append_report_source_summary(lines, yesterday_source)
@@ -1620,7 +1871,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
             [
                 f"Total ASINs using any genuine non-normal fallback/failure mode: "
                 f"{genuine_non_normal_count}",
-                f"Expected LIVE-only ASIN coverage: "
+                f"Expected/non-failing LIVE-only ASIN coverage: "
                 f"{len(expected_live_only_asins)} ASINs absent from both usable "
                 f"reports but valid in LIVE; representative examples: "
                 f"{expected_examples_text}",
@@ -2164,6 +2415,22 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
     diagnostics = diagnostics or _new_inbound_flow_diagnostics(
         asin_inbound, settings
     )
+    existing_draft_purpose = (
+        "Complete an existing Finished Goods-to-Prep transfer needed by the "
+        "inbound workflow"
+    )
+    aggregated_entry_purpose = (
+        "Move available Prep and/or Finished Goods stock into Amazon FBA "
+        "Inbound to satisfy protected inbound targets"
+    )
+    valuation_reconciliation_purpose = (
+        "Align source-warehouse Bin valuation with the Item valuation before "
+        "transfer; no quantity change"
+    )
+    inbound_reconciliation_purpose = (
+        "Set ERP Amazon FBA Inbound quantities to the remaining protected "
+        "inbound targets after transfers"
+    )
 
     if DEBUG: print(f"[DEBUG] Starting inbound inventory processing for warehouse: {inbound_wh}")
 
@@ -2174,6 +2441,18 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
         state["failure_reason"] = reason
         state["planned_rows"] = []
         diagnostics["skipped_item_count"] += 1
+        _record_inventory_trigger(
+            diagnostics,
+            "25",
+            "A required ERP warehouse quantity could not be read or verified",
+            state.get("item_code"),
+        )
+        _record_inventory_trigger(
+            diagnostics,
+            "26",
+            "An item was deliberately skipped to prevent double counting because quantities could not be verified",
+            state.get("item_code"),
+        )
         _record_inbound_flow_event(
             diagnostics,
             "Item deliberately skipped to prevent double counting",
@@ -2283,6 +2562,11 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             diagnostics["drafts_inspected"] = len(draft_rows)
         except Exception as exc:
             draft_rows = []
+            _record_inventory_trigger(
+                diagnostics,
+                "27",
+                "Searching for eligible draft Stock Entries failed",
+            )
             _record_inbound_flow_global_error(
                 diagnostics,
                 "Draft Stock Entry search failed: " + _concise_inventory_exception(exc),
@@ -2304,6 +2588,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 )
                 eligible_drafts.append((draft.name, relevant_codes))
                 diagnostics["drafts_eligible"] += 1
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Entry",
+                    draft.name,
+                    existing_draft_purpose,
+                    "pre-existing draft acted upon by this run",
+                    "selected; pending immediate revalidation",
+                    source_warehouses=sorted({
+                        row.s_warehouse for row in draft.items if row.s_warehouse
+                    }),
+                    target_warehouse=prep_wh,
+                    movement_quantity=sum(quantities.values()),
+                    affected_item_count=len(quantities),
+                )
                 for item_code in relevant_codes:
                     state = item_states[item_code]
                     state["eligible_draft_names"].append(draft.name)
@@ -2316,6 +2614,12 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                         quantities.get(item_code, 0),
                     )
             except Exception as exc:
+                _record_inventory_trigger(
+                    diagnostics,
+                    "28",
+                    "Inspecting or parsing a candidate draft Stock Entry failed",
+                    draft_row.name,
+                )
                 _record_inbound_flow_global_error(
                     diagnostics,
                     f"Draft {draft_row.name} could not be inspected: "
@@ -2332,6 +2636,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
         except Exception as exc:
             diagnostics["drafts_revalidation_ineligible"] += 1
             reason = "Immediate draft reload failed: " + _concise_inventory_exception(exc)
+            _record_inventory_trigger(
+                diagnostics,
+                "31",
+                "An eligible draft became ineligible during pre-submit revalidation",
+                draft_name,
+            )
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                existing_draft_purpose,
+                "pre-existing draft acted upon by this run",
+                "revalidation failed; not submitted",
+            )
             for item_code in initially_relevant_codes:
                 _record_inbound_flow_event(
                     diagnostics,
@@ -2371,6 +2689,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             draft, currently_needed, company, prep_wh
         ):
             diagnostics["drafts_revalidation_ineligible"] += 1
+            _record_inventory_trigger(
+                diagnostics,
+                "31",
+                "An eligible draft became ineligible during pre-submit revalidation",
+                draft_name,
+            )
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                existing_draft_purpose,
+                "pre-existing draft acted upon by this run",
+                "became ineligible during revalidation; not submitted",
+            )
             for item_code in initially_relevant_codes:
                 state = item_states.get(item_code)
                 _record_inbound_flow_event(
@@ -2398,6 +2730,14 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
 
         if DEBUG:
             diagnostics["drafts_debug_would_submit"] += 1
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                existing_draft_purpose,
+                "pre-existing draft acted upon by this run",
+                "DEBUG: remained draft; submission not attempted",
+            )
             for item_code in revalidated_codes:
                 state = item_states[item_code]
                 state["draft_outcome"] = "would submit in non-DEBUG mode"
@@ -2412,6 +2752,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             continue
 
         diagnostics["drafts_attempted"] += 1
+        _record_inventory_trigger(
+            diagnostics,
+            "29",
+            "A Finished Goods-to-Prep transfer was requested or attempted",
+            draft_name,
+        )
+        _upsert_inventory_document(
+            diagnostics,
+            "Stock Entry",
+            draft_name,
+            existing_draft_purpose,
+            "pre-existing draft acted upon by this run",
+            "submission attempted",
+        )
         for item_code in revalidated_codes:
             _record_inbound_flow_event(
                 diagnostics,
@@ -2443,6 +2797,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             diagnostics["submitted_finished_to_prep_qty"] += sum(
                 draft_quantities.values()
             )
+            _record_inventory_trigger(
+                diagnostics,
+                "30",
+                "An eligible pre-existing draft Stock Entry was submitted and completed",
+                draft_name,
+            )
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                existing_draft_purpose,
+                "pre-existing draft acted upon by this run",
+                "submitted, committed, and docstatus verified",
+            )
             for item_code, moved_qty in draft_quantities.items():
                 if item_code not in item_states:
                     continue
@@ -2465,6 +2833,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 diagnostics["drafts_committed_unverified"] += 1
                 outcome = "Submitted draft could not be verified"
                 reason = "Committed state could not be safely verified: " + reason
+                _record_inventory_trigger(
+                    diagnostics,
+                    "33",
+                    "A committed draft's submitted state could not be verified",
+                    draft_name,
+                )
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Entry",
+                    draft_name,
+                    existing_draft_purpose,
+                    "pre-existing draft acted upon by this run",
+                    "submission state unverified after commit",
+                )
                 for item_code in set(draft_quantities) & set(item_states):
                     state = item_states[item_code]
                     state["draft_outcome"] = "committed state could not be verified"
@@ -2479,6 +2861,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     )
             else:
                 diagnostics["drafts_failed_submission"] += 1
+                _record_inventory_trigger(
+                    diagnostics,
+                    "32",
+                    "A draft Stock Entry submission failed",
+                    draft_name,
+                )
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Entry",
+                    draft_name,
+                    existing_draft_purpose,
+                    "pre-existing draft acted upon by this run",
+                    "submission failed",
+                )
                 try:
                     frappe.db.rollback(save_point=savepoint_name)
                 except Exception as rollback_exc:
@@ -2533,6 +2929,12 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 reason = (
                     "Fresh post-draft quantities did not safely reflect the "
                     f"submitted movement of {moved_qty}"
+                )
+                _record_inventory_trigger(
+                    diagnostics,
+                    "34",
+                    "A draft's expected warehouse quantity movement could not be verified",
+                    (submitted_draft_names_by_item.get(item_code) or [item_code])[-1],
                 )
                 mark_item_skipped(
                     state,
@@ -2602,6 +3004,12 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 if not item_rows:
                     diagnostics["valuation_failed"] += 1
                     failed_corrections.add(item_code)
+                    _record_inventory_trigger(
+                        diagnostics,
+                        "36",
+                        "A required source valuation correction failed",
+                        item_code,
+                    )
                     _record_inbound_flow_event(
                         diagnostics,
                         "Source valuation correction failed",
@@ -2618,6 +3026,15 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             source_label = (
                 "Prep" if source_wh == prep_wh else "Finished Goods"
             )
+            source_sr = None
+            source_sr_inserted = False
+            zero_quantity_metrics = {
+                "changed_row_count": 0,
+                "total_increase_qty": 0,
+                "total_decrease_qty": 0,
+                "net_quantity_delta": 0,
+                "quantity_changed": False,
+            }
             try:
                 source_sr = frappe.get_doc({
                     "doctype": "Stock Reconciliation",
@@ -2628,9 +3045,33 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     "items": correction_rows,
                 })
                 source_sr.insert(ignore_permissions=True)
+                source_sr_inserted = True
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    source_sr.name,
+                    valuation_reconciliation_purpose,
+                    "newly created by this run",
+                    "inserted as draft",
+                    source_warehouses=[source_wh],
+                    target_warehouse=source_wh,
+                    movement_quantity=0,
+                    affected_item_count=len({
+                        state["item_code"] for state in correction_states
+                    }),
+                    reconciliation_metrics=zero_quantity_metrics,
+                )
                 if DEBUG:
                     frappe.db.commit()
                     diagnostics["valuation_debug_drafts"] += len(correction_states)
+                    _upsert_inventory_document(
+                        diagnostics,
+                        "Stock Reconciliation",
+                        source_sr.name,
+                        valuation_reconciliation_purpose,
+                        "newly created by this run",
+                        "DEBUG draft; not submitted",
+                    )
                     for state in correction_states:
                         _record_inbound_flow_event(
                             diagnostics,
@@ -2643,6 +3084,14 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     source_sr.submit()
                     frappe.db.commit()
                     diagnostics["valuation_successful"] += len(correction_states)
+                    _upsert_inventory_document(
+                        diagnostics,
+                        "Stock Reconciliation",
+                        source_sr.name,
+                        valuation_reconciliation_purpose,
+                        "newly created by this run",
+                        "submitted",
+                    )
                     for state in correction_states:
                         _record_inbound_flow_event(
                             diagnostics,
@@ -2654,6 +3103,28 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             except Exception as exc:
                 diagnostics["valuation_failed"] += len(correction_states)
                 reason = "Source valuation correction failed: " + _concise_inventory_exception(exc)
+                source_sr_name = getattr(source_sr, "name", None)
+                _record_inventory_trigger(
+                    diagnostics,
+                    "36",
+                    "A required source valuation correction failed",
+                    source_sr_name or source_label,
+                )
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    source_sr_name,
+                    valuation_reconciliation_purpose,
+                    "newly created by this run",
+                    "submission failed" if source_sr_inserted else "insertion failed",
+                    source_warehouses=[source_wh],
+                    target_warehouse=source_wh,
+                    movement_quantity=0,
+                    affected_item_count=len({
+                        state["item_code"] for state in correction_states
+                    }),
+                    reconciliation_metrics=zero_quantity_metrics,
+                )
                 for state in correction_states:
                     failed_corrections.add(state["item_code"])
                     _record_inbound_flow_event(
@@ -2696,6 +3167,12 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 )
             except Exception as exc:
                 rows, represented_qty = [], 0
+                _record_inventory_trigger(
+                    diagnostics,
+                    "37",
+                    "Building a required transfer row failed",
+                    item_code,
+                )
                 _record_inbound_flow_event(
                     diagnostics,
                     "Transfer row construction failed",
@@ -2706,6 +3183,12 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             state[valid_key] = represented_qty
             state["planned_rows"].extend(rows)
             if represented_qty < requested_qty:
+                _record_inventory_trigger(
+                    diagnostics,
+                    "38",
+                    "Batch or serial restrictions reduced transferable quantity below the requested quantity",
+                    item_code,
+                )
                 _record_inbound_flow_event(
                     diagnostics,
                     "Batch or serial restrictions reduced transferable quantity",
@@ -2752,6 +3235,13 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             max(state.get("fresh_finished_goods_qty", 0), 0),
             max(remaining_diff, 0),
         )
+        if state["requested_finished_qty"] > 0:
+            _record_inventory_trigger(
+                diagnostics,
+                "35",
+                "A direct Finished Goods-to-Inbound transfer was requested or attempted",
+                state["item_code"],
+            )
 
     add_source_transfer_rows(
         FINISHED_GOODS_WAREHOUSE,
@@ -2818,6 +3308,18 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             inserted = True
             diagnostics["aggregated_entry_name"] = se.name
             diagnostics["aggregated_entry_status"] = "inserted as draft"
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                se.name,
+                aggregated_entry_purpose,
+                "newly created by this run",
+                "inserted as draft",
+                source_warehouses=sources,
+                target_warehouse=inbound_wh,
+                movement_quantity=sum(row["qty"] for row in transfer_items),
+                affected_item_count=diagnostics["aggregated_item_count"],
+            )
             for state in allocatable_states:
                 if not state.get("planned_rows") or state.get("skipped"):
                     continue
@@ -2835,6 +3337,14 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             if DEBUG:
                 frappe.db.commit()
                 diagnostics["aggregated_entry_status"] = "DEBUG draft; not submitted"
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Entry",
+                    se.name,
+                    aggregated_entry_purpose,
+                    "newly created by this run",
+                    "DEBUG draft; not submitted",
+                )
                 for state in allocatable_states:
                     if not state.get("planned_rows") or state.get("skipped"):
                         continue
@@ -2854,6 +3364,14 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 diagnostics["aggregated_entry_status"] = "submitted"
                 diagnostics["prep_submitted_qty"] = diagnostics["prep_valid_row_qty"]
                 diagnostics["finished_submitted_qty"] = diagnostics["finished_valid_row_qty"]
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Entry",
+                    se.name,
+                    aggregated_entry_purpose,
+                    "newly created by this run",
+                    "submitted",
+                )
                 for state in allocatable_states:
                     if not state.get("planned_rows") or state.get("skipped"):
                         continue
@@ -2877,6 +3395,24 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             )
             if se and getattr(se, "name", None):
                 diagnostics["aggregated_entry_name"] = se.name
+            _record_inventory_trigger(
+                diagnostics,
+                "39",
+                "Inserting or submitting the aggregated Stock Entry failed",
+                getattr(se, "name", None) or "<not assigned>",
+            )
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                getattr(se, "name", None),
+                aggregated_entry_purpose,
+                "newly created by this run",
+                diagnostics["aggregated_entry_status"],
+                source_warehouses=sources,
+                target_warehouse=inbound_wh,
+                movement_quantity=sum(row["qty"] for row in transfer_items),
+                affected_item_count=diagnostics["aggregated_item_count"],
+            )
             for state in allocatable_states:
                 if not state.get("planned_rows") or state.get("skipped"):
                     continue
@@ -2906,6 +3442,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     cleanup_succeeded = True
                     diagnostics["aggregated_entry_status"] += "; cleaned up"
                 except Exception as cleanup_exc:
+                    _record_inventory_trigger(
+                        diagnostics,
+                        "40",
+                        "Cleanup or cancellation of a failed aggregated Stock Entry also failed",
+                        getattr(se, "name", None) or "<not assigned>",
+                    )
+                    _upsert_inventory_document(
+                        diagnostics,
+                        "Stock Entry",
+                        getattr(se, "name", None),
+                        aggregated_entry_purpose,
+                        "newly created by this run",
+                        "submission failed; cleanup failed",
+                    )
                     _record_inbound_flow_global_error(
                         diagnostics,
                         "Aggregated Stock Entry cleanup failed: "
@@ -2915,6 +3465,14 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                         frappe.get_traceback(), "Stock Entry Cleanup Error"
                     )
             if cleanup_succeeded:
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Entry",
+                    getattr(se, "name", None),
+                    aggregated_entry_purpose,
+                    "newly created by this run",
+                    "submission failed; cancelled/deleted during cleanup",
+                )
                 for state in allocatable_states:
                     if not state.get("planned_rows") or state.get("skipped"):
                         continue
@@ -2935,6 +3493,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
 
     # Second pass: collect reconciliations where qty doesn't match
     reconcile_items = []
+    inbound_reconciliation_current_quantities = {}
     for state in item_states.values():
         if state.get("skipped"):
             continue
@@ -2967,6 +3526,9 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
         else:
             item_dict["valuation_rate"] = 0.01
         reconcile_items.append(item_dict)
+        inbound_reconciliation_current_quantities[(item_code, inbound_wh)] = (
+            current_inbound
+        )
         remaining_shortage = max(target_qty - current_inbound, 0)
         if remaining_shortage > 0:
             state["reconciliation_qty"] = remaining_shortage
@@ -2994,6 +3556,11 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
     inbound_total_stocked = len(inbound_amazon_items)  # Amazon items currently holding stock here
     # Guard: refuse to zero if the unreported share exceeds the threshold (likely a partial pull)
     if inbound_total_stocked and (len(inbound_zero_candidates) / inbound_total_stocked) > MAX_ZERO_OUT_FRACTION:
+        _record_inventory_trigger(
+            diagnostics,
+            "46",
+            "The Inbound zero-out guard blocked reconciliation rows",
+        )
         frappe.log_error(
             f"Skipping inbound zero-out for {inbound_wh}: "
             f"{len(inbound_zero_candidates)}/{inbound_total_stocked} stocked Amazon items "
@@ -3013,12 +3580,27 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             else:
                 item_dict["valuation_rate"] = 0.01
             reconcile_items.append(item_dict)
+            inbound_reconciliation_current_quantities[
+                (row.item_code, inbound_wh)
+            ] = float(row.actual_qty or 0)
 
     # Create and submit Stock Reconciliation if needed
     if reconcile_items:
         if DEBUG: print(f"[DEBUG] Creating Stock Reconciliation with {len(reconcile_items)} items...")
+        inbound_sr = None
+        inbound_sr_inserted = False
+        inbound_reconciliation_metrics = _reconciliation_quantity_metrics(
+            reconcile_items,
+            inbound_reconciliation_current_quantities,
+        )
+        if inbound_reconciliation_metrics["quantity_changed"]:
+            _record_inventory_trigger(
+                diagnostics,
+                "42",
+                "An Inbound Stock Reconciliation changes at least one quantity",
+            )
         try:  # ADDED: Wrap for error logging
-            sr = frappe.get_doc({
+            inbound_sr = frappe.get_doc({
                 "doctype": "Stock Reconciliation",
                 "company": company,
                 "posting_date": frappe.utils.today(),
@@ -3026,16 +3608,74 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 "expense_account": adjustment_account,
                 "items": reconcile_items,
             })
-            sr.insert(ignore_permissions=True)
-            if DEBUG: print(f"[DEBUG] Inserted SR: {sr.name}")
+            inbound_sr.insert(ignore_permissions=True)
+            inbound_sr_inserted = True
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Reconciliation",
+                inbound_sr.name,
+                inbound_reconciliation_purpose,
+                "newly created by this run",
+                "inserted as draft",
+                source_warehouses=[inbound_wh],
+                target_warehouse=inbound_wh,
+                movement_quantity=abs(
+                    inbound_reconciliation_metrics["total_increase_qty"]
+                ) + abs(inbound_reconciliation_metrics["total_decrease_qty"]),
+                affected_item_count=len({
+                    row["item_code"] for row in reconcile_items
+                }),
+                reconciliation_metrics=inbound_reconciliation_metrics,
+            )
+            if DEBUG: print(f"[DEBUG] Inserted SR: {inbound_sr.name}")
             if DEBUG:
-                if DEBUG: print(f"[DEBUG] DEBUG mode: leaving inbound SR {sr.name} as DRAFT (not submitted)")
+                if DEBUG: print(f"[DEBUG] DEBUG mode: leaving inbound SR {inbound_sr.name} as DRAFT (not submitted)")
                 frappe.db.commit()  # persist draft
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    inbound_sr.name,
+                    inbound_reconciliation_purpose,
+                    "newly created by this run",
+                    "DEBUG draft; not submitted",
+                )
             else:
-                sr.submit()
+                inbound_sr.submit()
                 frappe.db.commit()
-                if DEBUG: print(f"[DEBUG] Submitted inbound SR: {sr.name}")
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    inbound_sr.name,
+                    inbound_reconciliation_purpose,
+                    "newly created by this run",
+                    "submitted",
+                )
+                if DEBUG: print(f"[DEBUG] Submitted inbound SR: {inbound_sr.name}")
         except Exception:
+            inbound_sr_name = getattr(inbound_sr, "name", None)
+            _record_inventory_trigger(
+                diagnostics,
+                "44",
+                "Inbound Stock Reconciliation insertion or submission failed",
+                inbound_sr_name or "<not assigned>",
+            )
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Reconciliation",
+                inbound_sr_name,
+                inbound_reconciliation_purpose,
+                "newly created by this run",
+                "submission failed" if inbound_sr_inserted else "insertion failed",
+                source_warehouses=[inbound_wh],
+                target_warehouse=inbound_wh,
+                movement_quantity=abs(
+                    inbound_reconciliation_metrics["total_increase_qty"]
+                ) + abs(inbound_reconciliation_metrics["total_decrease_qty"]),
+                affected_item_count=len({
+                    row["item_code"] for row in reconcile_items
+                }),
+                reconciliation_metrics=inbound_reconciliation_metrics,
+            )
             frappe.log_error(frappe.get_traceback(), "Inbound Stock Reconciliation Error")
             raise
 
@@ -3171,6 +3811,13 @@ def process_fba_inventory():
         # is surfaced for correction so one ERP Item maps to one ASIN.
         multiple_asin_items = _erp_items_with_multiple_asins()
         if multiple_asin_items:
+            for issue in multiple_asin_items:
+                _record_inventory_trigger(
+                    inbound_flow_diagnostics,
+                    "24",
+                    "An ERP Item contains multiple ASINs where one usable ASIN is required",
+                    issue["item_code"],
+                )
             multiple_asin_lines = [
                 f"Item {issue['item_code']}: custom_asin={issue['custom_asin']!r}; "
                 f"detected_asins={', '.join(issue['detected_asins'])}"
@@ -3201,6 +3848,13 @@ def process_fba_inventory():
                 missing_erp_asins.append(asin)
 
         if missing_erp_asins:
+            for asin in missing_erp_asins:
+                _record_inventory_trigger(
+                    inbound_flow_diagnostics,
+                    "23",
+                    "A positive protected target cannot be applied because no enabled ERP Item exists",
+                    asin,
+                )
             missing_lines = [
                 f"ASIN {asin}: main_target={asin_fulfillable.get(asin, '<none>')}, "
                 f"inbound_target={final_inbound_by_asin.get(asin, '<none>')}"
@@ -3218,6 +3872,10 @@ def process_fba_inventory():
         company = settings.company
         adjustment_account = settings.custom_amazon_inventory_adjustment_account
         items_list = []
+        main_reconciliation_current_quantities = {}
+        main_reconciliation_purpose = (
+            "Set ERP Main FBA quantities to the run's protected Main FBA targets"
+        )
 
         for asin, new_qty in asin_fulfillable.items():
             item_code = frappe.db.get_value(
@@ -3230,12 +3888,21 @@ def process_fba_inventory():
                 if DEBUG: print(f"[DEBUG] Skipping non-stock item: {item_code}")
                 continue
 
-            bin_data = frappe.db.get_value(
-                "Bin",
-                {"item_code": item_code, "warehouse": wh},
-                ["actual_qty", "valuation_rate"],
-                as_dict=True,
-            ) or {}
+            try:
+                bin_data = frappe.db.get_value(
+                    "Bin",
+                    {"item_code": item_code, "warehouse": wh},
+                    ["actual_qty", "valuation_rate"],
+                    as_dict=True,
+                ) or {}
+            except Exception:
+                _record_inventory_trigger(
+                    inbound_flow_diagnostics,
+                    "25",
+                    "A required ERP warehouse quantity could not be read or verified",
+                    item_code,
+                )
+                raise
             current_qty = bin_data.get("actual_qty", 0)
             if DEBUG:
                 print(
@@ -3256,6 +3923,9 @@ def process_fba_inventory():
                     item_valuation_rate if item_valuation_rate > 0 else 0.01
                 ),
             })
+            main_reconciliation_current_quantities[(item_code, wh)] = float(
+                current_qty or 0
+            )
 
         # Preserve the existing belt-and-suspenders zero-out guard. Because every
         # currently stocked Amazon ASIN is included in per-ASIN mode selection,
@@ -3283,6 +3953,11 @@ def process_fba_inventory():
             total_stocked
             and (len(zero_candidates) / total_stocked) > MAX_ZERO_OUT_FRACTION
         ):
+            _record_inventory_trigger(
+                inbound_flow_diagnostics,
+                "45",
+                "The Main FBA zero-out guard blocked reconciliation rows",
+            )
             frappe.log_error(
                 f"Skipping fulfillable zero-out for {wh}: "
                 f"{len(zero_candidates)}/{total_stocked} stocked Amazon items "
@@ -3303,11 +3978,26 @@ def process_fba_inventory():
                         item_valuation_rate if item_valuation_rate > 0 else 0.01
                     ),
                 })
+                main_reconciliation_current_quantities[(row.item_code, wh)] = (
+                    float(row.actual_qty or 0)
+                )
 
         if DEBUG: print(f"[DEBUG] Total items to reconcile: {len(items_list)}")
         if items_list:
+            main_sr = None
+            main_sr_inserted = False
+            main_reconciliation_metrics = _reconciliation_quantity_metrics(
+                items_list,
+                main_reconciliation_current_quantities,
+            )
+            if main_reconciliation_metrics["quantity_changed"]:
+                _record_inventory_trigger(
+                    inbound_flow_diagnostics,
+                    "41",
+                    "A Main FBA Stock Reconciliation changes at least one quantity",
+                )
             try:
-                sr = frappe.get_doc({
+                main_sr = frappe.get_doc({
                     "doctype": "Stock Reconciliation",
                     "company": company,
                     "posting_date": frappe.utils.today(),
@@ -3315,18 +4005,76 @@ def process_fba_inventory():
                     "expense_account": adjustment_account,
                     "items": items_list,
                 })
-                sr.insert(ignore_permissions=True)
+                main_sr.insert(ignore_permissions=True)
+                main_sr_inserted = True
+                _upsert_inventory_document(
+                    inbound_flow_diagnostics,
+                    "Stock Reconciliation",
+                    main_sr.name,
+                    main_reconciliation_purpose,
+                    "newly created by this run",
+                    "inserted as draft",
+                    source_warehouses=[wh],
+                    target_warehouse=wh,
+                    movement_quantity=abs(
+                        main_reconciliation_metrics["total_increase_qty"]
+                    ) + abs(main_reconciliation_metrics["total_decrease_qty"]),
+                    affected_item_count=len({
+                        row["item_code"] for row in items_list
+                    }),
+                    reconciliation_metrics=main_reconciliation_metrics,
+                )
                 if DEBUG:
-                    print(f"[DEBUG] Inserted SR: {sr.name}")
+                    print(f"[DEBUG] Inserted SR: {main_sr.name}")
                     print(
                         f"[DEBUG] DEBUG mode: leaving FBA fulfillable SR "
-                        f"{sr.name} as DRAFT (not submitted)"
+                        f"{main_sr.name} as DRAFT (not submitted)"
                     )
                     frappe.db.commit()
+                    _upsert_inventory_document(
+                        inbound_flow_diagnostics,
+                        "Stock Reconciliation",
+                        main_sr.name,
+                        main_reconciliation_purpose,
+                        "newly created by this run",
+                        "DEBUG draft; not submitted",
+                    )
                 else:
-                    sr.submit()
+                    main_sr.submit()
                     frappe.db.commit()
+                    _upsert_inventory_document(
+                        inbound_flow_diagnostics,
+                        "Stock Reconciliation",
+                        main_sr.name,
+                        main_reconciliation_purpose,
+                        "newly created by this run",
+                        "submitted",
+                    )
             except Exception:
+                main_sr_name = getattr(main_sr, "name", None)
+                _record_inventory_trigger(
+                    inbound_flow_diagnostics,
+                    "43",
+                    "Main FBA Stock Reconciliation insertion or submission failed",
+                    main_sr_name or "<not assigned>",
+                )
+                _upsert_inventory_document(
+                    inbound_flow_diagnostics,
+                    "Stock Reconciliation",
+                    main_sr_name,
+                    main_reconciliation_purpose,
+                    "newly created by this run",
+                    "submission failed" if main_sr_inserted else "insertion failed",
+                    source_warehouses=[wh],
+                    target_warehouse=wh,
+                    movement_quantity=abs(
+                        main_reconciliation_metrics["total_increase_qty"]
+                    ) + abs(main_reconciliation_metrics["total_decrease_qty"]),
+                    affected_item_count=len({
+                        row["item_code"] for row in items_list
+                    }),
+                    reconciliation_metrics=main_reconciliation_metrics,
+                )
                 frappe.log_error(
                     frappe.get_traceback(),
                     "Fulfillable Stock Reconciliation Error",
@@ -3339,7 +4087,13 @@ def process_fba_inventory():
             inbound_flow_diagnostics,
         )
 
-    except Exception:
+    except Exception as exc:
+        _record_inventory_trigger(
+            inbound_flow_diagnostics,
+            "47",
+            "An unhandled inventory-processing exception occurred",
+            type(exc).__name__,
+        )
         frappe.log_error(frappe.get_traceback(), "FBA Inventory Process Error")
         raise
     finally:
