@@ -2752,12 +2752,6 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             continue
 
         diagnostics["drafts_attempted"] += 1
-        _record_inventory_trigger(
-            diagnostics,
-            "29",
-            "A Finished Goods-to-Prep transfer was requested or attempted",
-            draft_name,
-        )
         _upsert_inventory_document(
             diagnostics,
             "Stock Entry",
@@ -2796,12 +2790,6 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             diagnostics["drafts_submitted_verified"] += 1
             diagnostics["submitted_finished_to_prep_qty"] += sum(
                 draft_quantities.values()
-            )
-            _record_inventory_trigger(
-                diagnostics,
-                "30",
-                "An eligible pre-existing draft Stock Entry was submitted and completed",
-                draft_name,
             )
             _upsert_inventory_document(
                 diagnostics,
@@ -3593,12 +3581,6 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             reconcile_items,
             inbound_reconciliation_current_quantities,
         )
-        if inbound_reconciliation_metrics["quantity_changed"]:
-            _record_inventory_trigger(
-                diagnostics,
-                "42",
-                "An Inbound Stock Reconciliation changes at least one quantity",
-            )
         try:  # ADDED: Wrap for error logging
             inbound_sr = frappe.get_doc({
                 "doctype": "Stock Reconciliation",
@@ -3990,12 +3972,6 @@ def process_fba_inventory():
                 items_list,
                 main_reconciliation_current_quantities,
             )
-            if main_reconciliation_metrics["quantity_changed"]:
-                _record_inventory_trigger(
-                    inbound_flow_diagnostics,
-                    "41",
-                    "A Main FBA Stock Reconciliation changes at least one quantity",
-                )
             try:
                 main_sr = frappe.get_doc({
                     "doctype": "Stock Reconciliation",
