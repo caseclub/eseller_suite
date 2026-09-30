@@ -52,6 +52,16 @@ FINISHED_GOODS_WAREHOUSE = "Finished Goods Post Production - CC"
 MAX_INBOUND_FLOW_EXAMPLES_PER_GROUP = 10
 MAX_INBOUND_FLOW_EXAMPLES_TOTAL = 50
 MAX_DOCUMENT_NAMES_PER_GROUP = 10
+INBOUND_DEBT_LOOKBACK_DAYS = 5
+INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS = 10
+INBOUND_DEBT_TIMEZONE = "America/Los_Angeles"
+INBOUND_DEBT_WINDOW_START_SECONDS = 6 * 60 * 60
+INBOUND_DEBT_WINDOW_END_SECONDS = 8 * 60 * 60
+INBOUND_DEBT_QTY_TOLERANCE = 1e-6
+INBOUND_DEBT_SOURCE_FIELD = "custom_amazon_inbound_debt_source_id"
+INBOUND_DEBT_LOCK_KEY = "amazon_fba_historical_inbound_debt_cleanup"
+INBOUND_DEBT_LOCK_TIMEOUT_SECONDS = 60 * 60
+MAX_INBOUND_DEBT_FAILURE_EXAMPLES = 10
 
 
 def _sp_response_data(response):
@@ -1322,6 +1332,31 @@ def _new_inbound_flow_diagnostics(asin_inbound, settings):
         "global_errors": [],
         "events": [],
         "items": {},
+        "historical_debt": {
+            "status": "not run",
+            "lock_status": "not attempted",
+            "context_original_count": 0,
+            "actionable_original_count": 0,
+            "actionable_bucket_count": 0,
+            "original_debt_qty": 0,
+            "linked_repayment_qty": 0,
+            "manual_reduction_credit_qty": 0,
+            "remaining_before_new_repayment_qty": 0,
+            "second_pass_drafts_inspected": 0,
+            "second_pass_drafts_eligible": 0,
+            "second_pass_drafts_submitted": 0,
+            "second_pass_draft_qty": 0,
+            "second_pass_draft_ids": [],
+            "repayment_documents_created": 0,
+            "repayment_document_ids": [],
+            "prep_repayment_qty": 0,
+            "finished_goods_repayment_qty": 0,
+            "verified_repayment_qty": 0,
+            "remaining_after_new_repayment_qty": 0,
+            "actionable_original_ids": [],
+            "manual_reconciliation_ids": [],
+            "failure_examples": [],
+        },
     }
 
 
@@ -1363,6 +1398,7 @@ def _upsert_inventory_document(
     movement_quantity=None,
     affected_item_count=None,
     reconciliation_metrics=None,
+    extra_details=None,
 ):
     """Register an inventory document once and update its final known state."""
     if diagnostics is None:
@@ -1414,6 +1450,8 @@ def _upsert_inventory_document(
             record["affected_item_count"] = int(affected_item_count or 0)
         if reconciliation_metrics is not None:
             record.update(reconciliation_metrics)
+        if extra_details:
+            record.update(extra_details)
     except Exception:
         return
 
@@ -1826,6 +1864,36 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                         f"{bool(record.get('quantity_changed'))}",
                     ]
                 )
+            if record.get("debt_source_reconciliation_id"):
+                lines.extend(
+                    [
+                        f"  Historical Inbound debt source ID: "
+                        f"{record['debt_source_reconciliation_id']}",
+                        f"  Historical debt quantity removed from Prep: "
+                        f"{record.get('debt_prep_qty', 0)}",
+                        f"  Historical debt quantity removed from Finished Goods: "
+                        f"{record.get('debt_finished_qty', 0)}",
+                        f"  Total verified historical debt repayment: "
+                        f"{record.get('debt_verified_qty', 0)}",
+                        f"  Remaining debt for referenced reconciliation: "
+                        f"{record.get('debt_remaining_qty', 0)}",
+                        "  Relevant submitted Finished Goods-to-Prep Stock Entries: "
+                        + (
+                            ", ".join(record.get("debt_relevant_draft_ids") or [])
+                            or "<none>"
+                        ),
+                        "  Credited manual blank-ID reconciliations: "
+                        + (
+                            ", ".join(record.get("debt_manual_offsets") or [])
+                            or "<none>"
+                        ),
+                    ]
+                )
+            if record.get("debt_source_reconciliation_ids"):
+                lines.append(
+                    "  Related historical Inbound debt source IDs: "
+                    + ", ".join(record["debt_source_reconciliation_ids"])
+                )
 
         lines.extend(
             [
@@ -2096,6 +2164,76 @@ def _log_temporary_consolidated_fallbacks_and_failures(
         else:
             lines.append("- <none>")
 
+        debt = flow.get("historical_debt") or {}
+        lines.extend(
+            [
+                "",
+                "HISTORICAL SYNTHETIC INBOUND DEBT REPAYMENT SUMMARY",
+                "Summary totals are complete and are not truncated.",
+                f"Phase status: {debt.get('status', 'not run')}",
+                f"Distributed lock status: "
+                f"{debt.get('lock_status', 'not attempted')}",
+                f"Original reconciliations inspected as attribution context: "
+                f"{debt.get('context_original_count', 0)}",
+                f"Actionable original reconciliation count: "
+                f"{debt.get('actionable_original_count', 0)}",
+                f"Actionable debt bucket count: "
+                f"{debt.get('actionable_bucket_count', 0)}",
+                f"Original actionable positive Inbound debt quantity: "
+                f"{debt.get('original_debt_qty', 0)}",
+                f"Previously verified linked repayment quantity: "
+                f"{debt.get('linked_repayment_qty', 0)}",
+                f"Credited manual blank-ID source reduction quantity: "
+                f"{debt.get('manual_reduction_credit_qty', 0)}",
+                f"Remaining actionable debt before this run's repayment: "
+                f"{debt.get('remaining_before_new_repayment_qty', 0)}",
+                f"Second-pass draft Stock Entries inspected: "
+                f"{debt.get('second_pass_drafts_inspected', 0)}",
+                f"Second-pass draft Stock Entries found eligible: "
+                f"{debt.get('second_pass_drafts_eligible', 0)}",
+                f"Second-pass draft Stock Entries submitted and verified: "
+                f"{debt.get('second_pass_drafts_submitted', 0)}",
+                f"Second-pass Finished Goods-to-Prep quantity submitted: "
+                f"{debt.get('second_pass_draft_qty', 0)}",
+                "Second-pass submitted draft IDs: "
+                + (
+                    ", ".join(debt.get("second_pass_draft_ids") or [])
+                    or "<none>"
+                ),
+                f"Historical debt repayment reconciliations created: "
+                f"{debt.get('repayment_documents_created', 0)}",
+                "Historical debt repayment reconciliation IDs: "
+                + (
+                    ", ".join(debt.get("repayment_document_ids") or [])
+                    or "<none>"
+                ),
+                f"Verified historical debt removed from Prep: "
+                f"{debt.get('prep_repayment_qty', 0)}",
+                f"Verified historical debt removed from Finished Goods: "
+                f"{debt.get('finished_goods_repayment_qty', 0)}",
+                f"Total verified historical debt repayment: "
+                f"{debt.get('verified_repayment_qty', 0)}",
+                f"Remaining actionable debt after this run's repayment: "
+                f"{debt.get('remaining_after_new_repayment_qty', 0)}",
+                "Actionable original reconciliation IDs: "
+                + (
+                    ", ".join(debt.get("actionable_original_ids") or [])
+                    or "<none>"
+                ),
+                "Manual blank-ID reconciliation IDs credited: "
+                + (
+                    ", ".join(debt.get("manual_reconciliation_ids") or [])
+                    or "<none>"
+                ),
+                "Bounded failure examples:",
+            ]
+        )
+        debt_failure_examples = debt.get("failure_examples") or []
+        if debt_failure_examples:
+            lines.extend(f"- {example}" for example in debt_failure_examples)
+        else:
+            lines.append("- <none>")
+
         lines.extend(
             [
                 "",
@@ -2287,6 +2425,399 @@ def _eligible_finished_to_prep_draft(
     return any(row.item_code in needed_item_codes for row in stock_entry.items)
 
 
+def _historical_debt_details(diagnostics):
+    return diagnostics.setdefault("historical_debt", {})
+
+
+def _record_historical_debt_failure(
+    diagnostics,
+    code,
+    summary,
+    identifier=None,
+    detail=None,
+):
+    """Record a grouped trigger plus only a bounded set of useful examples."""
+    _record_inventory_trigger(diagnostics, code, summary)
+    if diagnostics is None:
+        return
+    try:
+        debt = _historical_debt_details(diagnostics)
+        examples = debt.setdefault("failure_examples", [])
+        if len(examples) >= MAX_INBOUND_DEBT_FAILURE_EXAMPLES:
+            return
+        text = str(identifier or summary)
+        if detail:
+            text += ": " + str(detail)
+        if text not in examples:
+            examples.append(text)
+    except Exception:
+        return
+
+
+def _inbound_debt_local_datetime(value):
+    """Interpret Frappe's naive creation value in the site timezone."""
+    value = frappe.utils.get_datetime(value)
+    if value.tzinfo is None:
+        value = value.replace(
+            tzinfo=ZoneInfo(frappe.utils.get_system_timezone())
+        )
+    return value.astimezone(ZoneInfo(INBOUND_DEBT_TIMEZONE))
+
+
+def _inbound_debt_system_naive(local_value):
+    system_tz = ZoneInfo(frappe.utils.get_system_timezone())
+    return local_value.astimezone(system_tz).replace(tzinfo=None)
+
+
+def _inbound_debt_creation_in_window(local_creation, today, days):
+    age_days = (today - local_creation.date()).days
+    seconds = (
+        local_creation.hour * 60 * 60
+        + local_creation.minute * 60
+        + local_creation.second
+    )
+    return (
+        1 <= age_days <= days
+        and INBOUND_DEBT_WINDOW_START_SECONDS
+        <= seconds
+        < INBOUND_DEBT_WINDOW_END_SECONDS
+    )
+
+
+def _stock_ledger_rows(
+    voucher_names,
+    warehouses,
+    quantity_operator,
+    quantity_value,
+):
+    if not voucher_names:
+        return []
+    return frappe.get_all(
+        "Stock Ledger Entry",
+        filters=[
+            ["voucher_type", "=", "Stock Reconciliation"],
+            ["voucher_no", "in", sorted(set(voucher_names))],
+            ["warehouse", "in", sorted(set(warehouses))],
+            ["is_cancelled", "=", 0],
+            ["actual_qty", quantity_operator, quantity_value],
+        ],
+        fields=[
+            "name",
+            "voucher_no",
+            "item_code",
+            "warehouse",
+            "actual_qty",
+            "creation",
+        ],
+        order_by="creation asc, name asc",
+    )
+
+
+def _discover_historical_inbound_debt(company, inbound_wh, prep_wh):
+    """Reconstruct original debt, linked repayments, and manual FIFO credits."""
+    debt_tz = ZoneInfo(INBOUND_DEBT_TIMEZONE)
+    now_local = datetime.now(debt_tz)
+    today = now_local.date()
+    context_start_local = datetime.combine(
+        today - timedelta(days=INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS),
+        datetime.min.time(),
+        tzinfo=debt_tz,
+    )
+    today_start_local = datetime.combine(
+        today,
+        datetime.min.time(),
+        tzinfo=debt_tz,
+    )
+    context_start = _inbound_debt_system_naive(context_start_local)
+    today_start = _inbound_debt_system_naive(today_start_local)
+    now_system = _inbound_debt_system_naive(now_local)
+
+    original_rows = frappe.get_all(
+        "Stock Reconciliation",
+        filters=[
+            ["docstatus", "=", 1],
+            ["company", "=", company],
+            ["creation", ">=", context_start],
+            ["creation", "<", today_start],
+        ],
+        fields=["name", "creation"],
+        order_by="creation asc, name asc",
+    )
+    originals = {}
+    for row in original_rows:
+        local_creation = _inbound_debt_local_datetime(row.creation)
+        if not _inbound_debt_creation_in_window(
+            local_creation,
+            today,
+            INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS,
+        ):
+            continue
+        originals[row.name] = {
+            "name": row.name,
+            "created_at": local_creation,
+        }
+
+    original_sles = _stock_ledger_rows(
+        originals,
+        [inbound_wh],
+        ">",
+        INBOUND_DEBT_QTY_TOLERANCE,
+    )
+    buckets = {}
+    for sle in original_sles:
+        key = (sle.voucher_no, sle.item_code)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "source_id": sle.voucher_no,
+                "item_code": sle.item_code,
+                "created_at": originals[sle.voucher_no]["created_at"],
+                "original_qty": 0.0,
+                "linked_repayment_qty": 0.0,
+                "manual_reduction_qty": 0.0,
+                "remaining_qty": 0.0,
+                "linked_documents": defaultdict(float),
+                "manual_documents": defaultdict(float),
+                "overpaid": False,
+                "actionable": False,
+            },
+        )
+        bucket["original_qty"] += float(sle.actual_qty or 0)
+
+    source_ids = sorted({key[0] for key in buckets})
+    submitted_linked_rows = []
+    draft_linked_rows = []
+    if source_ids:
+        linked_fields = ["name", "creation", INBOUND_DEBT_SOURCE_FIELD]
+        linked_filters = [
+            [INBOUND_DEBT_SOURCE_FIELD, "in", source_ids],
+            ["company", "=", company],
+        ]
+        submitted_linked_rows = frappe.get_all(
+            "Stock Reconciliation",
+            filters=linked_filters + [["docstatus", "=", 1]],
+            fields=linked_fields,
+            order_by="creation asc, name asc",
+        )
+        draft_linked_rows = frappe.get_all(
+            "Stock Reconciliation",
+            filters=linked_filters + [["docstatus", "=", 0]],
+            fields=linked_fields,
+            order_by="creation asc, name asc",
+        )
+
+    linked_by_name = {row.name: row for row in submitted_linked_rows}
+    linked_sles = _stock_ledger_rows(
+        linked_by_name,
+        [prep_wh, FINISHED_GOODS_WAREHOUSE],
+        "<",
+        -INBOUND_DEBT_QTY_TOLERANCE,
+    )
+    linked_events = {}
+    for sle in linked_sles:
+        linked_doc = linked_by_name[sle.voucher_no]
+        source_id = linked_doc.get(INBOUND_DEBT_SOURCE_FIELD)
+        key = (sle.voucher_no, source_id, sle.item_code)
+        event = linked_events.setdefault(
+            key,
+            {
+                "kind": "linked",
+                "document_id": sle.voucher_no,
+                "source_id": source_id,
+                "item_code": sle.item_code,
+                "quantity": 0.0,
+                "event_at": _inbound_debt_local_datetime(
+                    sle.creation or linked_doc.creation
+                ),
+            },
+        )
+        event["quantity"] += abs(float(sle.actual_qty or 0))
+        event["event_at"] = min(
+            event["event_at"],
+            _inbound_debt_local_datetime(sle.creation or linked_doc.creation),
+        )
+
+    manual_sles = frappe.get_all(
+        "Stock Ledger Entry",
+        filters=[
+            ["voucher_type", "=", "Stock Reconciliation"],
+            ["warehouse", "in", [prep_wh, FINISHED_GOODS_WAREHOUSE]],
+            ["is_cancelled", "=", 0],
+            ["actual_qty", "<", -INBOUND_DEBT_QTY_TOLERANCE],
+            ["creation", ">=", context_start],
+            ["creation", "<=", now_system],
+        ],
+        fields=[
+            "name",
+            "voucher_no",
+            "item_code",
+            "warehouse",
+            "actual_qty",
+            "creation",
+        ],
+        order_by="creation asc, name asc",
+    )
+    manual_voucher_names = sorted({row.voucher_no for row in manual_sles})
+    manual_docs = {}
+    if manual_voucher_names:
+        candidate_manual_docs = frappe.get_all(
+            "Stock Reconciliation",
+            filters=[
+                ["name", "in", manual_voucher_names],
+                ["docstatus", "=", 1],
+                ["company", "=", company],
+            ],
+            fields=["name", "creation", INBOUND_DEBT_SOURCE_FIELD, "owner"],
+        )
+        manual_docs = {
+            row.name: row
+            for row in candidate_manual_docs
+            if not str(row.get(INBOUND_DEBT_SOURCE_FIELD) or "").strip()
+        }
+
+    manual_events = {}
+    for sle in manual_sles:
+        if sle.voucher_no not in manual_docs:
+            continue
+        key = (sle.voucher_no, sle.item_code)
+        event = manual_events.setdefault(
+            key,
+            {
+                "kind": "manual",
+                "document_id": sle.voucher_no,
+                "item_code": sle.item_code,
+                "quantity": 0.0,
+                "event_at": _inbound_debt_local_datetime(sle.creation),
+            },
+        )
+        event["quantity"] += abs(float(sle.actual_qty or 0))
+        event["event_at"] = min(
+            event["event_at"],
+            _inbound_debt_local_datetime(sle.creation),
+        )
+
+    events = list(linked_events.values()) + list(manual_events.values())
+    events.sort(
+        key=lambda event: (
+            event["event_at"],
+            0 if event["kind"] == "linked" else 1,
+            event["document_id"],
+            event["item_code"],
+        )
+    )
+    inconsistencies = []
+    buckets_by_item = defaultdict(list)
+    for bucket in buckets.values():
+        bucket["remaining_qty"] = bucket["original_qty"]
+        buckets_by_item[bucket["item_code"]].append(bucket)
+    for item_buckets in buckets_by_item.values():
+        item_buckets.sort(
+            key=lambda bucket: (bucket["created_at"], bucket["source_id"])
+        )
+
+    for event in events:
+        quantity = event["quantity"]
+        if event["kind"] == "linked":
+            key = (event["source_id"], event["item_code"])
+            bucket = buckets.get(key)
+            if bucket is None:
+                inconsistencies.append(
+                    (
+                        event["document_id"],
+                        f"linked repayment references {event['source_id']} for "
+                        f"item {event['item_code']} with no positive original debt",
+                    )
+                )
+                continue
+            if event["event_at"] <= bucket["created_at"]:
+                bucket["overpaid"] = True
+                inconsistencies.append(
+                    (
+                        event["document_id"],
+                        "linked repayment event is not later than its original debt",
+                    )
+                )
+            available = max(
+                bucket["original_qty"]
+                - bucket["linked_repayment_qty"]
+                - bucket["manual_reduction_qty"],
+                0,
+            )
+            bucket["linked_repayment_qty"] += quantity
+            bucket["linked_documents"][event["document_id"]] += quantity
+            if quantity > available + INBOUND_DEBT_QTY_TOLERANCE:
+                bucket["overpaid"] = True
+                inconsistencies.append(
+                    (
+                        event["document_id"],
+                        f"verified linked repayment for {event['item_code']} "
+                        f"exceeded the then-remaining debt by {quantity - available}",
+                    )
+                )
+            bucket["remaining_qty"] = max(available - quantity, 0)
+            continue
+
+        remaining_manual = quantity
+        for bucket in buckets_by_item.get(event["item_code"], []):
+            if remaining_manual <= INBOUND_DEBT_QTY_TOLERANCE:
+                break
+            age_at_event = (
+                event["event_at"].date() - bucket["created_at"].date()
+            ).days
+            if (
+                event["event_at"] <= bucket["created_at"]
+                or age_at_event < 1
+                or age_at_event > INBOUND_DEBT_LOOKBACK_DAYS
+            ):
+                continue
+            available = max(
+                bucket["original_qty"]
+                - bucket["linked_repayment_qty"]
+                - bucket["manual_reduction_qty"],
+                0,
+            )
+            allocated = min(available, remaining_manual)
+            if allocated <= INBOUND_DEBT_QTY_TOLERANCE:
+                continue
+            bucket["manual_reduction_qty"] += allocated
+            bucket["manual_documents"][event["document_id"]] += allocated
+            bucket["remaining_qty"] = available - allocated
+            remaining_manual -= allocated
+
+    for bucket in buckets.values():
+        calculated_remaining = (
+            bucket["original_qty"]
+            - bucket["linked_repayment_qty"]
+            - bucket["manual_reduction_qty"]
+        )
+        if calculated_remaining < -INBOUND_DEBT_QTY_TOLERANCE:
+            bucket["overpaid"] = True
+        bucket["remaining_qty"] = (
+            0.0
+            if abs(calculated_remaining) <= INBOUND_DEBT_QTY_TOLERANCE
+            else max(calculated_remaining, 0.0)
+        )
+        bucket["actionable"] = _inbound_debt_creation_in_window(
+            bucket["created_at"],
+            today,
+            INBOUND_DEBT_LOOKBACK_DAYS,
+        )
+
+    draft_repayments_by_source = defaultdict(list)
+    for row in draft_linked_rows:
+        draft_repayments_by_source[
+            row.get(INBOUND_DEBT_SOURCE_FIELD)
+        ].append(row.name)
+
+    return {
+        "now_local": now_local,
+        "buckets": buckets,
+        "inconsistencies": inconsistencies,
+        "draft_repayments_by_source": dict(draft_repayments_by_source),
+        "context_original_ids": sorted({bucket["source_id"] for bucket in buckets.values()}),
+    }
+
+
 def _source_valuation_reconciliation_rows(
     item_code,
     source_wh,
@@ -2405,6 +2936,891 @@ def _valid_source_transfer_rows(
         "basic_rate": valuation_rate,
     })
     return rows, requested_qty
+
+
+def _submit_historical_debt_drafts(
+    company,
+    prep_wh,
+    need_map,
+    debt_ids_by_item,
+    diagnostics,
+):
+    """Submit whole relevant Finished Goods-to-Prep drafts before repayment."""
+    debt = _historical_debt_details(diagnostics)
+    blocked_items = set()
+    submitted_by_item = defaultdict(list)
+    if not need_map:
+        return blocked_items, submitted_by_item
+
+    try:
+        draft_rows = frappe.get_all(
+            "Stock Entry",
+            filters={
+                "docstatus": 0,
+                "stock_entry_type": "Material Transfer",
+                "company": company,
+                "posting_date": ["<=", frappe.utils.today()],
+            },
+            fields=["name", "posting_date", "posting_time", "creation"],
+            order_by="posting_date asc, posting_time asc, creation asc, name asc",
+        )
+        debt["second_pass_drafts_inspected"] = len(draft_rows)
+        diagnostics["drafts_inspected"] += len(draft_rows)
+    except Exception as exc:
+        _record_historical_debt_failure(
+            diagnostics,
+            "52",
+            "Historical-debt Finished Goods-to-Prep draft discovery or inspection failed",
+            detail=_concise_inventory_exception(exc),
+        )
+        _record_inbound_flow_global_error(
+            diagnostics,
+            "Historical-debt draft search failed: "
+            + _concise_inventory_exception(exc),
+        )
+        return set(need_map), submitted_by_item
+
+    eligible_drafts = []
+    inspection_failed = False
+    needed_item_codes = {
+        item_code
+        for item_code, quantity in need_map.items()
+        if quantity > INBOUND_DEBT_QTY_TOLERANCE
+    }
+    for draft_row in draft_rows:
+        try:
+            draft = frappe.get_doc("Stock Entry", draft_row.name)
+            if not _eligible_finished_to_prep_draft(
+                draft,
+                needed_item_codes,
+                company,
+                prep_wh,
+            ):
+                continue
+            quantities = _stock_entry_item_quantities(draft)
+            relevant_codes = sorted(set(quantities) & needed_item_codes)
+            eligible_drafts.append((draft.name, relevant_codes))
+            debt["second_pass_drafts_eligible"] += 1
+            diagnostics["drafts_eligible"] += 1
+            related_source_ids = sorted({
+                source_id
+                for item_code in relevant_codes
+                for source_id in debt_ids_by_item.get(item_code, [])
+            })
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft.name,
+                "Complete an existing Finished Goods-to-Prep transfer before "
+                "historical synthetic Inbound debt repayment",
+                "pre-existing draft acted upon by the historical-debt phase",
+                "selected; pending immediate revalidation",
+                source_warehouses=[FINISHED_GOODS_WAREHOUSE],
+                target_warehouse=prep_wh,
+                movement_quantity=sum(quantities.values()),
+                affected_item_count=len(quantities),
+                extra_details={
+                    "debt_source_reconciliation_ids": related_source_ids,
+                },
+            )
+        except Exception as exc:
+            inspection_failed = True
+            _record_historical_debt_failure(
+                diagnostics,
+                "52",
+                "Historical-debt Finished Goods-to-Prep draft discovery or inspection failed",
+                draft_row.name,
+                _concise_inventory_exception(exc),
+            )
+
+    # An unread candidate could itself be relevant. Do not make reductions when
+    # the required second-pass search cannot be proven complete.
+    if inspection_failed:
+        return set(need_map), submitted_by_item
+
+    for draft_name, initially_relevant_codes in eligible_drafts:
+        try:
+            draft = frappe.get_doc("Stock Entry", draft_name)
+            draft.reload()
+            currently_needed = {
+                item_code
+                for item_code, quantity in need_map.items()
+                if quantity > INBOUND_DEBT_QTY_TOLERANCE
+                and item_code not in blocked_items
+            }
+            if not _eligible_finished_to_prep_draft(
+                draft,
+                currently_needed,
+                company,
+                prep_wh,
+            ):
+                raise RuntimeError(
+                    "draft no longer satisfies the existing whole-document "
+                    "Finished Goods-to-Prep eligibility rules"
+                )
+            draft_quantities = _stock_entry_item_quantities(draft)
+            relevant_codes = sorted(set(draft_quantities) & currently_needed)
+            before_quantities = {
+                item_code: (
+                    _read_bin_actual_qty(item_code, FINISHED_GOODS_WAREHOUSE),
+                    _read_bin_actual_qty(item_code, prep_wh),
+                )
+                for item_code in draft_quantities
+            }
+        except Exception as exc:
+            diagnostics["drafts_revalidation_ineligible"] += 1
+            blocked_items.update(initially_relevant_codes)
+            _record_historical_debt_failure(
+                diagnostics,
+                "52",
+                "A historical-debt draft failed immediate whole-document revalidation",
+                draft_name,
+                _concise_inventory_exception(exc),
+            )
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                "Complete an existing Finished Goods-to-Prep transfer before "
+                "historical synthetic Inbound debt repayment",
+                "pre-existing draft acted upon by the historical-debt phase",
+                "revalidation failed; not submitted",
+            )
+            continue
+
+        if DEBUG:
+            diagnostics["drafts_debug_would_submit"] += 1
+            blocked_items.update(relevant_codes)
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                "Complete an existing Finished Goods-to-Prep transfer before "
+                "historical synthetic Inbound debt repayment",
+                "pre-existing draft acted upon by the historical-debt phase",
+                "DEBUG: remained draft; submission not attempted",
+            )
+            _record_inbound_flow_event(
+                diagnostics,
+                "DEBUG-only historical-debt draft submission",
+                reason="Whole existing draft would be submitted before debt repayment",
+                document_name=draft_name,
+                quantity=sum(draft_quantities.values()),
+            )
+            continue
+
+        diagnostics["drafts_attempted"] += 1
+        savepoint_name = "amazon_debt_finished_to_prep_" + re.sub(
+            r"[^A-Za-z0-9_]", "_", draft_name
+        )
+        committed = False
+        try:
+            frappe.db.savepoint(savepoint_name)
+            draft.submit()
+            frappe.db.commit()
+            committed = True
+            draft.reload()
+            if draft.docstatus != 1:
+                raise RuntimeError(
+                    f"committed Stock Entry reloaded with docstatus={draft.docstatus}"
+                )
+            movement_failures = []
+            for item_code, moved_qty in draft_quantities.items():
+                before_finished, before_prep = before_quantities[item_code]
+                after_finished = _read_bin_actual_qty(
+                    item_code, FINISHED_GOODS_WAREHOUSE
+                )
+                after_prep = _read_bin_actual_qty(item_code, prep_wh)
+                if (
+                    after_finished
+                    > before_finished - moved_qty + INBOUND_DEBT_QTY_TOLERANCE
+                    or after_prep
+                    < before_prep + moved_qty - INBOUND_DEBT_QTY_TOLERANCE
+                ):
+                    movement_failures.append(item_code)
+            if movement_failures:
+                raise RuntimeError(
+                    "fresh source quantities did not verify the submitted "
+                    "movement for item(s): " + ", ".join(movement_failures)
+                )
+
+            moved_total = sum(draft_quantities.values())
+            diagnostics["drafts_submitted_verified"] += 1
+            diagnostics["submitted_finished_to_prep_qty"] += moved_total
+            debt["second_pass_drafts_submitted"] += 1
+            debt["second_pass_draft_qty"] += moved_total
+            if draft_name not in debt["second_pass_draft_ids"]:
+                debt["second_pass_draft_ids"].append(draft_name)
+            for item_code in relevant_codes:
+                submitted_by_item[item_code].append(draft_name)
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                "Complete an existing Finished Goods-to-Prep transfer before "
+                "historical synthetic Inbound debt repayment",
+                "pre-existing draft acted upon by the historical-debt phase",
+                "submitted, committed, and movement verified",
+            )
+            _record_inbound_flow_event(
+                diagnostics,
+                "Historical-debt Finished Goods-to-Prep draft submitted and verified",
+                reason=(
+                    "The entire eligible existing draft was submitted before "
+                    "historical debt repayment"
+                ),
+                document_name=draft_name,
+                quantity=moved_total,
+            )
+        except Exception as exc:
+            blocked_items.update(relevant_codes)
+            reason = _concise_inventory_exception(exc)
+            if committed:
+                diagnostics["drafts_committed_unverified"] += 1
+                status = "submitted and committed; movement verification failed"
+            else:
+                diagnostics["drafts_failed_submission"] += 1
+                status = "submission failed"
+                try:
+                    frappe.db.rollback(save_point=savepoint_name)
+                except Exception as rollback_exc:
+                    reason += "; savepoint rollback failed: " + _concise_inventory_exception(
+                        rollback_exc
+                    )
+            _record_historical_debt_failure(
+                diagnostics,
+                "53",
+                "A historical-debt draft submission or movement verification failed",
+                draft_name,
+                reason,
+            )
+            _upsert_inventory_document(
+                diagnostics,
+                "Stock Entry",
+                draft_name,
+                "Complete an existing Finished Goods-to-Prep transfer before "
+                "historical synthetic Inbound debt repayment",
+                "pre-existing draft acted upon by the historical-debt phase",
+                status,
+            )
+            _record_inbound_flow_event(
+                diagnostics,
+                "Historical-debt draft submission or verification failed",
+                reason=reason,
+                document_name=draft_name,
+                quantity=sum(draft_quantities.values()),
+            )
+
+    return blocked_items, submitted_by_item
+
+
+def _historical_debt_bin_data(item_code, warehouse):
+    data = frappe.db.get_value(
+        "Bin",
+        {"item_code": item_code, "warehouse": warehouse},
+        ["actual_qty", "valuation_rate"],
+        as_dict=True,
+    ) or {}
+    return {
+        "actual_qty": float(data.get("actual_qty") or 0),
+        "valuation_rate": float(data.get("valuation_rate") or 0),
+    }
+
+
+def _process_historical_inbound_debt(settings, diagnostics):
+    """Repay recent synthetic Inbound stock after the regular run is complete."""
+    if diagnostics is None:
+        return
+    debt = _historical_debt_details(diagnostics)
+    debt["status"] = "starting"
+    lock = None
+    lock_acquired = False
+    try:
+        cache = getattr(frappe, "cache", None)
+        if callable(cache) and not hasattr(cache, "lock"):
+            cache = cache()
+        if cache is None or not hasattr(cache, "lock"):
+            raise RuntimeError("Frappe cache does not expose a distributed lock")
+        lock = cache.lock(
+            INBOUND_DEBT_LOCK_KEY,
+            timeout=INBOUND_DEBT_LOCK_TIMEOUT_SECONDS,
+            blocking_timeout=0,
+        )
+        lock_acquired = bool(lock.acquire(blocking=False))
+        if not lock_acquired:
+            debt["lock_status"] = "already held; cleanup safely skipped"
+            debt["status"] = "skipped because another cleanup run owns the lock"
+            return
+        debt["lock_status"] = "acquired"
+
+        stock_reconciliation_meta = frappe.get_meta("Stock Reconciliation")
+        if not stock_reconciliation_meta.has_field(INBOUND_DEBT_SOURCE_FIELD):
+            _record_historical_debt_failure(
+                diagnostics,
+                "48",
+                "The required historical Inbound debt source field is absent",
+                INBOUND_DEBT_SOURCE_FIELD,
+            )
+            debt["status"] = "stopped because the required custom field is absent"
+            return
+
+        company = settings.company
+        prep_wh = settings.custom_amazon_fba_staging_area
+        inbound_wh = settings.custom_amazon_inbound_warehouse
+        adjustment_account = settings.custom_amazon_inventory_adjustment_account
+        discovery = _discover_historical_inbound_debt(
+            company,
+            inbound_wh,
+            prep_wh,
+        )
+        buckets = discovery["buckets"]
+        debt["context_original_count"] = len(
+            discovery["context_original_ids"]
+        )
+        actionable_buckets = [
+            bucket for bucket in buckets.values() if bucket["actionable"]
+        ]
+        actionable_source_ids = sorted({
+            bucket["source_id"] for bucket in actionable_buckets
+        })
+        debt["actionable_original_count"] = len(actionable_source_ids)
+        debt["actionable_bucket_count"] = len(actionable_buckets)
+        debt["actionable_original_ids"] = actionable_source_ids
+        debt["original_debt_qty"] = sum(
+            bucket["original_qty"] for bucket in actionable_buckets
+        )
+        debt["linked_repayment_qty"] = sum(
+            bucket["linked_repayment_qty"] for bucket in actionable_buckets
+        )
+        debt["manual_reduction_credit_qty"] = sum(
+            bucket["manual_reduction_qty"] for bucket in actionable_buckets
+        )
+        debt["remaining_before_new_repayment_qty"] = sum(
+            bucket["remaining_qty"] for bucket in actionable_buckets
+        )
+        debt["manual_reconciliation_ids"] = sorted({
+            document_id
+            for bucket in actionable_buckets
+            for document_id in bucket["manual_documents"]
+        })
+
+        for identifier, detail in discovery["inconsistencies"]:
+            source_id = None
+            for bucket in actionable_buckets:
+                if identifier in bucket["linked_documents"]:
+                    source_id = bucket["source_id"]
+                    break
+            if source_id is None and not any(
+                source in detail for source in actionable_source_ids
+            ):
+                continue
+            _record_historical_debt_failure(
+                diagnostics,
+                "50",
+                "Historical debt repayment data is materially inconsistent or overpaid",
+                identifier,
+                detail,
+            )
+
+        blocked_source_ids = set()
+        for source_id, draft_names in sorted(
+            discovery["draft_repayments_by_source"].items()
+        ):
+            if source_id not in actionable_source_ids:
+                continue
+            blocked_source_ids.add(source_id)
+            for draft_name in sorted(draft_names):
+                _record_historical_debt_failure(
+                    diagnostics,
+                    "54",
+                    "An existing draft historical-debt repayment reconciliation requires review",
+                    draft_name,
+                    f"references original reconciliation {source_id}",
+                )
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    draft_name,
+                    "Draft repayment of historical synthetic Amazon FBA Inbound inventory",
+                    "pre-existing draft discovered by the historical-debt phase",
+                    "draft; not counted as repayment and original source blocked",
+                    source_warehouses=[prep_wh, FINISHED_GOODS_WAREHOUSE],
+                    movement_quantity=0,
+                    extra_details={
+                        "debt_source_reconciliation_id": source_id,
+                    },
+                )
+
+        repayable_buckets = [
+            bucket
+            for bucket in actionable_buckets
+            if bucket["remaining_qty"] > INBOUND_DEBT_QTY_TOLERANCE
+            and not bucket["overpaid"]
+            and bucket["source_id"] not in blocked_source_ids
+        ]
+        need_map = defaultdict(float)
+        debt_ids_by_item = defaultdict(list)
+        for bucket in repayable_buckets:
+            need_map[bucket["item_code"]] += bucket["remaining_qty"]
+            if bucket["source_id"] not in debt_ids_by_item[bucket["item_code"]]:
+                debt_ids_by_item[bucket["item_code"]].append(bucket["source_id"])
+
+        blocked_items, submitted_drafts_by_item = (
+            _submit_historical_debt_drafts(
+                company,
+                prep_wh,
+                need_map,
+                debt_ids_by_item,
+                diagnostics,
+            )
+        )
+
+        buckets_by_source = defaultdict(list)
+        for bucket in repayable_buckets:
+            buckets_by_source[bucket["source_id"]].append(bucket)
+        source_order = sorted(
+            buckets_by_source,
+            key=lambda source_id: (
+                min(
+                    bucket["created_at"]
+                    for bucket in buckets_by_source[source_id]
+                ),
+                source_id,
+            ),
+        )
+        batch_serial_reported = set()
+        source_read_reported = set()
+
+        for source_id in source_order:
+            source_buckets = sorted(
+                buckets_by_source[source_id],
+                key=lambda bucket: bucket["item_code"],
+            )
+            rows = []
+            current_quantities = {}
+            allocations = {}
+            bucket_by_item = {}
+
+            # These reads occur after every required draft has been committed and
+            # verified. Re-read again for each original document, oldest first.
+            for bucket in source_buckets:
+                item_code = bucket["item_code"]
+                if item_code in blocked_items:
+                    continue
+                try:
+                    item_flags = frappe.db.get_value(
+                        "Item",
+                        item_code,
+                        ["has_batch_no", "has_serial_no", "valuation_rate"],
+                        as_dict=True,
+                    ) or {}
+                    if item_flags.get("has_batch_no") or item_flags.get("has_serial_no"):
+                        if item_code not in batch_serial_reported:
+                            batch_serial_reported.add(item_code)
+                            _record_historical_debt_failure(
+                                diagnostics,
+                                "55",
+                                "Batch or serial requirements prevent a safe historical-debt repayment row",
+                                item_code,
+                            )
+                        continue
+                    prep_data = _historical_debt_bin_data(item_code, prep_wh)
+                    finished_data = _historical_debt_bin_data(
+                        item_code, FINISHED_GOODS_WAREHOUSE
+                    )
+                except Exception as exc:
+                    if item_code not in source_read_reported:
+                        source_read_reported.add(item_code)
+                        _record_historical_debt_failure(
+                            diagnostics,
+                            "51",
+                            "A historical-debt source quantity could not be read or verified",
+                            item_code,
+                            _concise_inventory_exception(exc),
+                        )
+                    continue
+
+                remaining = bucket["remaining_qty"]
+                prep_repayment = min(
+                    max(prep_data["actual_qty"], 0), remaining
+                )
+                finished_repayment = min(
+                    max(finished_data["actual_qty"], 0),
+                    remaining - prep_repayment,
+                )
+                if (
+                    prep_repayment + finished_repayment
+                    <= INBOUND_DEBT_QTY_TOLERANCE
+                ):
+                    continue
+
+                item_valuation_rate = float(
+                    item_flags.get("valuation_rate") or 0
+                )
+                bucket_by_item[item_code] = bucket
+                for warehouse, warehouse_data, repayment in (
+                    (prep_wh, prep_data, prep_repayment),
+                    (
+                        FINISHED_GOODS_WAREHOUSE,
+                        finished_data,
+                        finished_repayment,
+                    ),
+                ):
+                    if repayment <= INBOUND_DEBT_QTY_TOLERANCE:
+                        continue
+                    target_qty = warehouse_data["actual_qty"] - repayment
+                    if target_qty < -INBOUND_DEBT_QTY_TOLERANCE:
+                        _record_historical_debt_failure(
+                            diagnostics,
+                            "51",
+                            "A historical-debt source quantity could not be read or verified",
+                            item_code,
+                            f"planned {warehouse} target would be {target_qty}",
+                        )
+                        continue
+                    valuation_rate = warehouse_data["valuation_rate"]
+                    if valuation_rate <= 0:
+                        valuation_rate = (
+                            item_valuation_rate
+                            if item_valuation_rate > 0
+                            else 0.01
+                        )
+                    key = (item_code, warehouse)
+                    current_quantities[key] = warehouse_data["actual_qty"]
+                    allocations[key] = repayment
+                    rows.append({
+                        "item_code": item_code,
+                        "warehouse": warehouse,
+                        "qty": max(target_qty, 0),
+                        "valuation_rate": valuation_rate,
+                    })
+
+            if not rows:
+                continue
+
+            # There is exactly one row per item/warehouse, and the combined
+            # allocation for an item is capped at that original bucket's debt.
+            repayment_metrics = _reconciliation_quantity_metrics(
+                rows,
+                current_quantities,
+            )
+            relevant_draft_ids = sorted({
+                draft_name
+                for item_code in bucket_by_item
+                for draft_name in submitted_drafts_by_item.get(item_code, [])
+            })
+            manual_offsets = defaultdict(float)
+            for bucket in source_buckets:
+                for document_id, quantity in bucket["manual_documents"].items():
+                    manual_offsets[document_id] += quantity
+            manual_offset_details = [
+                f"{document_id}: {quantity}"
+                for document_id, quantity in sorted(manual_offsets.items())
+            ]
+            remaining_before = sum(
+                bucket["remaining_qty"] for bucket in source_buckets
+            )
+            planned_prep = sum(
+                quantity
+                for (item_code, warehouse), quantity in allocations.items()
+                if warehouse == prep_wh
+            )
+            planned_finished = sum(
+                quantity
+                for (item_code, warehouse), quantity in allocations.items()
+                if warehouse == FINISHED_GOODS_WAREHOUSE
+            )
+            repayment_purpose = (
+                "Repay historical synthetic Amazon FBA Inbound inventory "
+                f"created by {source_id}"
+            )
+            stale_source_keys = []
+            try:
+                for key, planned_current_quantity in current_quantities.items():
+                    immediate_quantity = _read_bin_actual_qty(key[0], key[1])
+                    if (
+                        abs(immediate_quantity - planned_current_quantity)
+                        > INBOUND_DEBT_QTY_TOLERANCE
+                    ):
+                        stale_source_keys.append(
+                            f"{key[0]}@{key[1]} changed from "
+                            f"{planned_current_quantity} to {immediate_quantity}"
+                        )
+            except Exception as exc:
+                stale_source_keys.append(_concise_inventory_exception(exc))
+            if stale_source_keys:
+                _record_historical_debt_failure(
+                    diagnostics,
+                    "51",
+                    "A historical-debt source quantity could not be read or verified",
+                    source_id,
+                    "; ".join(stale_source_keys),
+                )
+                continue
+
+            repayment_sr = None
+            inserted = False
+            submitted = False
+            committed = False
+            savepoint_name = "amazon_inbound_debt_repayment_" + re.sub(
+                r"[^A-Za-z0-9_]", "_", source_id
+            )
+            try:
+                frappe.db.savepoint(savepoint_name)
+                repayment_sr = frappe.get_doc({
+                    "doctype": "Stock Reconciliation",
+                    "company": company,
+                    "posting_date": frappe.utils.today(),
+                    "purpose": "Stock Reconciliation",
+                    "expense_account": adjustment_account,
+                    INBOUND_DEBT_SOURCE_FIELD: source_id,
+                    "items": rows,
+                })
+                repayment_sr.insert(ignore_permissions=True)
+                inserted = True
+                debt["repayment_documents_created"] += 1
+                if repayment_sr.name not in debt["repayment_document_ids"]:
+                    debt["repayment_document_ids"].append(repayment_sr.name)
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    repayment_sr.name,
+                    repayment_purpose,
+                    "newly created by the historical-debt phase",
+                    "inserted as draft",
+                    source_warehouses=sorted({key[1] for key in allocations}),
+                    movement_quantity=planned_prep + planned_finished,
+                    affected_item_count=len(bucket_by_item),
+                    reconciliation_metrics=repayment_metrics,
+                    extra_details={
+                        "debt_source_reconciliation_id": source_id,
+                        "debt_prep_qty": planned_prep,
+                        "debt_finished_qty": planned_finished,
+                        "debt_verified_qty": 0,
+                        "debt_remaining_qty": remaining_before,
+                        "debt_relevant_draft_ids": relevant_draft_ids,
+                        "debt_manual_offsets": manual_offset_details,
+                    },
+                )
+                if DEBUG:
+                    frappe.db.commit()
+                    committed = True
+                    _upsert_inventory_document(
+                        diagnostics,
+                        "Stock Reconciliation",
+                        repayment_sr.name,
+                        repayment_purpose,
+                        "newly created by the historical-debt phase",
+                        "DEBUG draft; not submitted",
+                    )
+                    _record_inbound_flow_event(
+                        diagnostics,
+                        "DEBUG-only historical-debt repayment draft",
+                        reason="No source quantity was reduced in DEBUG mode",
+                        document_name=repayment_sr.name,
+                        quantity=planned_prep + planned_finished,
+                    )
+                    continue
+
+                repayment_sr.submit()
+                submitted = True
+                frappe.db.commit()
+                committed = True
+                repayment_sr.reload()
+                if repayment_sr.docstatus != 1:
+                    raise RuntimeError(
+                        "committed repayment reconciliation reloaded with "
+                        f"docstatus={repayment_sr.docstatus}"
+                    )
+
+                posted_sles = _stock_ledger_rows(
+                    [repayment_sr.name],
+                    [prep_wh, FINISHED_GOODS_WAREHOUSE],
+                    "<",
+                    -INBOUND_DEBT_QTY_TOLERANCE,
+                )
+                posted_reductions = defaultdict(float)
+                for sle in posted_sles:
+                    posted_reductions[(sle.item_code, sle.warehouse)] += abs(
+                        float(sle.actual_qty or 0)
+                    )
+
+                verification_failures = []
+                unexpected_keys = set(posted_reductions) - set(allocations)
+                if unexpected_keys:
+                    verification_failures.append(
+                        "unexpected negative ledger rows: "
+                        + ", ".join(
+                            f"{item_code}@{warehouse}"
+                            for item_code, warehouse in sorted(unexpected_keys)
+                        )
+                    )
+                for key, planned_quantity in allocations.items():
+                    actual_reduction = posted_reductions.get(key, 0)
+                    if abs(actual_reduction - planned_quantity) > INBOUND_DEBT_QTY_TOLERANCE:
+                        verification_failures.append(
+                            f"{key[0]}@{key[1]} ledger reduction "
+                            f"{actual_reduction} != planned {planned_quantity}"
+                        )
+                    fresh_quantity = _read_bin_actual_qty(key[0], key[1])
+                    observed_reduction = current_quantities[key] - fresh_quantity
+                    if abs(observed_reduction - planned_quantity) > INBOUND_DEBT_QTY_TOLERANCE:
+                        verification_failures.append(
+                            f"{key[0]}@{key[1]} Bin reduction "
+                            f"{observed_reduction} != planned {planned_quantity}"
+                        )
+                if verification_failures:
+                    raise RuntimeError("; ".join(verification_failures))
+
+                verified_prep = sum(
+                    quantity
+                    for (item_code, warehouse), quantity in posted_reductions.items()
+                    if warehouse == prep_wh
+                )
+                verified_finished = sum(
+                    quantity
+                    for (item_code, warehouse), quantity in posted_reductions.items()
+                    if warehouse == FINISHED_GOODS_WAREHOUSE
+                )
+                for item_code, bucket in bucket_by_item.items():
+                    verified_for_item = sum(
+                        posted_reductions.get((item_code, warehouse), 0)
+                        for warehouse in (prep_wh, FINISHED_GOODS_WAREHOUSE)
+                    )
+                    bucket["remaining_qty"] = max(
+                        bucket["remaining_qty"] - verified_for_item,
+                        0,
+                    )
+                remaining_after = sum(
+                    bucket["remaining_qty"] for bucket in source_buckets
+                )
+                debt["prep_repayment_qty"] += verified_prep
+                debt["finished_goods_repayment_qty"] += verified_finished
+                debt["verified_repayment_qty"] += (
+                    verified_prep + verified_finished
+                )
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    repayment_sr.name,
+                    repayment_purpose,
+                    "newly created by the historical-debt phase",
+                    "submitted, committed, and ledger/Bin movement verified",
+                    movement_quantity=verified_prep + verified_finished,
+                    extra_details={
+                        "debt_source_reconciliation_id": source_id,
+                        "debt_prep_qty": verified_prep,
+                        "debt_finished_qty": verified_finished,
+                        "debt_verified_qty": verified_prep + verified_finished,
+                        "debt_remaining_qty": remaining_after,
+                        "debt_relevant_draft_ids": relevant_draft_ids,
+                        "debt_manual_offsets": manual_offset_details,
+                    },
+                )
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Historical synthetic Inbound debt repayment submitted and verified",
+                    reason=f"Repayment references original reconciliation {source_id}",
+                    document_name=repayment_sr.name,
+                    quantity=verified_prep + verified_finished,
+                )
+            except Exception as exc:
+                reason = _concise_inventory_exception(exc)
+                repayment_name = getattr(repayment_sr, "name", None)
+                if committed or submitted:
+                    code = "57"
+                    summary = (
+                        "A submitted historical-debt repayment state or source "
+                        "reduction could not be verified"
+                    )
+                    status = "submitted state or source movement unverified"
+                else:
+                    code = "56"
+                    summary = (
+                        "Historical-debt repayment reconciliation insertion or "
+                        "submission failed"
+                    )
+                    status = "submission failed" if inserted else "insertion failed"
+                    try:
+                        frappe.db.rollback(save_point=savepoint_name)
+                    except Exception as rollback_exc:
+                        reason += "; savepoint rollback failed: " + _concise_inventory_exception(
+                            rollback_exc
+                        )
+                _record_historical_debt_failure(
+                    diagnostics,
+                    code,
+                    summary,
+                    repayment_name or source_id,
+                    reason,
+                )
+                _upsert_inventory_document(
+                    diagnostics,
+                    "Stock Reconciliation",
+                    repayment_name,
+                    repayment_purpose,
+                    "newly created by the historical-debt phase",
+                    status,
+                    source_warehouses=sorted({key[1] for key in allocations}),
+                    movement_quantity=planned_prep + planned_finished,
+                    affected_item_count=len(bucket_by_item),
+                    reconciliation_metrics=repayment_metrics,
+                    extra_details={
+                        "debt_source_reconciliation_id": source_id,
+                        "debt_prep_qty": 0,
+                        "debt_finished_qty": 0,
+                        "debt_verified_qty": 0,
+                        "debt_remaining_qty": remaining_before,
+                        "debt_relevant_draft_ids": relevant_draft_ids,
+                        "debt_manual_offsets": manual_offset_details,
+                    },
+                )
+                _record_inbound_flow_event(
+                    diagnostics,
+                    "Historical synthetic Inbound debt repayment failed or was unverified",
+                    reason=reason,
+                    document_name=repayment_name,
+                    quantity=planned_prep + planned_finished,
+                )
+
+        debt["remaining_after_new_repayment_qty"] = sum(
+            bucket["remaining_qty"] for bucket in actionable_buckets
+        )
+        debt["status"] = (
+            "completed with recorded failures"
+            if debt.get("failure_examples")
+            else "completed"
+        )
+    except Exception as exc:
+        debt["status"] = "stopped by historical-debt phase failure"
+        _record_historical_debt_failure(
+            diagnostics,
+            "49",
+            "Historical Inbound debt discovery or cleanup failed",
+            detail=_concise_inventory_exception(exc),
+        )
+        _record_inbound_flow_global_error(
+            diagnostics,
+            "Historical Inbound debt cleanup failed: "
+            + _concise_inventory_exception(exc),
+        )
+    finally:
+        if lock_acquired and lock is not None:
+            try:
+                if hasattr(lock, "owned") and not lock.owned():
+                    raise RuntimeError(
+                        "distributed lock ownership was lost before cleanup ended"
+                    )
+                lock.release()
+                debt["lock_status"] = "released"
+            except Exception as exc:
+                debt["lock_status"] = "release failed"
+                _record_historical_debt_failure(
+                    diagnostics,
+                    "58",
+                    "The historical-debt distributed lock could not be safely released",
+                    detail=_concise_inventory_exception(exc),
+                )
 
 
 def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
@@ -4059,6 +5475,10 @@ def process_fba_inventory():
 
         process_inbound_inventory(
             final_inbound_by_asin,
+            settings,
+            inbound_flow_diagnostics,
+        )
+        _process_historical_inbound_debt(
             settings,
             inbound_flow_diagnostics,
         )
