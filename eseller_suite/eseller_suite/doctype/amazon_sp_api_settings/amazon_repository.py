@@ -1708,13 +1708,24 @@ class AmazonRepository:
                     so.submit()
                     self._submitted_this_run.add(so.name)
                     is_fulfilled = (channel == "AFN") or mfn_fulfilled
+                    
                     if is_fulfilled:
+                        # Amazon fulfilled the order outside ERPNext stock flow. Persist the
+                        # Sales Order Item delivery quantities too; setting only the parent
+                        # status leaves Bin.reserved_qty stale because child delivered_qty
+                        # remains zero.
                         for d in so.items:
-                            d.delivered_qty = d.qty
-                        so.per_delivered = 100
-                        so.db_set("status", "Completed")
-                        so.db_set("delivery_date", nowdate())
-                        so.db_update()
+                            d.db_set("delivered_qty", d.qty, update_modified=False)
+
+                        so.db_set("per_delivered", 100, update_modified=False)
+                        so.db_set("status", "Completed", update_modified=False)
+                        so.db_set("delivery_date", nowdate(), update_modified=False)
+
+                        # Recalculate/release SO reservation after the delivered_qty rows are
+                        # actually written to the database.
+                        if hasattr(so, "update_reserved_qty"):
+                            so.update_reserved_qty()
+
                     # Separate postage ownership is only real once the SO economics are final.
                     for service_fee in pending_postage_fees:
                         self._post_mfn_postage_service_fee(so, service_fee)
