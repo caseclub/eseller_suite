@@ -21,7 +21,7 @@ from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_se
     AmazonSPAPISettings,
 )
 from frappe import scrub
-from frappe.utils import getdate, add_days, add_to_date, get_datetime, now_datetime, nowdate, today
+from frappe.utils import getdate, add_days, add_to_date, cint, flt, get_datetime, now_datetime, nowdate, today
 from requests.exceptions import HTTPError
 from requests.exceptions import RequestException
 from erpnext.accounts.party import get_party_account
@@ -869,6 +869,96 @@ class AmazonRepository:
                 order_id, "MFN postage JE failed to post; see Error Log. Sales Order economics unaffected."
             )
 
+    def _so_is_submitted(self, so_name) -> bool:
+        """True only if the Sales Order exists in the DB with docstatus=1."""
+        return bool(so_name) and cint(frappe.db.get_value("Sales Order", so_name, "docstatus")) == 1
+
+    def _mark_amazon_fulfilled_delivered(self, so_name: str, order_id: str) -> bool:
+        """
+        Post-submit, idempotent cleanup for Amazon-fulfilled orders: set delivered_qty=qty,
+        per_delivered=100, status=Completed, then release Bin.reserved_qty.
+
+        Never touches rates/taxes/totals. Runs only after the submit is committed, so a failure
+        here is rolled back on its own and can never undo or be reported as the SO submission.
+        """
+        if not self._so_is_submitted(so_name):
+            return False  # drafts/cancelled/missing SOs are never touched
+
+        # Idempotency: nothing to do once every row is delivered and per_delivered is 100.
+        pending_rows = frappe.db.sql(
+            """SELECT name FROM `tabSales Order Item`
+               WHERE parent=%s
+                 AND parenttype='Sales Order'
+                 AND IFNULL(delivered_qty, 0) < IFNULL(qty, 0)
+               LIMIT 1""",
+            (so_name,),
+        )
+        per_delivered = flt(frappe.db.get_value("Sales Order", so_name, "per_delivered"))
+        if not pending_rows and per_delivered >= 100:
+            return True
+
+        # If a stock-moving DN / update_stock SI exists, ERPNext owns delivered_qty; writing it
+        # here would make that document fail over-delivery validation on submit.
+        stock_doc = frappe.db.sql(
+            """SELECT 1 FROM `tabDelivery Note Item`
+               WHERE against_sales_order=%s AND docstatus < 2 LIMIT 1""",
+            (so_name,),
+        ) or frappe.db.sql(
+            """SELECT 1 FROM `tabSales Invoice Item` sii
+               JOIN `tabSales Invoice` si ON si.name = sii.parent
+               WHERE sii.sales_order=%s AND si.docstatus < 2 AND si.update_stock = 1 LIMIT 1""",
+            (so_name,),
+        )
+        if stock_doc:
+            print(
+                f"[AMZ-SO-CLEANUP] {so_name}/{order_id}: stock-moving DN/SI exists; "
+                "leaving delivered_qty to ERPNext",
+                flush=True,
+            )
+            return False
+
+        frappe.db.savepoint("amz_so_fulfilled_cleanup")
+        try:
+            # Serialize with concurrent hourly/daily/reprocess jobs touching the same SO.
+            frappe.db.sql("SELECT name FROM `tabSales Order` WHERE name=%s FOR UPDATE", (so_name,))
+            so = frappe.get_doc("Sales Order", so_name)  # fresh copy, never the in-flight doc
+            if so.docstatus != 1:
+                frappe.db.rollback(save_point="amz_so_fulfilled_cleanup")
+                return False
+
+            for d in so.items:
+                if flt(d.delivered_qty) < flt(d.qty):
+                    d.db_set("delivered_qty", d.qty, update_modified=False)
+
+            if flt(so.per_delivered) < 100:
+                so.db_set("per_delivered", 100, update_modified=False)
+                so.db_set("delivery_date", nowdate(), update_modified=False)  # first transition only
+
+            # Don't override a manual Closed/On Hold or an already-final status.
+            if so.status not in ("Completed", "Closed", "On Hold"):
+                so.db_set("status", "Completed", update_modified=False)
+
+            # Recompute Bin.reserved_qty from the delivered_qty rows written above.
+            if hasattr(so, "update_reserved_qty"):
+                so.update_reserved_qty()
+
+            frappe.db.commit()
+            return True
+        except Exception:
+            try:
+                frappe.db.rollback(save_point="amz_so_fulfilled_cleanup")
+            except Exception:
+                frappe.db.rollback()  # deadlock already discarded the txn; submit was committed earlier
+            frappe.log_error(
+                title=f"Amazon Fulfilled SO Cleanup {order_id}"[:140],
+                message=f"Sales Order {so_name} IS submitted; only delivered/reserved cleanup failed "
+                        f"(retried on next sync).\n\n{frappe.get_traceback()}",
+                reference_doctype="Sales Order",
+                reference_name=so_name,
+            )
+            frappe.db.commit()  # persist the Error Log only
+            return False
+
     def create_item(self, order_item, order_id) -> str:
         def create_item_group(amazon_item) -> str:
             if not amazon_item:
@@ -1419,6 +1509,13 @@ class AmazonRepository:
                     "repository will not mutate submitted economics",
                     flush=True,
                 )
+            # Retry the idempotent delivered/reserved cleanup if an earlier run failed it.
+            # Touches only delivery fields + Bin, never economics.
+            if so_docstatus == 1 and (
+                channel_hint == "AFN"
+                or (channel_hint == "MFN" and incoming_status in ["Shipped", "InvoiceUnconfirmed"])
+            ):
+                self._mark_amazon_fulfilled_delivered(so_id, order_id)
             return so_id
         if not so_id:
             so = frappe.new_doc("Sales Order")
@@ -1670,7 +1767,9 @@ class AmazonRepository:
         so.flags.ignore_mandatory = True
         so.disable_rounded_total = 1
         so.calculate_taxes_and_totals()
+        saved_ok = False  # submit is only attempted on a successfully saved draft
         if so.grand_total>=0:
+            frappe.db.savepoint("amz_before_so_save")
             try:
                 if channel == "MFN":
                     so.payment_terms_template = ""
@@ -1678,8 +1777,17 @@ class AmazonRepository:
                     if getattr(so, "payment_schedule", None):
                         so.payment_schedule = []
                 so.save(ignore_permissions=True)
-            except Exception as e:
-                frappe.log_error("Error saving Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
+                saved_ok = True
+            except Exception:
+                try:
+                    frappe.db.rollback(save_point="amz_before_so_save")
+                except Exception:
+                    frappe.db.rollback()  # deadlock already discarded the txn
+                frappe.log_error(
+                    title="Error saving Sales Order for Order {0}".format(so.amazon_order_id),
+                    message=frappe.get_traceback(),
+                    reference_doctype="Sales Order",
+                )
 
             order_statuses = [
                 "Shipped",
@@ -1703,35 +1811,48 @@ class AmazonRepository:
                 (channel != "MFN" and (has_taxes or is_replacement_zero))
                 or (channel == "MFN" and mfn_fulfilled and (mfn_finance_ready or is_replacement_zero))
             )
-            if order_status_valid and accounting_ready and transfer_exists:
+            if saved_ok and order_status_valid and accounting_ready and transfer_exists:
+                # Step 1: submit ONLY. This is the sole code that may log "Error submitting".
+                submit_committed = False
+                frappe.db.savepoint("amz_before_so_submit")
                 try:
                     so.submit()
+                    frappe.db.commit()  # make submission durable before any post-submit work
+                    submit_committed = True
+                except Exception:
+                    try:
+                        frappe.db.rollback(save_point="amz_before_so_submit")  # keep the saved draft
+                    except Exception:
+                        frappe.db.rollback()  # deadlock already discarded the txn
+                    frappe.log_error(
+                        title="Error submitting Sales Order for Order {0}".format(so.amazon_order_id),
+                        message=frappe.get_traceback(),
+                        reference_doctype="Sales Order",
+                        reference_name=so.name,
+                    )
+                    frappe.db.commit()  # persist draft save + Error Log
+
+                # Step 2: eligible for SI submission only once the DB confirms docstatus=1.
+                if submit_committed and self._so_is_submitted(so.name):
                     self._submitted_this_run.add(so.name)
-                    is_fulfilled = (channel == "AFN") or mfn_fulfilled
-                    
-                    if is_fulfilled:
-                        # Amazon fulfilled the order outside ERPNext stock flow. Persist the
-                        # Sales Order Item delivery quantities too; setting only the parent
-                        # status leaves Bin.reserved_qty stale because child delivered_qty
-                        # remains zero.
-                        for d in so.items:
-                            d.db_set("delivered_qty", d.qty, update_modified=False)
 
-                        so.db_set("per_delivered", 100, update_modified=False)
-                        so.db_set("status", "Completed", update_modified=False)
-                        so.db_set("delivery_date", nowdate(), update_modified=False)
+                    # Step 3: MFN postage JE (helper is idempotent + savepointed). Own error title.
+                    try:
+                        for service_fee in pending_postage_fees:
+                            self._post_mfn_postage_service_fee(so, service_fee)
+                        frappe.db.commit()
+                    except Exception:
+                        frappe.db.rollback()  # only uncommitted postage work is lost
+                        frappe.log_error(
+                            title=f"Amazon MFN Postage Posting {order_id}"[:140],
+                            message=frappe.get_traceback(),
+                        )
+                        frappe.db.commit()
+                        # enq_si_submit re-checks/re-posts MFN postage before any MFN SI submit.
 
-                        # Recalculate/release SO reservation after the delivered_qty rows are
-                        # actually written to the database.
-                        if hasattr(so, "update_reserved_qty"):
-                            so.update_reserved_qty()
-
-                    # Separate postage ownership is only real once the SO economics are final.
-                    for service_fee in pending_postage_fees:
-                        self._post_mfn_postage_service_fee(so, service_fee)
-                    frappe.db.commit()
-                except Exception as e:
-                    frappe.log_error("Error submitting Sales Order for Order {0}".format(so.amazon_order_id), e, "Sales Order")
+                    # Step 4: Amazon-fulfilled delivered/reserved cleanup (idempotent, own log).
+                    if channel == "AFN" or mfn_fulfilled:
+                        self._mark_amazon_fulfilled_delivered(so.name, order_id)
             elif channel == "MFN" and order_status_valid and transfer_exists:
                 print(
                     f"[AMZ-MFN] Keeping {so.name} Draft for {order_id}: "
@@ -1768,6 +1889,9 @@ class AmazonRepository:
             if not frappe.db.exists('Amazon Failed Sync Record', { 'amazon_order_id':order_id, 'grand_total':so.grand_total, 'remarks':remarks }):
                 failed_sync_record.save(ignore_permissions=True)
 
+        # A failed insert can leave a naming-series name on the doc that was never written.
+        if not so.name or not frappe.db.exists("Sales Order", so.name):
+            return None
         return so.name
 
     def _refresh_recent_mfn_drafts(
@@ -1881,7 +2005,11 @@ class AmazonRepository:
                     so = None
                 time.sleep(1.1)
                 if so:
-                    if channel != "MFN" or so in self._submitted_this_run:
+                    # Eligible only when submitted: MFN must be finalized by this run; AFN may
+                    # also retry draft SIs of SOs submitted earlier, but never drafts/ghosts.
+                    if so in self._submitted_this_run or (
+                        channel != "MFN" and self._so_is_submitted(so)
+                    ):
                         sales_orders.append(so)
 
             if not next_token:
@@ -2045,7 +2173,6 @@ def reprocess_single_draft_order(amz_setting_name: str, sales_order_name: str, a
 def get_order(amz_setting_name, amazon_order_ids) -> list:
     ar = AmazonRepository(amz_setting_name)
     return ar.get_order(amazon_order_ids)
-
 
 
 

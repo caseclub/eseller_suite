@@ -567,6 +567,22 @@ def enq_si_submit(sales_orders=None, amz_setting_name: str | None = None):
         if terminal_reason:
             print(f"[AMZ-SI] {si.name}: terminal review already recorded; skipping", flush=True)
             continue
+
+        # Every linked SO (AFN and MFN, incl. links the lineage JOIN would drop because the SO
+        # row is missing) must be submitted; otherwise ERPNext rejects the SI at submit.
+        linked_sos = sorted({row.sales_order for row in si.items if row.sales_order})
+        unsubmitted_sos = [
+            name for name in linked_sos
+            if cint(frappe.db.get_value("Sales Order", name, "docstatus")) != 1
+        ]
+        if unsubmitted_sos:
+            _record_amazon_invoice_failure(
+                si.name,
+                f"Submission deferred: linked Sales Order(s) not submitted: {unsubmitted_sos}",
+            )
+            frappe.db.commit()
+            continue
+
         source_rows = _amazon_source_sales_orders(si.name)
         source_order_id = None
 
