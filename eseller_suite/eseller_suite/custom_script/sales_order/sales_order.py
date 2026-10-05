@@ -54,6 +54,25 @@ class SalesOrderOverride(SalesOrder):
         # Conditional: Create draft SI only for Amazon orders with amazon_order_id and fulfillment_channel == "AFN"
         if self.amazon_order_id and self.fulfillment_channel == "AFN":
             sales_invoice = make_sales_invoice(source_name=self.name, target_doc=None, ignore_permissions=True)
+
+            # The mapper can leave party fields blank on this customized SO -> SI path.
+            # Without customer, ERPNext tax-withholding validation rejects the invoice.
+            for fieldname in (
+                "customer",
+                "customer_name",
+                "company",
+                "currency",
+                "conversion_rate",
+                "party_account_currency",
+            ):
+                if not sales_invoice.get(fieldname) and self.get(fieldname):
+                    sales_invoice.set(fieldname, self.get(fieldname))
+
+            if not sales_invoice.customer:
+                frappe.throw(f"Cannot create Amazon Sales Invoice because Sales Order {self.name} has no customer")
+
+            sales_invoice.debit_to = get_party_account("Customer", sales_invoice.customer, sales_invoice.company)
+
             # NEW: Temporarily clear customer's payment_terms to prevent inheritance during SI creation
             original_cust_terms = frappe.db.get_value("Customer", self.customer, "payment_terms")
             try:
@@ -198,6 +217,11 @@ def make_sales_invoice(source_name, target_doc=None, ignore_permissions=False):
             "Sales Order": {
                 "doctype": "Sales Invoice",
                 "field_map": {
+                    "customer": "customer",
+                    "customer_name": "customer_name",
+                    "company": "company",
+                    "currency": "currency",
+                    "conversion_rate": "conversion_rate",
                     "party_account_currency": "party_account_currency",
                     "payment_terms_template": "payment_terms_template",
                     "transaction_date": "posting_date",
