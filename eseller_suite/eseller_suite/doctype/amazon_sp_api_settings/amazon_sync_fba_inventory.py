@@ -5,11 +5,19 @@
 # =========================================
 from __future__ import annotations
 import csv
+import base64
 import gzip
 import inspect
 import io
 import json, requests
 import re
+import fcntl
+import hashlib
+import math
+import os
+from pathlib import Path
+import tempfile
+import uuid
 
 from datetime import datetime, timedelta, timezone
 import time
@@ -2360,6 +2368,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                     f"items in this group; {omitted_items} additional items omitted."
                 )
 
+        lines.extend(_transition_report_lines(inbound_flow_diagnostics))
         lines.extend(
             [
                 "",
@@ -3823,6 +3832,693 @@ def _process_historical_inbound_debt(settings, diagnostics):
                 )
 
 
+# The transition ledger is deliberately separate from synthetic Inbound debt.
+# Schema v1: one unresolved quantity lot per row, keyed by ERP item_code.
+# context records company/site/warehouses and protected targets, never report IDs.
+TRANSITION_WINDOW_DAYS = 7
+TRANSITION_QTY_TOLERANCE = 1e-6
+TRANSITION_CSV_NAME = "amazon_fba_transition_window_debt.csv"
+TRANSITION_RELEASE = "INBOUND_RELEASE_WAITING_FOR_MAIN"
+TRANSITION_NEED = "MAIN_INCREASE_WAITING_FOR_INBOUND"
+TRANSITION_FIELDS = (
+    "schema_version", "lot_id", "item_code", "asin", "direction",
+    "first_seen_at", "last_seen_at", "original_quantity", "remaining_quantity",
+    "context",
+)
+
+
+def _transition_quantity(value):
+    quantity = float(value)
+    if not math.isfinite(quantity) or quantity < 0:
+        raise ValueError("Transition quantity must be finite and nonnegative")
+    return 0.0 if quantity <= TRANSITION_QTY_TOLERANCE else quantity
+
+
+def _transition_timestamp(value):
+    result = datetime.fromisoformat(value)
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("Transition timestamps must include a UTC offset")
+    return result.astimezone(ZoneInfo("America/Los_Angeles"))
+
+
+def _transition_age_seconds(lot, now):
+    # UTC elapsed time avoids expiring an hour early across a DST change.
+    return (now.astimezone(timezone.utc) -
+            lot["first_seen_at"].astimezone(timezone.utc)).total_seconds()
+
+
+def _transition_item_blocked(diagnostics, item_code, asin=None):
+    window = (diagnostics or {}).get("_transition_window")
+    return bool(window and (item_code in window.blocked_items or
+                            asin in window.blocked_asins))
+
+
+class _FbaTransitionWindow:
+    """Locked, bounded waiting ledger; fresh protected-target gaps own quantity.
+
+    Only verified documents consume lots FIFO. Disappearing gaps trim newest
+    lots first. The lock spans the regular inventory and historical debt phases;
+    atomic replacement occurs only after their outcomes are known. A committed
+    movement followed by a crash is recovered from fresh Bin gaps on the next
+    run, rather than replaying the CSV as a command or summing daily snapshots.
+    """
+
+    def __init__(self, settings, diagnostics, now=None, path=None):
+        self.settings = settings
+        self.diagnostics = diagnostics
+        self.now = now or datetime.now(ZoneInfo("America/Los_Angeles"))
+        self.path = Path(path) if path is not None else Path(__file__).resolve().parent / TRANSITION_CSV_NAME
+        self.inbound_wh = settings.custom_amazon_inbound_warehouse
+        self.main_wh = settings.afn_warehouse
+        self.scope = {
+            "company": settings.company,
+            "site": str(getattr(getattr(frappe, "local", None), "site", "") or ""),
+            "inbound_warehouse": self.inbound_wh, "main_warehouse": self.main_wh,
+        }
+        self.lots = []
+        self.items = {}
+        self.blocked_items = set()
+        self.blocked_asins = set()
+        self.lock = None
+        self.readable = False
+        self.unsafe_transaction = False
+        self.stats = dict.fromkeys((
+            "same_day_overlap", "historical_overlap", "transferred_quantity",
+            "same_day_matched_quantity", "historical_matched_quantity", "lots_created",
+            "lots_updated", "lots_removed_disappeared", "lots_partially_matched",
+            "lots_fully_matched", "lots_expired", "expired_reconciled_quantity",
+            "rows_retained_after_failure", "csv_read_validation_failures", "csv_write_failures",
+        ), 0)
+        self.stats.update({"csv_filename": self.path.name, "errors": [], "expired_examples": [],
+                           "transfers": [], "status": "not opened"})
+        diagnostics["transition_window"] = self.stats
+        diagnostics["_transition_window"] = self
+
+    def count(self, name, quantity=1):
+        self.stats[name] = self.stats.get(name, 0) + quantity
+
+    def error(self, kind, message, item_code=None):
+        self.count(kind + "_failures")
+        self.count("error_count")
+        if len(self.stats["errors"]) < 10:
+            self.stats["errors"].append(f"{kind}: {item_code or '<run>'}: {message}")
+        _record_inventory_trigger(self.diagnostics, "TW_" + kind,
+                                  "Amazon transition-window " + kind + " failure",
+                                  item_code or kind)
+
+    def open(self):
+        try:
+            # Keep the lock inode; unlinking it permits simultaneous lock owners.
+            fd = os.open(str(self.path.with_suffix(".lock")),
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            self.lock = os.fdopen(fd, "a+")
+            fcntl.flock(self.lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception as exc:
+            self.error("lock", _concise_inventory_exception(exc))
+            if self.lock is not None:
+                self.lock.close()
+                self.lock = None
+            return False
+        try:
+            if self.path.is_symlink():
+                raise ValueError("Refusing a symlink transition CSV")
+            if not self.path.exists():
+                if not DEBUG:
+                    self.save()
+                self.readable = True
+                self.stats["status"] = "new ledger"
+                return True
+            with self.path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle, strict=True)
+                if reader.fieldnames is None:  # A zero-byte file is an empty ledger.
+                    self.readable = True
+                    self.stats["status"] = "empty ledger"
+                    return True
+                if tuple(reader.fieldnames) != TRANSITION_FIELDS:
+                    raise ValueError("Unexpected transition CSV header")
+                seen = set()
+                loaded = []
+                for line, row in enumerate(reader, start=2):
+                    if set(row) != set(TRANSITION_FIELDS) or any(v is None for v in row.values()):
+                        raise ValueError(f"Wrong field count at CSV line {line}")
+                    if row["schema_version"] != "1":
+                        raise ValueError(f"Unsupported schema at CSV line {line}")
+                    if not row["lot_id"] or row["lot_id"] in seen or not row["item_code"].strip():
+                        raise ValueError(f"Missing/duplicate lot or item at CSV line {line}")
+                    seen.add(row["lot_id"])
+                    if row["direction"] not in (TRANSITION_RELEASE, TRANSITION_NEED):
+                        raise ValueError(f"Invalid direction at CSV line {line}")
+                    for key in ("first_seen_at", "last_seen_at"):
+                        row[key] = _transition_timestamp(row[key])
+                    first = row["first_seen_at"].astimezone(timezone.utc)
+                    last = row["last_seen_at"].astimezone(timezone.utc)
+                    if first > last or last > self.now.astimezone(timezone.utc):
+                        raise ValueError(f"Invalid timestamp order at CSV line {line}")
+                    for key in ("original_quantity", "remaining_quantity"):
+                        row[key] = _transition_quantity(row[key])
+                    if (not row["remaining_quantity"] or
+                            row["remaining_quantity"] > row["original_quantity"] + TRANSITION_QTY_TOLERANCE):
+                        raise ValueError(f"Invalid lot balance at CSV line {line}")
+                    context = json.loads(row["context"])
+                    if not isinstance(context, dict) or any(context.get(k) != v for k, v in self.scope.items()):
+                        raise ValueError(f"Ledger company/site/warehouse mismatch at CSV line {line}")
+                    loaded.append(row)
+                self.lots = loaded
+            self.readable = True
+            self.stats["status"] = "loaded"
+        except Exception as exc:
+            # Never overwrite an unreadable ledger, even with header-only output.
+            self.error("csv_read_validation", _concise_inventory_exception(exc))
+            self.stats["status"] = "untrusted; eligible legs held; original file preserved"
+        return True
+
+    def save(self):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="",
+                                             dir=str(self.path.parent), prefix=self.path.name + ".",
+                                             suffix=".tmp", delete=False) as handle:
+                temporary = handle.name
+                writer = csv.DictWriter(handle, fieldnames=TRANSITION_FIELDS, lineterminator="\n")
+                writer.writeheader()
+                for lot in sorted(self.lots, key=lambda r: (r["item_code"], r["direction"],
+                        r["first_seen_at"].astimezone(timezone.utc), r["lot_id"])):
+                    if lot["remaining_quantity"] <= TRANSITION_QTY_TOLERANCE:
+                        continue
+                    row = dict(lot)
+                    for key in ("first_seen_at", "last_seen_at"):
+                        row[key] = row[key].isoformat()
+                    writer.writerow(row)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+            directory_fd = os.open(str(self.path.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
+
+    def item_lots(self, item_code, direction):
+        return sorted((r for r in self.lots if r["item_code"] == item_code and
+                       r["direction"] == direction),
+                      key=lambda r: (r["first_seen_at"].astimezone(timezone.utc), r["lot_id"]))
+
+    def pending(self, item_code, direction):
+        return sum(r["remaining_quantity"] for r in self.item_lots(item_code, direction))
+
+    def context(self, state):
+        return json.dumps(dict(self.scope, protected_main=state["main_target"],
+                               protected_inbound=state["inbound_target"]), sort_keys=True)
+
+    def align(self, state, direction, gap, add=True):
+        """Clamp to current gaps; newest-first cancellation preserves old age."""
+        gap = _transition_quantity(gap)
+        lots = self.item_lots(state["item_code"], direction)
+        excess = max(sum(r["remaining_quantity"] for r in lots) - gap, 0)
+        for lot in reversed(lots):
+            if excess <= TRANSITION_QTY_TOLERANCE:
+                break
+            reduction = min(lot["remaining_quantity"], excess)
+            lot["remaining_quantity"] -= reduction
+            excess -= reduction
+            if lot["remaining_quantity"] <= TRANSITION_QTY_TOLERANCE:
+                self.lots.remove(lot)
+                self.count("lots_removed_disappeared")
+            else:
+                self.count("lots_updated")
+        for lot in self.item_lots(state["item_code"], direction):
+            lot["last_seen_at"] = self.now
+            lot["asin"] = state["asin"]
+            lot["context"] = self.context(state)
+        increased = gap - self.pending(state["item_code"], direction)
+        if add and increased > TRANSITION_QTY_TOLERANCE:
+            self.lots.append({"schema_version": "1", "lot_id": uuid.uuid4().hex,
+                              "item_code": state["item_code"], "asin": state["asin"],
+                              "direction": direction, "first_seen_at": self.now,
+                              "last_seen_at": self.now, "original_quantity": increased,
+                              "remaining_quantity": increased, "context": self.context(state)})
+            self.count("lots_created")
+
+    def consume(self, item_code, direction, quantity, matched=True):
+        for lot in self.item_lots(item_code, direction):
+            if quantity <= TRANSITION_QTY_TOLERANCE:
+                break
+            taken = min(quantity, lot["remaining_quantity"])
+            lot["remaining_quantity"] -= taken
+            quantity -= taken
+            if lot["remaining_quantity"] <= TRANSITION_QTY_TOLERANCE:
+                self.lots.remove(lot)
+                self.count("lots_fully_matched" if matched else "lots_expired")
+            else:
+                self.count("lots_partially_matched" if matched else "lots_updated")
+
+    def fresh(self, state):
+        inbound = _read_bin_actual_qty(state["item_code"], self.inbound_wh)
+        main = _read_bin_actual_qty(state["item_code"], self.main_wh)
+        if not math.isfinite(inbound) or not math.isfinite(main):
+            raise ValueError("Nonfinite ERP warehouse quantity")
+        if inbound < -TRANSITION_QTY_TOLERANCE or main < -TRANSITION_QTY_TOLERANCE:
+            raise ValueError("Negative ERP warehouse balance requires review")
+        return inbound, main, max(inbound - state["inbound_target"], 0), max(state["main_target"] - main, 0)
+
+    def align_fresh(self, state, add=True):
+        values = self.fresh(state)
+        if self.readable:
+            self.align(state, TRANSITION_RELEASE, values[2], add)
+            self.align(state, TRANSITION_NEED, values[3], add)
+        return values
+
+    def fail_item(self, state, kind, exc):
+        self.blocked_items.add(state["item_code"])
+        self.error(kind, _concise_inventory_exception(exc), state["item_code"])
+
+    def outcome_marker(self):
+        scope_hash = hashlib.sha256(json.dumps(self.scope, sort_keys=True).encode()).hexdigest()[:24]
+        return "Amazon FBA transition outcome v1 " + scope_hash + " "
+
+    def lot_caps(self, allocations, directions):
+        # Cumulative remaining balances make replay idempotent even if an old
+        # CSV survived more than one committed action or a failed replacement.
+        caps = {}
+        for item_code, quantity in allocations.items():
+            for direction in directions:
+                remaining = quantity
+                for lot in self.item_lots(item_code, direction):
+                    taken = min(remaining, lot["remaining_quantity"])
+                    if taken <= TRANSITION_QTY_TOLERANCE:
+                        break
+                    caps[lot["lot_id"]] = max(lot["remaining_quantity"] - taken, 0)
+                    remaining -= taken
+        return caps
+
+    def verify_posted(self, doctype, name, expected):
+        document = frappe.get_doc(doctype, name)
+        document.reload()
+        if document.docstatus != 1:
+            raise RuntimeError("Outcome document is not submitted")
+        posted = defaultdict(float)
+        for sle in frappe.get_all("Stock Ledger Entry", filters={
+                "voucher_type": doctype, "voucher_no": name, "is_cancelled": 0},
+                fields=["item_code", "warehouse", "actual_qty"]):
+            delta = float(sle.actual_qty or 0)
+            if not math.isfinite(delta):
+                raise RuntimeError("Nonfinite posted ledger quantity")
+            posted[(sle.item_code, sle.warehouse)] += delta
+        for key in set(expected) | set(posted):
+            if abs(posted.get(key, 0) - expected.get(key, 0)) > TRANSITION_QTY_TOLERANCE:
+                raise RuntimeError(f"Unexpected Stock Ledger movement: {key}")
+
+    def recover_outcomes(self):
+        if not self.lots:
+            return
+        try:
+            oldest = min((r["first_seen_at"] for r in self.lots), key=lambda value: value.astimezone(timezone.utc))
+            comments = frappe.get_all("Comment", filters={"comment_type": "Info",
+                "reference_doctype": ["in", ["Stock Entry", "Stock Reconciliation"]],
+                "content": ["like", self.outcome_marker() + "%"],
+                "creation": [">=", _inbound_debt_system_naive(oldest)]},
+                fields=["reference_doctype", "reference_name", "content"],
+                order_by="creation asc, name asc")
+            by_id = {r["lot_id"]: r for r in self.lots}
+            for comment in comments:
+                payload = json.loads(base64.b64decode(comment.content[len(self.outcome_marker()):], validate=True).decode("utf-8"))
+                caps = payload["lot_remaining_caps"]
+                if not isinstance(caps, dict):
+                    raise ValueError("Invalid recovered lot-cap mapping")
+                relevant = set(caps) & set(by_id)
+                if not relevant:
+                    continue
+                doc = frappe.get_doc(comment.reference_doctype, comment.reference_name)
+                doc.reload()
+                if doc.docstatus == 0:
+                    # Never submit unrelated or interrupted drafts. Normal
+                    # savepoint rollback removes our uncommitted attempts.
+                    continue
+                if doc.docstatus == 2:
+                    continue  # Cancellation is represented by fresh gaps.
+                expected = {}
+                for row in payload["expected"]:
+                    if len(row) != 3 or row[1] not in (self.inbound_wh, self.main_wh):
+                        raise ValueError("Invalid recovered warehouse movement")
+                    key = (row[0], row[1])
+                    delta = float(row[2])
+                    if key in expected or not math.isfinite(delta):
+                        raise ValueError("Invalid recovered quantity movement")
+                    expected[key] = delta
+                self.verify_posted(comment.reference_doctype, comment.reference_name, expected)
+                for lot_id in relevant:
+                    lot = by_id[lot_id]
+                    cap = _transition_quantity(caps[lot_id])
+                    if cap > lot["original_quantity"] + TRANSITION_QTY_TOLERANCE:
+                        raise ValueError("Invalid recovered lot cap")
+                    if cap < lot["remaining_quantity"] - TRANSITION_QTY_TOLERANCE:
+                        lot["remaining_quantity"] = cap
+                        self.count("lots_recovered_after_interruption")
+            self.lots = [r for r in self.lots if r["remaining_quantity"] > TRANSITION_QTY_TOLERANCE]
+        except Exception as exc:
+            # Age cannot be inferred from total Bin changes alone: an old FIFO
+            # lot may already have been transferred/expired before a CSV crash.
+            self.blocked_items.update(r["item_code"] for r in self.lots)
+            self.error("outcome_recovery", _concise_inventory_exception(exc))
+
+    def post_document(self, values, before, expected, purpose, lot_caps=None):
+        """Savepoint before insertion; never cancel a possibly committed movement."""
+        document = None
+        commit_attempted = False
+        savepoint = "fba_transition_" + uuid.uuid4().hex
+        doctype = values["doctype"]
+        try:
+            frappe.db.savepoint(savepoint)
+            document = frappe.get_doc(values)
+            document.insert(ignore_permissions=True)
+            if lot_caps:
+                # Stored in the same ERP transaction as the stock document;
+                # no historical rows or second journal are added to the CSV.
+                payload = {"lot_remaining_caps": lot_caps,
+                           "expected": [[k[0], k[1], v] for k, v in sorted(expected.items())]}
+                frappe.get_doc({"doctype": "Comment", "comment_type": "Info",
+                    "reference_doctype": doctype, "reference_name": document.name,
+                    "content": self.outcome_marker() + base64.b64encode(json.dumps(payload, sort_keys=True).encode("utf-8")).decode("ascii")}).insert(ignore_permissions=True)
+            # Revalidate after insertion too; document hooks can change inventory.
+            for key, baseline in before.items():
+                actual = _read_bin_actual_qty(*key)
+                if not math.isfinite(actual) or abs(actual - baseline) > TRANSITION_QTY_TOLERANCE:
+                    raise RuntimeError(f"Warehouse changed before submit: {key}")
+            document.submit()
+            commit_attempted = True
+            frappe.db.commit()
+            document.reload()
+            if document.docstatus != 1:
+                raise RuntimeError("Submitted document could not be verified")
+            self.verify_posted(doctype, document.name, expected)
+            for key, baseline in before.items():
+                actual = _read_bin_actual_qty(*key)
+                if not math.isfinite(actual) or abs(actual - baseline - expected.get(key, 0)) > TRANSITION_QTY_TOLERANCE:
+                    raise RuntimeError(f"Fresh warehouse movement not verified: {key}")
+            status = "submitted, committed, and ledger/Bin movement verified"
+        except Exception as exc:
+            status = "failed; obligation retained"
+            if commit_attempted:
+                status = "commit attempted; final movement unverified; obligation retained"
+            else:
+                try:
+                    frappe.db.rollback(save_point=savepoint)
+                    status += "; uncommitted document rolled back"
+                except Exception as rollback_exc:
+                    # A lost submit response may already have committed and
+                    # invalidated the savepoint. A full rollback clears only
+                    # uncommitted work; it never cancels that committed stock.
+                    self.error("rollback", _concise_inventory_exception(rollback_exc))
+                    try:
+                        frappe.db.rollback()
+                    except Exception as full_rollback_exc:
+                        self.unsafe_transaction = True
+                        self.error("rollback", _concise_inventory_exception(full_rollback_exc))
+            self.error("document", f"{purpose}: {_concise_inventory_exception(exc)}")
+            return None
+        finally:
+            _upsert_inventory_document(self.diagnostics, doctype, getattr(document, "name", None),
+                purpose, "newly created by the transition-window phase", status,
+                source_warehouses=([self.inbound_wh] if doctype == "Stock Entry"
+                                   else sorted({k[1] for k in before})),
+                target_warehouse=self.main_wh if doctype == "Stock Entry" else None,
+                movement_quantity=(sum(abs(v) for v in expected.values()) /
+                                   (2 if doctype == "Stock Entry" else 1)),
+                affected_item_count=len({k[0] for k in before}),
+                reconciliation_metrics=(_reconciliation_quantity_metrics([
+                    {"item_code": key[0], "warehouse": key[1], "qty": before[key] + delta}
+                    for key, delta in expected.items()], before)
+                    if doctype == "Stock Reconciliation" else None))
+        return document.name
+
+    def transfer_rows(self, state, quantity, before):
+        item_code = state["item_code"]
+        data = _historical_debt_bin_data(item_code, self.inbound_wh)
+        rate = data["valuation_rate"]
+        if not math.isfinite(rate):
+            raise ValueError("Nonfinite source valuation")
+        # Preserve a valid source valuation. Correct only an unusable source rate.
+        if rate <= 0:
+            rate = float(frappe.get_value("Item", item_code, "valuation_rate") or 0.01)
+            if not math.isfinite(rate) or rate <= 0:
+                rate = 0.01
+            corrections = _source_valuation_reconciliation_rows(item_code, self.inbound_wh,
+                before[0], rate, state["has_batch"], state["has_serial"])
+            if not corrections or abs(sum(float(r["qty"]) for r in corrections) - before[0]) > TRANSITION_QTY_TOLERANCE:
+                raise RuntimeError("Source valuation rows do not represent the current quantity")
+            doc_id = self.post_document({"doctype": "Stock Reconciliation", "company": self.settings.company,
+                "posting_date": frappe.utils.today(), "purpose": "Stock Reconciliation",
+                "expense_account": self.settings.custom_amazon_inventory_adjustment_account,
+                "items": corrections}, {(item_code, self.inbound_wh): before[0]},
+                {(item_code, self.inbound_wh): 0},
+                "Correct Inbound source valuation before transition transfer; no quantity change")
+            if not doc_id:
+                raise RuntimeError("Source valuation correction not verified")
+            before = self.fresh(state)
+        rows, represented = _valid_source_transfer_rows(item_code, self.inbound_wh, self.main_wh,
+            quantity, rate, state["has_batch"], state["has_serial"])
+        if represented <= TRANSITION_QTY_TOLERANCE or represented > quantity + TRANSITION_QTY_TOLERANCE:
+            raise RuntimeError("Cannot safely represent transition quantity in batch/serial rows")
+        represented = _transition_quantity(represented)
+        if abs(sum(_transition_quantity(r["qty"]) for r in rows) - represented) > TRANSITION_QTY_TOLERANCE:
+            raise ValueError("Transfer rows do not equal their represented quantity")
+        if not state["uom"]:
+            raise ValueError("Missing stock UOM")
+        for row in rows:
+            row.update({"uom": state["uom"], "stock_uom": state["uom"], "conversion_factor": 1})
+        return rows, represented
+
+    def match(self):
+        rows, allocations, before, expected = [], {}, {}, {}
+        for item_code, state in sorted(self.items.items()):
+            if item_code in self.blocked_items:
+                continue
+            try:
+                fresh = self.align_fresh(state, add=False)
+                overlap = min(fresh[2], fresh[3], max(fresh[0], 0))
+                if overlap <= TRANSITION_QTY_TOLERANCE:
+                    continue
+                historical = min(overlap, max(self.pending(item_code, TRANSITION_RELEASE),
+                                               self.pending(item_code, TRANSITION_NEED)))
+                self.count("historical_overlap", historical)
+                self.count("same_day_overlap", overlap - historical)
+                if DEBUG:
+                    continue
+                item_rows, quantity = self.transfer_rows(state, overlap, fresh)
+                latest = self.fresh(state)
+                if any(abs(latest[i] - fresh[i]) > TRANSITION_QTY_TOLERANCE for i in (0, 1)):
+                    raise RuntimeError("Warehouse quantity changed during transfer preparation")
+                allocations[item_code] = (quantity, min(historical, quantity), overlap)
+                rows.extend(item_rows)
+                before[(item_code, self.inbound_wh)] = fresh[0]
+                before[(item_code, self.main_wh)] = fresh[1]
+                expected[(item_code, self.inbound_wh)] = -quantity
+                expected[(item_code, self.main_wh)] = quantity
+            except Exception as exc:
+                self.fail_item(state, "transfer_preparation", exc)
+        if not rows:
+            return
+        document_id = self.post_document({"doctype": "Stock Entry", "company": self.settings.company,
+            "stock_entry_type": "Material Transfer", "from_warehouse": self.inbound_wh,
+            "to_warehouse": self.main_wh, "posting_date": frappe.utils.today(),
+            "remarks": "Amazon Inbound-to-Main-FBA transition transfer (seven-day matching window)",
+            "items": rows}, before, expected, "Amazon Inbound-to-Main-FBA transition transfer",
+            self.lot_caps({code: data[0] for code, data in allocations.items()},
+                          (TRANSITION_RELEASE, TRANSITION_NEED)))
+        for item_code, (quantity, historical, overlap) in allocations.items():
+            if not document_id:
+                self.blocked_items.add(item_code)
+                continue
+            self.consume(item_code, TRANSITION_RELEASE, quantity)
+            self.consume(item_code, TRANSITION_NEED, quantity)
+            self.count("transferred_quantity", quantity)
+            self.count("historical_matched_quantity", historical)
+            self.count("same_day_matched_quantity", quantity - historical)
+            if quantity < overlap - TRANSITION_QTY_TOLERANCE:
+                self.fail_item(self.items[item_code], "transfer_partial",
+                               RuntimeError("Batch/serial rows covered only part of the overlap"))
+        if document_id:
+            self.stats["transfers"].append({"document_id": document_id,
+                                           "quantity": sum(x[0] for x in allocations.values())})
+
+    def expire(self, direction):
+        rows, allocations, before, expected, examples = [], {}, {}, {}, []
+        warehouse = self.inbound_wh if direction == TRANSITION_RELEASE else self.main_wh
+        for item_code, state in sorted(self.items.items()):
+            if item_code in self.blocked_items:
+                continue
+            try:
+                fresh = self.align_fresh(state)
+                expired = [r for r in self.item_lots(item_code, direction)
+                           if _transition_age_seconds(r, self.now) >= TRANSITION_WINDOW_DAYS * 86400]
+                quantity = sum(r["remaining_quantity"] for r in expired)
+                if quantity <= TRANSITION_QTY_TOLERANCE or DEBUG:
+                    continue
+                current = fresh[0] if direction == TRANSITION_RELEASE else fresh[1]
+                target = current - quantity if direction == TRANSITION_RELEASE else current + quantity
+                if target < -TRANSITION_QTY_TOLERANCE:
+                    raise ValueError("Expiration would create negative inventory")
+                rate = float(frappe.get_value("Item", item_code, "valuation_rate") or 0.01)
+                if not math.isfinite(rate) or rate <= 0:
+                    rate = 0.01
+                rows.append({"item_code": item_code, "warehouse": warehouse,
+                             "qty": max(target, 0), "valuation_rate": rate})
+                allocations[item_code] = quantity
+                before[(item_code, warehouse)] = current
+                expected[(item_code, warehouse)] = target - current
+                examples.extend({"item_code": item_code, "asin": state["asin"],
+                    "first_seen_at": r["first_seen_at"].isoformat(),
+                    "age_days": _transition_age_seconds(r, self.now) / 86400,
+                    "direction": direction, "quantity": r["remaining_quantity"]} for r in expired)
+            except Exception as exc:
+                self.fail_item(state, "expiration_preparation", exc)
+        if not rows:
+            return
+        _record_inventory_trigger(self.diagnostics, "TW_expiration",
+                                  "Seven-day transition-window expiration reconciliation", direction)
+        purpose = "Reconcile expired seven-day Amazon transition remainder: " + direction
+        document_id = self.post_document({"doctype": "Stock Reconciliation", "company": self.settings.company,
+            "posting_date": frappe.utils.today(), "purpose": "Stock Reconciliation",
+            "expense_account": self.settings.custom_amazon_inventory_adjustment_account,
+            "items": rows}, before, expected, purpose,
+            self.lot_caps(allocations, (direction,)))
+        for item_code, quantity in allocations.items():
+            if document_id:
+                self.consume(item_code, direction, quantity, matched=False)
+                self.count("expired_reconciled_quantity", quantity)
+            else:
+                self.blocked_items.add(item_code)
+        for example in examples:
+            example["document_id"] = document_id or "<failed or unverified>"
+            self.count("expired_example_count")
+            if len(self.stats["expired_examples"]) < 10:
+                self.stats["expired_examples"].append(example)
+
+    def prepare(self, main_targets, inbound_targets):
+        effective_main, effective_inbound = dict(main_targets), dict(inbound_targets)
+        targets = sorted(set(main_targets) | set(inbound_targets))
+        mappings = frappe.get_all("Item", filters={"custom_asin": ["in", targets],
+            "disabled": 0, "is_stock_item": 1},
+            fields=["name", "custom_asin", "stock_uom", "has_batch_no", "has_serial_no"])
+        by_asin = defaultdict(list)
+        for row in mappings:
+            by_asin[row.custom_asin].append(row)
+        for asin, matches in sorted(by_asin.items()):
+            if len(matches) != 1 or asin not in main_targets or asin not in inbound_targets:
+                self.blocked_asins.add(asin)
+                self.blocked_items.update(r.name for r in matches)
+                self.error("mapping", "Ambiguous item mapping or missing paired protected target", asin)
+                continue
+            row = matches[0]
+            self.items[row.name] = {"item_code": row.name, "asin": asin,
+                "main_target": _transition_quantity(main_targets[asin]),
+                "inbound_target": _transition_quantity(inbound_targets[asin]),
+                "uom": row.stock_uom, "has_batch": row.has_batch_no, "has_serial": row.has_serial_no}
+        if self.main_wh == self.inbound_wh:
+            raise ValueError("Transition source and target warehouses must differ")
+        # Validate old item-code obligations even when an ASIN has changed.
+        for lot in self.lots:
+            if lot["item_code"] not in self.items:
+                self.blocked_items.add(lot["item_code"])
+                self.error("mapping", "Pending item has no current paired protected target", lot["item_code"])
+        if self.readable:
+            self.recover_outcomes()
+            self.match()
+            # Only genuinely remaining quantities become new lots. Failed
+            # actions retain their pre-action gaps, never a speculative removal.
+            for item_code, state in self.items.items():
+                try:
+                    if item_code not in self.blocked_items:
+                        self.align_fresh(state)
+                    else:
+                        fresh = self.fresh(state)
+                        for direction, gap in ((TRANSITION_RELEASE, fresh[2]), (TRANSITION_NEED, fresh[3])):
+                            # Retain existing obligations after an uncertain submit.
+                            self.align(state, direction, max(gap, self.pending(item_code, direction)))
+                except Exception as exc:
+                    self.fail_item(state, "quantity_read", exc)
+            if self.unsafe_transaction:
+                raise RuntimeError("Transition rollback failed; further stock writes stopped")
+            self.expire(TRANSITION_RELEASE)
+            if self.unsafe_transaction:
+                raise RuntimeError("Transition rollback failed; further stock writes stopped")
+            self.expire(TRANSITION_NEED)
+            if self.unsafe_transaction:
+                raise RuntimeError("Transition rollback failed; further stock writes stopped")
+        for item_code, state in self.items.items():
+            if item_code in self.blocked_items:
+                continue
+            try:
+                fresh = self.align_fresh(state)
+                # All remaining lots are held here: expired ones were either
+                # verified above or the affected item is blocked for retry.
+                release = fresh[2] if not self.readable else self.pending(item_code, TRANSITION_RELEASE)
+                need = fresh[3] if not self.readable else self.pending(item_code, TRANSITION_NEED)
+                effective_main[state["asin"]] = max(state["main_target"] - need, 0)
+                effective_inbound[state["asin"]] = max(state["inbound_target"] + release, 0)
+            except Exception as exc:
+                self.fail_item(state, "quantity_read", exc)
+        return effective_main, effective_inbound
+
+    def finish(self):
+        try:
+            if self.readable and not DEBUG:
+                for item_code, state in self.items.items():
+                    if item_code in self.blocked_items:
+                        continue
+                    try:
+                        self.align_fresh(state)
+                    except Exception as exc:
+                        self.fail_item(state, "final_quantity_read", exc)
+                try:
+                    self.save()
+                except Exception as exc:
+                    self.error("csv_write", _concise_inventory_exception(exc))
+            self.stats["pending_by_direction"] = {
+                direction: {"lots": sum(r["direction"] == direction for r in self.lots),
+                            "quantity": sum(r["remaining_quantity"] for r in self.lots if r["direction"] == direction)}
+                for direction in (TRANSITION_RELEASE, TRANSITION_NEED)}
+            self.stats["oldest_age_days"] = max((_transition_age_seconds(r, self.now) / 86400 for r in self.lots), default=0)
+            overdue = [r for r in self.lots if _transition_age_seconds(r, self.now) >= TRANSITION_WINDOW_DAYS * 86400]
+            self.stats["overdue_lots_retained"] = len(overdue)
+            self.stats["overdue_quantity_retained"] = sum(r["remaining_quantity"] for r in overdue)
+            self.stats["rows_retained_after_failure"] = sum(r["item_code"] in self.blocked_items for r in self.lots)
+            if overdue and not DEBUG:
+                _record_inventory_trigger(self.diagnostics, "TW_overdue",
+                    "Overdue transition obligations retained for safe retry", "overdue")
+        finally:
+            if self.lock is not None:
+                try:
+                    fcntl.flock(self.lock.fileno(), fcntl.LOCK_UN)
+                    self.lock.close()
+                except Exception as exc:
+                    self.error("lock_release", _concise_inventory_exception(exc))
+                self.lock = None
+
+
+def _transition_report_lines(diagnostics):
+    stats = (diagnostics or {}).get("transition_window")
+    if not stats:
+        return []
+    lines = ["", "SEVEN-DAY INBOUND-TO-MAIN-FBA TRANSITION WINDOW",
+             "Expected transfers and unexpired waits do not trigger this report."]
+    for key, value in stats.items():
+        if key not in ("errors", "expired_examples"):
+            lines.append(f"{key}: {value}")
+    lines.extend("Transition error: " + value for value in stats["errors"])
+    lines.extend("Expired transition: " + json.dumps(value, sort_keys=True)
+                 for value in stats["expired_examples"])
+    if stats.get("error_count", 0) > len(stats["errors"]):
+        lines.append("TRUNCATED: first 10 transition errors shown; counters are complete.")
+    if stats.get("expired_example_count", 0) > len(stats["expired_examples"]):
+        lines.append("TRUNCATED: first 10 expired-lot examples shown; quantities are complete.")
+    return lines
+
+
 def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
     prep_wh = settings.custom_amazon_fba_staging_area
     inbound_wh = settings.custom_amazon_inbound_warehouse
@@ -3896,6 +4592,9 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
         item_code = frappe.db.get_value("Item", {"custom_asin": asin, "disabled": 0}, "name")
         if not item_code:
             if DEBUG: print(f"[DEBUG] No matching item_code found for ASIN: {asin}")
+            continue
+
+        if _transition_item_blocked(diagnostics, item_code, asin):
             continue
 
         # ADDED: Skip if not a stock item
@@ -4914,7 +5613,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             )
             continue
         state["final_inbound_qty"] = current_inbound
-        if current_inbound == target_qty:
+        if abs(current_inbound - target_qty) <= TRANSITION_QTY_TOLERANCE:
             if DEBUG: print(f"[DEBUG] Inbound qty matches for {item_code}: {current_inbound} == {target_qty}")
             continue
 
@@ -4973,6 +5672,8 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
         )
     else:
         for row in inbound_zero_candidates:  # already excludes reported ASINs
+            if _transition_item_blocked(diagnostics, row.item_code, row.asin):
+                continue
             item_valuation_rate = frappe.get_value("Item", row.item_code, "valuation_rate") or 0
             item_dict = {
                 "item_code": row.item_code,
@@ -5083,6 +5784,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
 def process_fba_inventory():
     temporary_log_inputs = None
     inbound_flow_diagnostics = None
+    transition_window = None
     try:  # ADDED: High-level wrap for entire function
         repo = AmazonRepository("q3opu7c5ac")
         settings = repo.amz_setting
@@ -5265,6 +5967,16 @@ def process_fba_inventory():
                 "Amazon ASIN Missing From ERP",
             )
 
+        # Hold the local lock through all stock changes and the final CSV save.
+        if inbound_flow_diagnostics is None:
+            inbound_flow_diagnostics = _new_inbound_flow_diagnostics(final_inbound_by_asin, settings)
+        transition_window = _FbaTransitionWindow(settings, inbound_flow_diagnostics)
+        if not transition_window.open():
+            return  # A concurrent run must not use stale effective targets.
+        effective_main_targets, effective_inbound_targets = transition_window.prepare(
+            asin_fulfillable, final_inbound_by_asin
+        )
+
         # All source discovery, mode selection, and target protection is complete.
         # Only now may ERP inventory be mutated.
         company = settings.company
@@ -5275,12 +5987,14 @@ def process_fba_inventory():
             "Set ERP Main FBA quantities to the run's protected Main FBA targets"
         )
 
-        for asin, new_qty in asin_fulfillable.items():
+        for asin, new_qty in effective_main_targets.items():
             item_code = frappe.db.get_value(
                 "Item", {"custom_asin": asin, "disabled": 0}, "name"
             )
             if not item_code:
                 if DEBUG: print(f"[DEBUG] No matching item_code found for ASIN: {asin}")
+                continue
+            if _transition_item_blocked(inbound_flow_diagnostics, item_code, asin):
                 continue
             if not frappe.get_value("Item", item_code, "is_stock_item"):
                 if DEBUG: print(f"[DEBUG] Skipping non-stock item: {item_code}")
@@ -5307,7 +6021,8 @@ def process_fba_inventory():
                     f"[DEBUG] Current qty in Bin: {current_qty} vs "
                     f"New qty: {new_qty} - {item_code}"
                 )
-            if int(current_qty) == new_qty:
+            if (int(current_qty) == new_qty or
+                    abs(float(current_qty or 0) - new_qty) <= TRANSITION_QTY_TOLERANCE):
                 continue
 
             item_valuation_rate = (
@@ -5365,6 +6080,8 @@ def process_fba_inventory():
             )
         else:
             for row in zero_candidates:
+                if _transition_item_blocked(inbound_flow_diagnostics, row.item_code, row.asin):
+                    continue
                 item_valuation_rate = (
                     frappe.get_value("Item", row.item_code, "valuation_rate") or 0
                 )
@@ -5474,7 +6191,7 @@ def process_fba_inventory():
                 raise
 
         process_inbound_inventory(
-            final_inbound_by_asin,
+            effective_inbound_targets,
             settings,
             inbound_flow_diagnostics,
         )
@@ -5493,6 +6210,8 @@ def process_fba_inventory():
         frappe.log_error(frappe.get_traceback(), "FBA Inventory Process Error")
         raise
     finally:
+        if transition_window is not None:
+            transition_window.finish()
         if temporary_log_inputs is not None:
             _log_temporary_consolidated_fallbacks_and_failures(
                 *temporary_log_inputs,
