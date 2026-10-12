@@ -37,7 +37,7 @@ import pytz
 
 # When True all docs are left as drafts and not submitted
 DEBUG = False  # Toggle to False to disable all debug prints. Also set to True to run the progam on demand as opposed to during the set time
-
+DEBUG_LOG = True
 # Belt-and-suspenders guard: if a single sync run would zero out more than this
 # fraction of the Amazon-linked items currently holding stock in a warehouse,
 # treat the API pull as partial/unhealthy and SKIP the zero-out for that warehouse
@@ -1758,7 +1758,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 detail += "; identifiers=" + ", ".join(identifiers)
             add_trigger(code, trigger.get("summary", code) + detail)
 
-        if not trigger_reasons:
+        if not trigger_reasons and not DEBUG_LOG:
             return
 
         mode_counts = defaultdict(int)
