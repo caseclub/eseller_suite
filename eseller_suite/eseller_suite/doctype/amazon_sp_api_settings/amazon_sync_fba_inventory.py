@@ -3835,7 +3835,7 @@ def _process_historical_inbound_debt(settings, diagnostics):
 # The transition ledger is deliberately separate from synthetic Inbound debt.
 # Schema v1: one unresolved quantity lot per row, keyed by ERP item_code.
 # context records company/site/warehouses and protected targets, never report IDs.
-TRANSITION_WINDOW_DAYS = 7
+TRANSITION_WINDOW_DAYS = 14
 TRANSITION_QTY_TOLERANCE = 1e-6
 TRANSITION_CSV_NAME = "amazon_fba_transition_window_debt.csv"
 TRANSITION_RELEASE = "INBOUND_RELEASE_WAITING_FOR_MAIN"
@@ -4325,7 +4325,7 @@ class _FbaTransitionWindow:
         document_id = self.post_document({"doctype": "Stock Entry", "company": self.settings.company,
             "stock_entry_type": "Material Transfer", "from_warehouse": self.inbound_wh,
             "to_warehouse": self.main_wh, "posting_date": frappe.utils.today(),
-            "remarks": "Amazon Inbound-to-Main-FBA transition transfer (seven-day matching window)",
+            "remarks": "Amazon Inbound-to-Main-FBA transition transfer (fourteen-day matching window)",
             "items": rows}, before, expected, "Amazon Inbound-to-Main-FBA transition transfer",
             self.lot_caps({code: data[0] for code, data in allocations.items()},
                           (TRANSITION_RELEASE, TRANSITION_NEED)))
@@ -4379,8 +4379,8 @@ class _FbaTransitionWindow:
         if not rows:
             return
         _record_inventory_trigger(self.diagnostics, "TW_expiration",
-                                  "Seven-day transition-window expiration reconciliation", direction)
-        purpose = "Reconcile expired seven-day Amazon transition remainder: " + direction
+                                  "Fourteen-day transition-window expiration reconciliation", direction)
+        purpose = "Reconcile expired fourteen-day Amazon transition remainder: " + direction
         document_id = self.post_document({"doctype": "Stock Reconciliation", "company": self.settings.company,
             "posting_date": frappe.utils.today(), "purpose": "Stock Reconciliation",
             "expense_account": self.settings.custom_amazon_inventory_adjustment_account,
@@ -4504,7 +4504,7 @@ def _transition_report_lines(diagnostics):
     stats = (diagnostics or {}).get("transition_window")
     if not stats:
         return []
-    lines = ["", "SEVEN-DAY INBOUND-TO-MAIN-FBA TRANSITION WINDOW",
+    lines = ["", "FOURTEEN-DAY INBOUND-TO-MAIN-FBA TRANSITION WINDOW",
              "Expected transfers and unexpired waits do not trigger this report."]
     for key, value in stats.items():
         if key not in ("errors", "expired_examples"):
