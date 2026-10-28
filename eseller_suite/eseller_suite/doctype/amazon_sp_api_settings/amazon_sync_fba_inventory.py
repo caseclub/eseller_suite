@@ -598,6 +598,98 @@ def _api_required_quantity(container, key, field_name, asin):
     return _parse_required_nonnegative_quantity(container.get(key), f"LIVE {field_name}", asin)
 
 
+def _reserved_future_supply_diagnostic_lines(summaries, live_global_error=None):
+    """Read-only LIVE observations; these values never enter stock targets.
+
+    Amazon does not guarantee the optional futureSupplyQuantity fields in its
+    published Inventory Summaries model. Missing/invalid is not observed zero.
+    Duplicate marketplace/SKU views are not summed; show one intact observation
+    with the largest observed reserved value for each distinct NewItem ASIN.
+    """
+    heading = "LIVE RESERVED FUTURE SUPPLY (read-only; NewItem condition only)"
+    if live_global_error:
+        return [heading, "Qualifying distinct ASIN count: unavailable (LIVE pull unavailable/incomplete)",
+                "Reserved future supply / future buyable / inbound: unavailable"]
+
+    def quantity(container, key):
+        if not isinstance(container, dict) or key not in container:
+            return None
+        value = container[key]
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or number < 0 or not number.is_integer():
+            return None
+        return int(number)
+
+    def display(value):
+        return "unavailable" if value is None else str(value)
+
+    observed = {}
+    for summary in summaries:
+        if not isinstance(summary, dict) or summary.get("condition") != "NewItem":
+            continue
+        asin = str(summary.get("asin") or "").strip()
+        if not asin:
+            continue
+        details = summary.get("inventoryDetails")
+        details = details if isinstance(details, dict) else {}
+        future = details.get("futureSupplyQuantity")
+        inbound = [quantity(details, key) for key in (
+            "inboundWorkingQuantity", "inboundShippedQuantity", "inboundReceivingQuantity")]
+        row = {"reserved": quantity(future, "reservedFutureSupplyQuantity"),
+               "buyable": quantity(future, "futureSupplyBuyableQuantity"),
+               "inbound": sum(inbound) if all(v is not None for v in inbound) else None,
+               "sku": str(summary.get("sellerSku") or "unavailable")}
+        observed.setdefault(asin, []).append(row)
+
+    qualifying = {}
+    unavailable = 0
+    partial = 0
+    for asin, rows in observed.items():
+        known = [row for row in rows if row["reserved"] is not None]
+        if not known:
+            unavailable += 1
+        elif len(known) != len(rows):
+            partial += 1
+        positive = [row for row in known if row["reserved"] > 0]
+        if positive:
+            qualifying[asin] = max(positive, key=lambda row: (
+                row["reserved"], row["inbound"] is not None, row["buyable"] is not None,
+                row["sku"]))
+    lines = [heading,
+             f"Total qualifying distinct ASINs with observed reserved future supply > 0: {len(qualifying)}",
+             f"Distinct NewItem ASINs inspected: {len(observed)}; reserved future supply unavailable: {unavailable}; "
+             f"additional ASINs with some unavailable duplicate views: {partial}",
+             "Unavailable fields are not zero; qualifying count includes observed positives only.",
+             "At most 10 examples; duplicate marketplace/SKU views are not summed. "
+             "Each example uses one observation with maximum reserved future supply.",
+             "Inbound = working + shipped + receiving from that same LIVE observation."]
+    sample_asins = sorted(qualifying)[:10]
+    item_codes = {}
+    if sample_asins:
+        try:
+            for item in frappe.get_all("Item", filters={"custom_asin": ["in", sample_asins],
+                    "disabled": 0, "is_stock_item": 1}, fields=["name", "custom_asin"]):
+                item_codes.setdefault(item.custom_asin, []).append(item.name)
+        except Exception:
+            # A diagnostic-only mapping lookup must never stop inventory sync.
+            lines.append("ERP Item mapping lookup unavailable; ASIN/SKU observations retained.")
+    for asin in sample_asins:
+        row = qualifying[asin]
+        items = ", ".join(sorted(set(item_codes.get(asin, [])))) or "unavailable"
+        lines.append(f"- Item={items}; ASIN={asin}; seller SKU={row['sku']}; "
+                     f"inbound={display(row['inbound'])}; "
+                     f"reserved future supply={display(row['reserved'])}; "
+                     f"future buyable={display(row['buyable'])}")
+    if not sample_asins:
+        lines.append("- No observed qualifying examples.")
+    return lines
+
+
 def _build_live_api_snapshots(summaries):
     """Map current Inventory Summaries to explicit per-ASIN C/S/R/F snapshots."""
     snapshots = {}
@@ -1758,7 +1850,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 detail += "; identifiers=" + ", ".join(identifiers)
             add_trigger(code, trigger.get("summary", code) + detail)
 
-        if not trigger_reasons and not DEBUG_LOG:
+        if not trigger_reasons and not DEBUG_LOG and not flow.get("reserved_future_supply_lines"):
             return
 
         mode_counts = defaultdict(int)
@@ -1919,10 +2011,10 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 f"LIVE invalid-ASIN count: {len(live_invalid_asins)}",
                 f"LIVE global error: {live_global_error or '<none>'}",
                 "",
-                "All discovered report candidates "
-                "(complete; formatted with _report_candidate_summary()):",
             ]
         )
+        lines.extend(["", *flow.get("reserved_future_supply_lines", []), "",
+            "All discovered report candidates (complete; formatted with _report_candidate_summary()):"])
         sorted_candidates = sorted(
             report_candidates,
             key=lambda report: (
@@ -4116,35 +4208,246 @@ class _FbaTransitionWindow:
         return caps
 
     def verify_posted(self, doctype, name, expected):
+        """Verify voucher evidence, not today's Bin or assumed SLE semantics.
+
+        ERPNext v15 ordinary reconciliations reset qty_after_transaction and
+        can legitimately store actual_qty=0. Stock Entries remain delta based.
+        Legacy v1 outcome comments are checked against persisted child rows.
+        """
+        if doctype not in ("Stock Entry", "Stock Reconciliation"):
+            raise RuntimeError("Unsupported outcome document type")
         document = frappe.get_doc(doctype, name)
         document.reload()
-        if document.docstatus != 1:
-            raise RuntimeError("Outcome document is not submitted")
-        posted = defaultdict(float)
-        for sle in frappe.get_all("Stock Ledger Entry", filters={
+        if document.docstatus != 1 or document.company != self.settings.company:
+            raise RuntimeError("Outcome document is not submitted in this company")
+        if not expected or any(not math.isfinite(float(v)) for v in expected.values()):
+            raise RuntimeError("Missing or nonfinite expected movement")
+        ledger = frappe.get_all("Stock Ledger Entry", filters={
                 "voucher_type": doctype, "voucher_no": name, "is_cancelled": 0},
-                fields=["item_code", "warehouse", "actual_qty"]):
-            delta = float(sle.actual_qty or 0)
+                fields=["item_code", "warehouse", "actual_qty", "qty_after_transaction",
+                        "voucher_detail_no", "company", "posting_date", "posting_time",
+                        "serial_no", "batch_no", "serial_and_batch_bundle"])
+        if not ledger:
+            raise RuntimeError("Outcome document has no uncancelled Stock Ledger evidence")
+        posted = defaultdict(float)
+        for sle in ledger:
+            if sle.company != document.company:
+                raise RuntimeError("Stock Ledger company does not match outcome document")
+            if sle.actual_qty is None:
+                raise RuntimeError("Missing posted ledger quantity")
+            delta = float(sle.actual_qty)
             if not math.isfinite(delta):
                 raise RuntimeError("Nonfinite posted ledger quantity")
             posted[(sle.item_code, sle.warehouse)] += delta
-        for key in set(expected) | set(posted):
-            if abs(posted.get(key, 0) - expected.get(key, 0)) > TRANSITION_QTY_TOLERANCE:
-                raise RuntimeError(f"Unexpected Stock Ledger movement: {key}")
+        if set(posted) != set(expected):
+            raise RuntimeError("Unexpected Stock Ledger item/warehouse coverage")
+        if doctype == "Stock Entry":
+            for key in expected:
+                if abs(posted[key] - expected[key]) > TRANSITION_QTY_TOLERANCE:
+                    raise RuntimeError(f"Unexpected Stock Ledger movement: {key}")
+            return
+
+        reposts = frappe.get_all("Repost Item Valuation", filters={
+            "voucher_type": doctype, "voucher_no": name, "docstatus": ["!=", 2]},
+            fields=["name", "status"])
+        if any(row.status != "Completed" for row in reposts):
+            raise RuntimeError("Reconciliation repost is not completed; outcome held for retry")
+
+        # Never accept a reconciliation merely because its zero actual_qty
+        # happens to match a zero expected delta. Verify every linked reset.
+        rows = {}
+        for row in document.items:
+            key = (row.item_code, row.warehouse)
+            if not row.name or key in rows or key not in expected:
+                raise RuntimeError("Ambiguous reconciliation child item/warehouse")
+            if any(row.get(field) for field in ("serial_no", "current_serial_no", "batch_no",
+                    "serial_and_batch_bundle", "current_serial_and_batch_bundle")):
+                raise RuntimeError("Serial/batch reconciliation outcome requires manual verification")
+            if row.qty is None or row.current_qty is None:
+                raise RuntimeError("Missing reconciliation target or original quantity")
+            target, baseline = float(row.qty), float(row.current_qty)
+            if not math.isfinite(target) or not math.isfinite(baseline):
+                raise RuntimeError("Nonfinite reconciliation quantity")
+            if abs(target - baseline - expected[key]) > TRANSITION_QTY_TOLERANCE:
+                raise RuntimeError(f"Unexpected reconciliation child movement: {key}")
+            rows[key] = row
+        if set(rows) != set(expected) or len(ledger) != len(rows):
+            raise RuntimeError("Incomplete or ambiguous reconciliation ledger evidence")
+        seen = set()
+        for sle in ledger:
+            key = (sle.item_code, sle.warehouse)
+            row = rows[key]
+            if key in seen or sle.voucher_detail_no != row.name:
+                raise RuntimeError("Reconciliation ledger child linkage does not match")
+            seen.add(key)
+            if any(sle.get(field) for field in ("serial_no", "batch_no", "serial_and_batch_bundle")):
+                raise RuntimeError("Serial/batch ledger cannot prove an ordinary balance reset")
+            if any(value is None or value == "" for value in (
+                    sle.posting_date, sle.posting_time, document.posting_date, document.posting_time)):
+                raise RuntimeError("Missing reconciliation posting timestamp")
+            if (str(sle.posting_date) != str(document.posting_date) or
+                    frappe.utils.get_timedelta(sle.posting_time) !=
+                    frappe.utils.get_timedelta(document.posting_time)):
+                raise RuntimeError("Reconciliation ledger posting timestamp does not match")
+            if sle.qty_after_transaction is None:
+                raise RuntimeError("Missing reconciliation ledger balance")
+            balance = float(sle.qty_after_transaction)
+            if not math.isfinite(balance) or abs(balance - float(row.qty)) > TRANSITION_QTY_TOLERANCE:
+                raise RuntimeError(f"Unexpected reconciliation ledger balance: {key}")
+            # v15 stores zero for ordinary resets. Also allow a persisted delta
+            # only when it independently agrees with the validated child delta.
+            if (abs(float(sle.actual_qty)) > TRANSITION_QTY_TOLERANCE and
+                    abs(float(sle.actual_qty) - expected[key]) > TRANSITION_QTY_TOLERANCE):
+                raise RuntimeError(f"Unexpected reconciliation ledger quantity: {key}")
+
+    def _record_recovery_diagnostics(self, context, failure=None):
+        """Best-effort read-only evidence; never controls recovery or stock writes.
+
+        Failed-voucher observations are a fresh read AFTER the failure, not a
+        replacement for verification evidence and never used to release debt.
+        Every sample is capped at ten; counts and quantity totals cover all rows.
+        """
+        try:
+            def value(row, key):
+                try:
+                    result = row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+                    return "unavailable" if result is None else result
+                except Exception:
+                    return "unavailable"
+
+            def sample(rows, fields):
+                return [{key: value(row, key) for key in fields} for row in rows[:10]]
+
+            counters = {
+                "comments_discovered": context.get("comments_discovered", 0),
+                "comments_checked": context.get("comments_checked", 0),
+                "relevant_outcomes_checked": context.get("outcomes_checked", 0),
+                "outcomes_verified": context.get("outcomes_verified", 0),
+                "recovery_failures": 1 if failure else 0,
+                "comments_unchecked": max(context.get("comments_discovered", 0) - context.get("comments_checked", 0), 0),
+                "verified_outcomes_held_not_applied": context.get("outcomes_verified", 0) if failure else 0,
+                "lots_recovered": context.get("lots_recovered", 0),
+                "recovered_quantity": context.get("recovered_quantity", 0),
+                "held_lots": len(self.lots) if failure else 0,
+                "held_quantity": sum(r["remaining_quantity"] for r in self.lots) if failure else 0,
+            }
+            self.stats["outcome_recovery_counts"] = counters
+            if failure is None:
+                return
+            try:
+                marker_prefix = self.outcome_marker()
+            except Exception:
+                marker_prefix = "unavailable"
+            record = {"stage": context.get("stage", "unavailable"), "failure": str(failure),
+                "debt_disposition": "all current transition lots retained; all their item codes blocked",
+                "csv_action": "no recovery caps applied; existing obligations retained",
+                "blocked_item_count": len({r["item_code"] for r in self.lots}),
+                "blocked_item_examples": sorted({r["item_code"] for r in self.lots})[:10],
+                "marker_prefix": marker_prefix,
+                "observation_timing": "read-only fresh evidence after failure; not used for acceptance",
+                "debt_kind": "transition-window pending lot obligations",
+                "quantity_semantics": "child current_qty=before, qty=target; SLE qty_after_transaction=posted balance; "
+                    "ordinary v15 reconciliation actual_qty may be zero rather than the delta"}
+            comment = context.get("comment")
+            record["comment"] = sample([comment], ("name", "creation", "reference_doctype", "reference_name"))[0]
+            expected = context.get("expected", {})
+            record["expected_movement_count"] = len(expected)
+            record["expected_movement_examples"] = [
+                {"item_code": k[0], "warehouse": k[1], "expected_delta": v}
+                for k, v in list(expected.items())[:10]]
+            payload = context.get("payload")
+            raw_expected = payload.get("expected") if isinstance(payload, dict) else None
+            if isinstance(raw_expected, list):
+                record["marker_expected_row_count"] = len(raw_expected)
+                record["marker_expected_examples"] = [str(row) for row in raw_expected[:10]]
+            else:
+                record["marker_expected_evidence"] = "unavailable or invalid"
+            caps = context.get("caps")
+            record["marker_lot_cap_count"] = len(caps) if isinstance(caps, dict) else "unavailable"
+            relevant = context.get("relevant", set())
+            affected = [r for r in self.lots if r["lot_id"] in relevant] if relevant else list(self.lots)
+            record["lot_selection"] = "marker-related lots" if relevant else "all retained lots; marker association unavailable"
+            record["affected_lot_count"] = len(affected)
+            record["affected_remaining_quantity"] = sum(r["remaining_quantity"] for r in affected)
+            record["lot_examples"] = sample(affected, ("lot_id", "item_code", "asin", "direction",
+                "original_quantity", "remaining_quantity", "first_seen_at", "last_seen_at"))
+            for row in record["lot_examples"]:
+                row["marker_remaining_cap"] = caps.get(row["lot_id"], "unavailable") if isinstance(caps, dict) else "unavailable"
+            try:
+                overdue = [r for r in self.lots if _transition_age_seconds(r, self.now) >= TRANSITION_WINDOW_DAYS * 86400]
+                record["overdue_held_lots"] = len(overdue)
+                record["overdue_held_quantity"] = sum(r["remaining_quantity"] for r in overdue)
+            except Exception:
+                record["overdue_held_lots"] = record["overdue_held_quantity"] = "unavailable"
+            doctype, name = value(comment, "reference_doctype"), value(comment, "reference_name")
+            if doctype != "unavailable" and name != "unavailable":
+                try:
+                    document = frappe.get_doc(doctype, name)
+                    document.reload()
+                    record["voucher"] = sample([document], ("doctype", "name", "docstatus", "company",
+                        "posting_date", "posting_time"))[0]
+                    children = list(document.items)
+                    record["document_child_count"] = len(children)
+                    record["document_child_examples"] = sample(children, ("name", "item_code", "warehouse",
+                        "s_warehouse", "t_warehouse", "current_qty", "qty", "transfer_qty",
+                        "serial_no", "batch_no", "serial_and_batch_bundle"))
+                except Exception as exc:
+                    record["document_evidence"] = "unavailable: " + str(exc)
+                for label, target, filters, fields in (
+                    ("stock_ledger", "Stock Ledger Entry", {"voucher_type": doctype, "voucher_no": name},
+                     ["name", "voucher_detail_no", "item_code", "warehouse", "company", "is_cancelled",
+                      "actual_qty", "qty_after_transaction", "posting_date", "posting_time"]),
+                    ("reposts", "Repost Item Valuation", {"voucher_type": doctype, "voucher_no": name},
+                     ["name", "status", "docstatus", "based_on", "voucher_type", "voucher_no",
+                      "item_code", "warehouse", "posting_date", "posting_time"]),
+                ):
+                    try:
+                        rows = frappe.get_all(target, filters=filters, fields=fields)
+                        record[label + "_count"] = len(rows)
+                        record[label + "_examples"] = sample(rows, fields)
+                    except Exception as exc:
+                        record[label + "_evidence"] = "unavailable: " + str(exc)
+            examples = self.stats.setdefault("outcome_recovery_failure_examples", [])
+            if len(examples) < 10:
+                # Round-trip makes report serialization independent of Frappe
+                # datetime/Decimal types, and prevents retaining live documents.
+                def bounded(value):
+                    if isinstance(value, dict):
+                        return {key: bounded(item) for key, item in value.items()}
+                    if isinstance(value, (list, tuple)):
+                        return [bounded(item) for item in value]
+                    if value is None or isinstance(value, (bool, int, float)):
+                        return value
+                    text = str(value)
+                    return text if len(text) <= 500 else text[:500] + f" [truncated: {len(text) - 500} characters omitted]"
+                examples.append(json.loads(json.dumps(bounded(record), default=str)))
+        except Exception:
+            # Diagnostics must not replace the original failure, mutate lots,
+            # clear the CSV, or make an unverified voucher acceptable.
+            return
 
     def recover_outcomes(self):
         if not self.lots:
             return
+        stage = "discover outcome comments"
+        comments_discovered = comments_checked = outcomes_checked = outcomes_verified = 0
+        lots_recovered = 0
+        recovered_quantity = 0
         try:
             oldest = min((r["first_seen_at"] for r in self.lots), key=lambda value: value.astimezone(timezone.utc))
             comments = frappe.get_all("Comment", filters={"comment_type": "Info",
                 "reference_doctype": ["in", ["Stock Entry", "Stock Reconciliation"]],
                 "content": ["like", self.outcome_marker() + "%"],
                 "creation": [">=", _inbound_debt_system_naive(oldest)]},
-                fields=["reference_doctype", "reference_name", "content"],
+                fields=["name", "creation", "reference_doctype", "reference_name", "content"],
                 order_by="creation asc, name asc")
+            comments_discovered = len(comments)
             by_id = {r["lot_id"]: r for r in self.lots}
+            staged_caps = {}
             for comment in comments:
+                comments_checked += 1
+                expected, relevant, caps, payload = {}, set(), None, None
+                stage = "decode outcome marker and lot-cap mapping"
                 payload = json.loads(base64.b64decode(comment.content[len(self.outcome_marker()):], validate=True).decode("utf-8"))
                 caps = payload["lot_remaining_caps"]
                 if not isinstance(caps, dict):
@@ -4152,6 +4455,8 @@ class _FbaTransitionWindow:
                 relevant = set(caps) & set(by_id)
                 if not relevant:
                     continue
+                outcomes_checked += 1
+                stage = "load outcome voucher and status"
                 doc = frappe.get_doc(comment.reference_doctype, comment.reference_name)
                 doc.reload()
                 if doc.docstatus == 0:
@@ -4160,6 +4465,7 @@ class _FbaTransitionWindow:
                     continue
                 if doc.docstatus == 2:
                     continue  # Cancellation is represented by fresh gaps.
+                stage = "validate marker expected movements"
                 expected = {}
                 for row in payload["expected"]:
                     if len(row) != 3 or row[1] not in (self.inbound_wh, self.main_wh):
@@ -4169,21 +4475,41 @@ class _FbaTransitionWindow:
                     if key in expected or not math.isfinite(delta):
                         raise ValueError("Invalid recovered quantity movement")
                     expected[key] = delta
+                stage = "verify posted voucher (specific check in failure message)"
                 self.verify_posted(comment.reference_doctype, comment.reference_name, expected)
+                outcomes_verified += 1
+                stage = "validate marker lot caps against retained obligations"
                 for lot_id in relevant:
                     lot = by_id[lot_id]
+                    if not any(key[0] == lot["item_code"] for key in expected):
+                        raise ValueError("Recovered lot has no verified item movement")
                     cap = _transition_quantity(caps[lot_id])
                     if cap > lot["original_quantity"] + TRANSITION_QTY_TOLERANCE:
                         raise ValueError("Invalid recovered lot cap")
-                    if cap < lot["remaining_quantity"] - TRANSITION_QTY_TOLERANCE:
-                        lot["remaining_quantity"] = cap
-                        self.count("lots_recovered_after_interruption")
+                    staged_caps[lot_id] = min(staged_caps.get(lot_id, lot["remaining_quantity"]), cap)
+            # Apply only after every relevant outcome and cap has been validated.
+            # A malformed later comment must leave the entire CSV obligation intact.
+            stage = "apply fully verified recovery caps"
+            for lot_id, cap in staged_caps.items():
+                if cap < by_id[lot_id]["remaining_quantity"] - TRANSITION_QTY_TOLERANCE:
+                    lots_recovered += 1
+                    recovered_quantity += by_id[lot_id]["remaining_quantity"] - cap
+                    by_id[lot_id]["remaining_quantity"] = cap
+                    self.count("lots_recovered_after_interruption")
             self.lots = [r for r in self.lots if r["remaining_quantity"] > TRANSITION_QTY_TOLERANCE]
+            try:
+                self._record_recovery_diagnostics(locals())
+            except Exception:
+                pass
         except Exception as exc:
             # Age cannot be inferred from total Bin changes alone: an old FIFO
             # lot may already have been transferred/expired before a CSV crash.
             self.blocked_items.update(r["item_code"] for r in self.lots)
             self.error("outcome_recovery", _concise_inventory_exception(exc))
+            try:
+                self._record_recovery_diagnostics(locals(), failure=exc)
+            except Exception:
+                pass
 
     def post_document(self, values, before, expected, purpose, lot_caps=None):
         """Savepoint before insertion; never cancel a possibly committed movement."""
@@ -4507,7 +4833,7 @@ def _transition_report_lines(diagnostics):
     lines = ["", "FOURTEEN-DAY INBOUND-TO-MAIN-FBA TRANSITION WINDOW",
              "Expected transfers and unexpired waits do not trigger this report."]
     for key, value in stats.items():
-        if key not in ("errors", "expired_examples"):
+        if key not in ("errors", "expired_examples", "outcome_recovery_failure_examples"):
             lines.append(f"{key}: {value}")
     lines.extend("Transition error: " + value for value in stats["errors"])
     lines.extend("Expired transition: " + json.dumps(value, sort_keys=True)
@@ -4516,6 +4842,12 @@ def _transition_report_lines(diagnostics):
         lines.append("TRUNCATED: first 10 transition errors shown; counters are complete.")
     if stats.get("expired_example_count", 0) > len(stats["expired_examples"]):
         lines.append("TRUNCATED: first 10 expired-lot examples shown; quantities are complete.")
+    for example in stats.get("outcome_recovery_failure_examples", []):
+        try:
+            lines.append("Outcome recovery failure evidence (max 10 rows per example; totals complete): "
+                         + json.dumps(example, sort_keys=True, default=str))
+        except Exception:
+            lines.append("Outcome recovery failure evidence: unavailable; original error above remains authoritative.")
     return lines
 
 
@@ -5888,6 +6220,21 @@ def process_fba_inventory():
         except Exception:
             # Temporary diagnostic initialization must not affect inventory.
             inbound_flow_diagnostics = None
+        # Diagnostic-only: never add future supply to targets or transition lots.
+        try:
+            future_supply_lines = _reserved_future_supply_diagnostic_lines(summaries, live_global_error)
+        except Exception as exc:
+            future_supply_lines = ["LIVE RESERVED FUTURE SUPPLY (read-only)",
+                "Diagnostic unavailable: " + _concise_inventory_exception(exc)]
+        if inbound_flow_diagnostics is not None:
+            inbound_flow_diagnostics["reserved_future_supply_lines"] = future_supply_lines
+        else:
+            # Preserve failed diagnostic initialization behavior; do not pass a
+            # partially initialized flow dictionary to inventory-writing phases.
+            try:
+                frappe.log_error("\n".join(future_supply_lines), "FBA Future Supply Diagnostic")
+            except Exception:
+                pass
         temporary_log_inputs = (
             today_source,
             yesterday_source,
