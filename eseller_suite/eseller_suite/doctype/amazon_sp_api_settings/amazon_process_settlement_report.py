@@ -14,6 +14,14 @@ from frappe.utils import flt, add_days, cint, getdate
 from erpnext.accounts.party import get_party_account
 from erpnext.accounts.utils import reconcile_against_document
 from .amazon_repository import _sp_get, AmazonRepository
+from .amazon_afn_fee_accounting import (
+    FEE_ACCOUNTING_SEPARATE,
+    LINE_KIND_SETTLEMENT_REFUND,
+    LINE_KIND_SETTLEMENT_SALE,
+    allocate_fee_credit_for_order as _allocate_afn_fee_credit_for_order,
+    classify_settlement_debit_row as _classify_settlement_debit_row,
+    validate_refund_for_marked_invoice as _validate_refund_for_marked_invoice,
+)
 from requests.exceptions import HTTPError, RequestException
 from urllib.parse import urlencode
 from dateutil.parser import parse as dt_parse
@@ -1240,6 +1248,25 @@ def create_credit_note_for_refund(settings, si_name: str, refund_amount: float, 
                 "cost_center": default_cost_center,
             })
         
+        # Separate-Fee invoices exclude seller fees, so a refund that reverses fees must be
+        # checked against the fee snapshot (and native return rules) before a CN is posted.
+        # Unsupported cases are deferred explicitly; legacy invoices keep the existing flow.
+        if (si.get("custom_amazon_fee_accounting") or "") == FEE_ACCOUNTING_SEPARATE:
+            charges_by_account = defaultdict(float)
+            for tax in cn.taxes:
+                charges_by_account[tax.account_head] += flt(tax.tax_amount)
+            refunded_items = [
+                (item.item_name, flt(item.qty), -flt(item.qty) * flt(item.rate)) for item in cn.items
+            ]
+            refund_ok, refund_reason = _validate_refund_for_marked_invoice(si, dict(charges_by_account), refunded_items)
+            if not refund_ok:
+                _log_error_resilient(
+                    "Amazon Settlement Refund Deferred (Separate Fee JE)",
+                    f"Refund for Amazon order {order_id} against Separate-Fee invoice {si_name} "
+                    f"(report {report_id}) was NOT posted: {refund_reason}",
+                )
+                return None
+
         # Compute totals (no diff check or rounding; rely on report data)
         cn.calculate_taxes_and_totals()
                
@@ -1576,6 +1603,9 @@ def build_je(
                 "party_type": "Customer",
                 "party": ctx.customer,
                 "amazon_order_id": order_id,
+                # Line-kind identifier: lets later allocation tell a negative-sale residual
+                # debit from a refund debit without guessing. Amounts are untouched.
+                "custom_amazon_line_kind": LINE_KIND_SETTLEMENT_SALE,
             }
             stamp_marketplace_fields(
                 base_line, {}, marketplace_name, merchant_order_id,
@@ -1615,6 +1645,7 @@ def build_je(
                     "party_type": "Customer",
                     "party": unref_ctx.customer,
                     "amazon_order_id": order_id,
+                    "custom_amazon_line_kind": LINE_KIND_SETTLEMENT_SALE,
                 }
                 stamp_marketplace_fields(
                     base_line, {}, marketplace_name, merchant_order_id,
@@ -1641,6 +1672,76 @@ def build_je(
             # unreferenced party line instead of over-allocating or dropping it.
             _append_ar_line(ar_lines, base_line, remaining, credit=True)
 
+        # ──────────────────────────────────────────────
+        # Refund pass (restored). Refunds are part of order_net_native, so the residual fee
+        # bucket already excludes them; without an explicit customer DEBIT the voucher was
+        # unbalanced by exactly the refund total and the gap landed in the round-off account.
+        # Each refund becomes a debit AR line referencing this report's Credit Note when the
+        # source invoice exists (bounded by the CN's live outstanding), else an unreferenced
+        # refund-kind debit that late allocation can match once the CN exists.
+        # ──────────────────────────────────────────────
+        for order_id, refund_total_native in refund_totals.items():
+            order_rows = order_groups.get(order_id, [])
+            first_row = order_rows[0] if order_rows else {}
+            marketplace_name = (first_row.get("marketplace-name") or "").strip().lower()
+            merchant_order_id = (first_row.get("merchant-order-id") or "").strip()
+            refund_rows = [
+                r for r in order_rows
+                if (r.get("transaction-type") or "").strip().lower() in REFUND_TYPES
+            ]
+
+            si_row = latest_si_by_order.get(order_id)
+            si_name = si_row.name if si_row else None
+            cn_name = existing_report_cn_by_order.get(order_id)
+            if si_name and refund_rows and not cn_name and refund_total_native > 0:
+                cn_name = create_credit_note_for_refund(
+                    repo.amz_setting, si_name, refund_total_native, post_dt, order_id,
+                    marketplace_name, merchant_order_id, refund_rows, rpt_id,
+                )
+                if cn_name:
+                    existing_report_cn_by_order[order_id] = cn_name
+
+            ctx = resolve_order_receivable_context(
+                repo.amz_setting, order_id, settlement_ccy, cn_name or si_name
+            )
+            base_line = {
+                "account": ctx.account,
+                "exchange_rate": rate,
+                "party_type": "Customer",
+                "party": ctx.customer,
+                "amazon_order_id": order_id,
+                "custom_amazon_line_kind": LINE_KIND_SETTLEMENT_REFUND,
+            }
+            stamp_marketplace_fields(
+                base_line, {}, marketplace_name, merchant_order_id,
+                ctx.fulfillment_channel, is_refund=True,
+            )
+            ccy_ok = (
+                (not ctx.currency or ctx.currency == settlement_ccy)
+                and (not ctx.account_currency or ctx.account_currency == settlement_ccy)
+            )
+            if (cn_name or si_name) and not ccy_ok:
+                unref_ctx = resolve_order_receivable_context(
+                    repo.amz_setting, order_id, settlement_ccy, invoice_name=None
+                )
+                base_line.update({"account": unref_ctx.account, "party": unref_ctx.customer})
+                stamp_marketplace_fields(
+                    base_line, {}, marketplace_name, merchant_order_id,
+                    unref_ctx.fulfillment_channel, is_refund=True,
+                )
+
+            remaining = refund_total_native
+            cn_ctx = get_invoice_receivable_context(cn_name) if cn_name else frappe._dict()
+            if cn_ctx and cn_ctx.docstatus == 1 and cint(cn_ctx.is_return) and ccy_ok and remaining > 0:
+                available = abs(min(flt(cn_ctx.outstanding_amount), 0.0))
+                apply = min(remaining, available)
+                if apply >= 0.01:
+                    ref_line = dict(base_line)
+                    ref_line.update({"reference_type": "Sales Invoice", "reference_name": cn_name})
+                    _append_ar_line(ar_lines, ref_line, apply, credit=False)
+                    remaining = round(remaining - apply, 2)
+            # Any remainder (either sign) stays an unreferenced refund-kind party line.
+            _append_ar_line(ar_lines, base_line, remaining, credit=False)
 
         # ──────────────────────────────────────────────
         # 3) Add reimbursement line if significant (unchanged)
@@ -3160,6 +3261,81 @@ def _post_exact_mfn_financial_event_repair(
         )
         return False
 
+def _pick_refund_debit_line(je_name: str, order_id: str, order_rows: list[dict], rpt_id: str):
+    """
+    First still-unreferenced debit row of this order that is a REFUND debit.
+
+    Negative-sale residual debits (stamped settlement_sale, or legacy rows whose stamped remark
+    ends in ' Order') belong to the separate-fee allocation, never to a Credit Note. A legacy
+    row whose identity cannot be established from its remark or the source report rows is
+    reported as ambiguous instead of being consumed on order id + amount alone.
+    """
+    fields = ["name", "account", "party", "debit_in_account_currency", "idx", "user_remark"]
+    if frappe.get_meta("Journal Entry Account").get_field("custom_amazon_line_kind"):
+        fields.append("custom_amazon_line_kind")
+    rows = frappe.get_all(
+        "Journal Entry Account",
+        filters={
+            "parent": je_name,
+            "amazon_order_id": order_id,
+            "debit_in_account_currency": [">", 0],
+            "reference_type": ["is", "not set"],
+        },
+        fields=fields,
+        order_by="idx asc",
+        parent_doctype="Journal Entry",
+    )
+    for row in rows:
+        row["cheque_no"] = rpt_id   # rows belong to this report's first-pass voucher
+        kind = _classify_settlement_debit_row(row, order_rows, rpt_id)
+        if kind == "refund":
+            return row
+        if kind == "ambiguous":
+            _log_error_resilient(
+                "Amazon Settlement Refund Debit Ambiguous",
+                f"Settlement {rpt_id} row {row.name} (idx {row.idx}, {row.debit_in_account_currency}) for Amazon "
+                f"order {order_id} cannot be identified as a refund debit or a negative-sale debit from its "
+                "remark or the source report rows. It was NOT allocated; review it manually.",
+            )
+    return None
+
+
+def _allocate_separate_fee_orders_in_report(rpt_id: str, repo: AmazonRepository, order_groups: dict) -> None:
+    """Run the separate-fee allocation for every Separate-Fee AFN order present in this report."""
+    order_ids = [oid for oid in order_groups.keys() if _is_canonical_amazon_order_id(oid)]
+    if not order_ids:
+        return
+    if not frappe.get_meta("Sales Order").get_field("custom_amazon_fee_accounting"):
+        return  # fields not installed: no order can be marked
+    marked = frappe.get_all(
+        "Sales Order",
+        filters={
+            "amazon_order_id": ["in", order_ids],
+            "docstatus": 1,
+            "company": repo.amz_setting.company,
+            "custom_amazon_fee_accounting": FEE_ACCOUNTING_SEPARATE,
+        },
+        fields=["name", "amazon_order_id"],
+    )
+    if not marked:
+        return
+    print(f"[SETT] {rpt_id}: {len(marked)} Separate-Fee AFN order(s) in report; allocating fee credit")
+    for row in marked:
+        try:
+            result = _allocate_afn_fee_credit_for_order(
+                row.amazon_order_id, company=repo.amz_setting.company, settings=repo.amz_setting,
+                report_id=rpt_id, report_rows=order_groups.get(row.amazon_order_id),
+            )
+            print(
+                f"[SETT][AFN-FEE] {row.amazon_order_id}: {result.status} "
+                f"invoice={result.get('applied_to_invoice', 0)} settlement={result.get('applied_to_settlement', 0)} "
+                f"{result.reason}"
+            )
+        except Exception:
+            _rollback_for_error()
+            _log_error_resilient(f"Amazon AFN fee allocation {row.amazon_order_id}", frappe.get_traceback())
+
+
 def allocate_late_documents_for_settlement(
     rpt_id: str, repo: AmazonRepository, order_groups: dict, settlement_ccy: str, post_dt: str
 ):
@@ -3290,6 +3466,11 @@ def allocate_late_documents_for_settlement(
         if live_outstanding >= 0.01 and fulfillment_channel == "MFN":
             _post_exact_mfn_financial_event_repair(repo, order_id, si_name, post_dt)
 
+    # Separate-fee AFN orders in this report: apply the fee JE credit to the submitted SI and
+    # then to this order's negative-sale settlement debits (any report). Legacy net-invoice
+    # orders never enter this loop; monetary settlement output above is unchanged.
+    _allocate_separate_fee_orders_in_report(rpt_id, repo, order_groups)
+
     # Refund handling is intentionally preserved: Credit Note creation is independent of whether
     # an old settlement debit is still available for allocation.
     for order_id in refund_candidate_ids:
@@ -3344,18 +3525,7 @@ def allocate_late_documents_for_settlement(
             outstanding = abs(flt(cn.outstanding_amount))
             if outstanding < 0.01:
                 continue
-            line = frappe.db.get_value(
-                "Journal Entry Account",
-                {
-                    "parent": je_name,
-                    "amazon_order_id": order_id,
-                    "debit_in_account_currency": [">", 0],
-                    "reference_type": ["is", "not set"],
-                },
-                ["name", "account", "party", "debit_in_account_currency", "idx"],
-                as_dict=True,
-                order_by="idx asc",
-            )
+            line = _pick_refund_debit_line(je_name, order_id, order_rows, rpt_id)
             if not line:
                 break
 

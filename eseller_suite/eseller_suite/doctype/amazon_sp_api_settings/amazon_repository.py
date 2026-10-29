@@ -20,6 +20,15 @@ from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api im
 from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings import (
     AmazonSPAPISettings,
 )
+# Separate-fee support module only imports frappe/erpnext at load time (no import cycle).
+from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_afn_fee_accounting import (
+    FEE_ACCOUNTING_NET,
+    FEE_ACCOUNTING_SEPARATE,
+    ensure_fee_journal_entry as afn_ensure_fee_journal_entry,
+    is_validated_separate_fee_state as afn_is_validated_separate_fee_state,
+    plan_separate_fee_accounting as afn_plan_separate_fee_accounting,
+    record_review as afn_record_review,
+)
 from frappe import scrub
 from frappe.utils import getdate, add_days, add_to_date, cint, flt, get_datetime, now_datetime, nowdate, today
 from requests.exceptions import HTTPError
@@ -163,6 +172,12 @@ def _to_float(x, default=0.0):
         return float(x)
     except (TypeError, ValueError):
         return default
+
+def _note_currency(summary: dict, currency_code) -> None:
+    """Record a Financial Events CurrencyCode on the summary (deterministic, de-duplicated)."""
+    code = (currency_code or "").strip().upper()
+    if code and code not in summary.setdefault("currencies", []):
+        summary["currencies"].append(code)
 
 # ------------------------------------------------------------------
 # Convert CAD↔USD, MXN↔USD with ERPNext’s built-in exchanger
@@ -506,6 +521,12 @@ class AmazonRepository:
                 "promotion_count": 0,
                 "promotion_total": 0.0,
                 "buyer_charge_total": 0.0,
+                # True only when every Financial Events page was received. The AFN
+                # separate-fee path refuses to freeze a fee snapshot from partial data.
+                "pagination_complete": True,
+                # Every distinct CurrencyCode seen on charges/fees/withheld tax/promotions.
+                # The AFN separate-fee path rejects an order whose components mix currencies.
+                "currencies": [],
             },
         }
         try:
@@ -515,6 +536,7 @@ class AmazonRepository:
                 message=f"SP-API finances fetch failed for {order_id}: {e}",
                 title="Amazon Finances Fetch",
             )
+            empty["financial_event_summary"]["pagination_complete"] = False  # fetch failed, not "no events"
             return empty
 
         if not (
@@ -559,6 +581,7 @@ class AmazonRepository:
                     for charge in charges:
                         charge_type = charge.get("ChargeType")
                         amount = _to_float(charge.get("ChargeAmount", {}).get("CurrencyAmount"), 0.0)
+                        _note_currency(summary, (charge.get("ChargeAmount") or {}).get("CurrencyCode"))
                         if charge_type == "Principal":
                             summary["principal_count"] += 1
                             summary["principal_total"] += amount
@@ -574,11 +597,13 @@ class AmazonRepository:
                             "account_head": self.get_account(charge_type),
                             "tax_amount": amount,
                             "description": f"{charge_type} for {seller_sku if seller_sku else order_id}",
+                            "currency": ((charge.get("ChargeAmount") or {}).get("CurrencyCode") or "").upper(),
                         })
 
                     for fee in fees:
                         fee_type = fee.get("FeeType")
                         amount = _to_float(fee.get("FeeAmount", {}).get("CurrencyAmount"), 0.0)
+                        _note_currency(summary, (fee.get("FeeAmount") or {}).get("CurrencyCode"))
                         if abs(amount) < 0.000001:
                             continue
                         summary["fee_count"] += 1
@@ -588,12 +613,16 @@ class AmazonRepository:
                             "account_head": self.get_account(fee_type),
                             "tax_amount": amount,
                             "description": f"{fee_type} for {seller_sku if seller_sku else order_id}",
+                            "fee_type": fee_type,      # snapshot metadata (not a Sales Taxes field)
+                            "sku": seller_sku,
+                            "currency": ((fee.get("FeeAmount") or {}).get("CurrencyCode") or "").upper(),
                         })
 
                     for tds_group in tds_list:
                         for tds in tds_group.get("TaxesWithheld", []) or []:
                             tds_type = tds.get("ChargeType")
                             amount = _to_float(tds.get("ChargeAmount", {}).get("CurrencyAmount"), 0.0)
+                            _note_currency(summary, (tds.get("ChargeAmount") or {}).get("CurrencyCode"))
                             if abs(amount) < 0.000001:
                                 continue
                             summary["withheld_tax_count"] += 1
@@ -603,10 +632,12 @@ class AmazonRepository:
                                 "account_head": self.get_account(tds_type),
                                 "tax_amount": amount,
                                 "description": f"{tds_type} for {seller_sku if seller_sku else order_id}",
+                                "currency": ((tds.get("ChargeAmount") or {}).get("CurrencyCode") or "").upper(),
                             })
 
                     for promotion in promotion_list:
                         amount = _to_float(promotion.get("PromotionAmount", {}).get("CurrencyAmount"), 0.0)
+                        _note_currency(summary, (promotion.get("PromotionAmount") or {}).get("CurrencyCode"))
                         if abs(amount) < 0.000001:
                             continue
                         summary["promotion_count"] += 1
@@ -619,6 +650,7 @@ class AmazonRepository:
                 for service_fee_item in service_fee.get("FeeList", []) or []:
                     fee_type = service_fee_item.get("FeeType")
                     amount = _to_float(service_fee_item.get("FeeAmount", {}).get("CurrencyAmount"), 0.0)
+                    _note_currency(summary, (service_fee_item.get("FeeAmount") or {}).get("CurrencyCode"))
                     if abs(amount) < 0.000001:
                         continue
                     summary["service_fee_count"] += 1
@@ -628,6 +660,9 @@ class AmazonRepository:
                         "account_head": self.get_account(fee_type),
                         "tax_amount": amount,
                         "description": f"{fee_type} for {order_id}",
+                        "fee_type": fee_type,          # snapshot metadata (not a Sales Taxes field)
+                        "sku": "",
+                        "currency": ((service_fee_item.get("FeeAmount") or {}).get("CurrencyCode") or "").upper(),
                     })
 
             if not next_token:
@@ -640,6 +675,7 @@ class AmazonRepository:
                     f"Amazon Financial Events pagination ended early for {order_id}; "
                     "keeping MFN accounting unfinalized until a later refresh"
                 )
+                summary["pagination_complete"] = False  # AFN separate-fee path also refuses partial data
                 break
 
         for seller_sku, total in principal_totals.items():
@@ -1224,7 +1260,13 @@ class AmazonRepository:
         print("reprocess_draft_orders dispatcher finished (this job is now fast).", flush=True)
         print("Finished reprocess_draft_orders.", flush=True)
 
-    def create_sales_order(self, order) -> str | None:
+    def create_sales_order(self, order, force_rebuild: bool = False) -> str | None:
+        """
+        Create/refresh the Sales Order for one Orders API order object.
+
+        force_rebuild=True is used only by explicit recovery: it bypasses the low-churn AFN
+        draft rebuild guard so a selected draft is rebuilt from fresh Financial Events.
+        """
         def create_customer(order) -> str:
             #print(f"---->Create Customer {order}", flush=True)
             """
@@ -1516,6 +1558,18 @@ class AmazonRepository:
                 or (channel_hint == "MFN" and incoming_status in ["Shipped", "InvoiceUnconfirmed"])
             ):
                 self._mark_amazon_fulfilled_delivered(so_id, order_id)
+            # Separate-fee AFN orders must not be stranded by this early return: re-post a
+            # missing fee JE idempotently (allocation/SI submission run in enq_si_submit).
+            if so_docstatus == 1 and channel_hint == "AFN" and (
+                frappe.db.get_value("Sales Order", so_id, "custom_amazon_fee_accounting") == FEE_ACCOUNTING_SEPARATE
+            ):
+                try:
+                    afn_ensure_fee_journal_entry(so_id, settings=self.amz_setting)
+                except Exception:
+                    frappe.log_error(
+                        title=f"Amazon AFN fee JE retry {order_id}"[:140],
+                        message=frappe.get_traceback(),
+                    )
             return so_id
         if not so_id:
             so = frappe.new_doc("Sales Order")
@@ -1594,7 +1648,7 @@ class AmazonRepository:
 
             # Optional: Only rebuild if current SO lacks taxes but new data provides them
             # (Reduces over-rebuilding; remove if you want to always rebuild on presence)
-            if channel != "MFN" and (len(so.taxes) > 0 or (not has_new_taxes and not has_additional_discount)):
+            if not force_rebuild and channel != "MFN" and (len(so.taxes) > 0 or (not has_new_taxes and not has_additional_discount)):
                 # AFN keeps the legacy low-churn guard. MFN intentionally rebuilds every draft
                 # refresh because an earlier Financial Events response may have been partial.
                 is_status_same = so.amazon_order_status == order.get("OrderStatus")
@@ -1671,6 +1725,11 @@ class AmazonRepository:
         mfn_finance_ready = channel != "MFN"
         mfn_finance_reason = "not_mfn"
         pending_postage_fees = []  # posted only after a successful so.submit()
+        afn_fee_components = []    # (bucket, component) rows placed on so.taxes from fees/service_fees
+        # Every rebuilt draft starts from the legacy net model; the separate-fee decision is
+        # re-derived below from this run's Financial Events (frozen once the SO submits).
+        so.custom_amazon_fee_accounting = FEE_ACCOUNTING_NET if channel == "AFN" else so.get("custom_amazon_fee_accounting")
+        so.custom_amazon_fee_snapshot = None
 
         item_lookup = {item["item_code"]: item.get('total_order_value', 0) for item in items}
         for row in so.items:
@@ -1722,6 +1781,8 @@ class AmazonRepository:
             for fee in charges_and_fees.get("fees"):
                 if fee:
                     so.append("taxes", fee)
+                    if channel == "AFN":
+                        afn_fee_components.append(("fees", fee))
 
             for tds in charges_and_fees.get("tds"):
                 if tds:
@@ -1757,6 +1818,8 @@ class AmazonRepository:
                         )
                 else:
                     so.append("taxes", service_fee)
+                    if channel == "AFN":
+                        afn_fee_components.append(("service_fees", service_fee))
 
             if charges_and_fees.get("additional_discount"):
                 so.discount_amount = float(charges_and_fees.get("additional_discount")) * -1
@@ -1767,6 +1830,29 @@ class AmazonRepository:
         so.flags.ignore_mandatory = True
         so.disable_rounded_total = 1
         so.calculate_taxes_and_totals()
+
+        # AFN separate-fee path: only when the correctly calculated net-invoice total is
+        # negative at document precision and removing the seller fees yields a valid sale.
+        # Zero and positive totals stay on the existing net-invoice path untouched.
+        afn_fee_plan = None
+        if (
+            channel == "AFN"
+            and afn_fee_components
+            and flt(so.grand_total, so.precision("grand_total")) < 0
+        ):
+            afn_fee_plan = afn_plan_separate_fee_accounting(
+                so, order, charges_and_fees, afn_fee_components, self.amz_setting
+            )
+            if afn_fee_plan.status == "planned":
+                print(
+                    f"[AMZ-AFN-FEE] {order_id}: net total {afn_fee_plan.snapshot['projected_net_total']:.2f} -> "
+                    f"separate fee JE {afn_fee_plan.snapshot['expected_receivable_credit']:.2f}, "
+                    f"sale total {afn_fee_plan.snapshot['sale_total']:.2f} {so.currency}",
+                    flush=True,
+                )
+            elif afn_fee_plan.status == "rejected":
+                afn_record_review(order_id, afn_fee_plan.reason)
+
         saved_ok = False  # submit is only attempted on a successfully saved draft
         if so.grand_total>=0:
             frappe.db.savepoint("amz_before_so_save")
@@ -1807,8 +1893,14 @@ class AmazonRepository:
 
             is_replacement_zero = (so.grand_total == 0 and so.replaced_order_id)
             mfn_fulfilled = channel == "MFN" and order.get("OrderStatus") in ["Shipped", "InvoiceUnconfirmed"]
+            # An explicit, fingerprint-verified separate-fee state is ready even when the fee
+            # rows left so.taxes empty; an arbitrary non-empty tax list is not what qualifies it.
+            separate_fee_ready = (
+                channel == "AFN" and afn_fee_plan is not None and afn_fee_plan.status == "planned"
+                and afn_is_validated_separate_fee_state(so)[0]
+            )
             accounting_ready = (
-                (channel != "MFN" and (has_taxes or is_replacement_zero))
+                (channel != "MFN" and (has_taxes or is_replacement_zero or separate_fee_ready))
                 or (channel == "MFN" and mfn_fulfilled and (mfn_finance_ready or is_replacement_zero))
             )
             if saved_ok and order_status_valid and accounting_ready and transfer_exists:
@@ -1849,6 +1941,24 @@ class AmazonRepository:
                         )
                         frappe.db.commit()
                         # enq_si_submit re-checks/re-posts MFN postage before any MFN SI submit.
+
+                    # Step 3b: AFN separate fee JE, only after the SO is durably submitted and
+                    # outside the Sales Order hooks. Idempotent; the SI gate retries it.
+                    if separate_fee_ready:
+                        try:
+                            fee_result = afn_ensure_fee_journal_entry(so.name, settings=self.amz_setting)
+                            print(
+                                f"[AMZ-AFN-FEE] {order_id}: fee JE {fee_result.status} "
+                                f"{fee_result.get('journal_entry') or ''} {fee_result.reason}",
+                                flush=True,
+                            )
+                        except Exception:
+                            frappe.db.rollback()
+                            frappe.log_error(
+                                title=f"Amazon AFN Fee Posting {order_id}"[:140],
+                                message=frappe.get_traceback(),
+                            )
+                            frappe.db.commit()
 
                     # Step 4: Amazon-fulfilled delivered/reserved cleanup (idempotent, own log).
                     if channel == "AFN" or mfn_fulfilled:
@@ -2077,20 +2187,33 @@ class AmazonRepository:
         return sales_orders
 
     def get_order(self, amazon_order_ids) -> list:
-        order_payload = _sp_get(
-            "/orders/v0/orders",
-            f"AmazonOrderIds={amazon_order_ids}",
-            self.amz_setting,
-        )
+        """
+        Import specific orders by id (comma-separated string or list).
+
+        The previous version passed the whole Orders API envelope to create_sales_order()
+        and swallowed every exception. It now unwraps each order object and logs failures
+        with a traceback instead of hiding them.
+        """
+        if isinstance(amazon_order_ids, (list, tuple, set)):
+            amazon_order_ids = ",".join(str(x).strip() for x in amazon_order_ids if str(x).strip())
+        order_payload = _list_orders(self.amz_setting, amazon_order_ids=amazon_order_ids)
         sales_orders = []
-        if order_payload:
+        if not order_payload:
+            frappe.logger().warning(f"Orders API returned no payload for {amazon_order_ids}")
+            return sales_orders
+        orders = order_payload.get("Orders")
+        if orders is None and isinstance(order_payload.get("payload"), dict):
+            orders = order_payload["payload"].get("Orders")
+        for order in orders or []:
             try:
-                sales_order = self.create_sales_order(order_payload)
+                sales_order = self.create_sales_order(order)
                 if sales_order:
                     sales_orders.append(sales_order)
-            except:
-                pass
-        # frappe.enqueue("eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_sp_api_settings.enq_si_submit", sales_orders=sales_orders)
+            except Exception:
+                frappe.log_error(
+                    title=f"Amazon get_order {order.get('AmazonOrderId')}"[:140],
+                    message=frappe.get_traceback(),
+                )
         return sales_orders
 
     def get_catalog_items_instance(self) -> CatalogItems:
@@ -2120,8 +2243,16 @@ def reprocess_single_draft_order(amz_setting_name: str, sales_order_name: str, a
         print(f"[{amazon_order_id}] Processing single draft SO {sales_order_name}", flush=True)
 
         order_payload = _list_orders(ar.amz_setting, amazon_order_ids=amazon_order_id)
-        if not order_payload or not order_payload.get("Orders"):
-            print(f"[{amazon_order_id}] No order payload found. Deleting orphan SO {sales_order_name}.")
+        if not order_payload or "Orders" not in order_payload:
+            # A degraded/empty response (network failure, 403, throttling) is not evidence
+            # that the order does not exist. Keep the draft; it is retried on the next run.
+            frappe.logger().warning(
+                f"[{amazon_order_id}] Orders API returned no usable payload; keeping draft SO {sales_order_name}."
+            )
+            return
+        if not order_payload.get("Orders"):
+            # Amazon explicitly returned an empty Orders list for this id: genuine orphan.
+            print(f"[{amazon_order_id}] Orders API returned no order. Deleting orphan SO {sales_order_name}.")
             frappe.delete_doc("Sales Order", sales_order_name, ignore_permissions=True)
             frappe.db.commit()
             return

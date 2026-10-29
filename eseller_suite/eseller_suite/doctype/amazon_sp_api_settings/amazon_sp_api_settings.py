@@ -193,6 +193,54 @@ MFN_INVOICE_UNSCOPED_CANDIDATE_LIMIT = 500
 MFN_INVOICE_REVIEW_PREFIX = "MFN accounting finalization manual review"
 # Terminal marker for invoices that keep failing GL submission; stops unbounded retry.
 AMAZON_INVOICE_SUBMIT_REVIEW_PREFIX = "Amazon Sales Invoice submission manual review"
+# Non-terminal marker for Separate-Fee AFN invoices waiting on their fee Journal Entry.
+AFN_SEPARATE_FEE_DEFER_PREFIX = "AFN separate-fee invoice deferred"
+
+
+def _afn_separate_fee_gate(si, source_so, amz_setting_name: str | None):
+    """
+    Gate for an AFN Sales Invoice whose source SO uses the Separate Fee JE model.
+
+    Returns (ok, reason, fee_je_name, fingerprint, marked).  A marked invoice may submit only
+    when: the source SO is submitted; SO/SI markers agree; the SI copied the SO's sale
+    economics and carries none of the snapshot's fee rows; and the fee JE is submitted and
+    matches the persisted snapshot (missing fee posting is retried idempotently here).
+    """
+    # Local import: the support module imports nothing from this module at load time, but
+    # keeping it local mirrors the existing circular-import discipline of this file.
+    from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings import amazon_afn_fee_accounting as afn_fee
+
+    so_marker = (source_so.get("custom_amazon_fee_accounting") or "").strip()
+    si_marker = (si.get("custom_amazon_fee_accounting") or "").strip()
+    if so_marker != afn_fee.FEE_ACCOUNTING_SEPARATE and si_marker != afn_fee.FEE_ACCOUNTING_SEPARATE:
+        return True, "legacy net-invoice model", None, None, False
+    if so_marker != afn_fee.FEE_ACCOUNTING_SEPARATE:
+        return False, f"SI is marked '{si_marker}' but source SO {source_so.name} is '{so_marker or 'blank'}'", None, None, True
+    if si_marker and si_marker != afn_fee.FEE_ACCOUNTING_SEPARATE:
+        return False, f"accounting marker mismatch SI='{si_marker}' SO='{so_marker}'", None, None, True
+    if cint(source_so.docstatus) != 1:
+        return False, f"source SO {source_so.name} is not submitted", None, None, True
+
+    state_ok, state_reason = afn_fee.is_validated_separate_fee_state(source_so)
+    if not state_ok:
+        return False, f"source SO separate-fee state invalid: {state_reason}", None, None, True
+    snapshot = afn_fee.sales_order_snapshot(source_so)
+
+    invoice_ok, invoice_reason = _draft_si_matches_source_so(si, source_so)
+    if not invoice_ok:
+        return False, f"Draft SI did not copy the source SO sale economics: {invoice_reason}", None, None, True
+    excl_ok, excl_reason = afn_fee.document_excludes_snapshot_fees(si, snapshot)
+    if not excl_ok:
+        return False, excl_reason, None, None, True
+
+    settings_doc = None
+    setting_name, _reason = _resolve_amazon_setting_for_so(source_so, amz_setting_name)
+    if setting_name:
+        settings_doc = frappe.get_doc("Amazon SP API Settings", setting_name)
+    fee = afn_fee.ensure_fee_journal_entry(source_so.name, settings=settings_doc)
+    if fee.status not in ("submitted", "created"):
+        return False, f"fee Journal Entry {fee.status}: {fee.reason}", fee.get("journal_entry"), None, True
+    return True, "separate-fee state verified", fee.journal_entry, snapshot.get("fingerprint"), True
 
 
 def _record_amazon_invoice_failure(invoice_name: str, message: str) -> None:
@@ -555,8 +603,6 @@ def enq_si_submit(sales_orders=None, amz_setting_name: str | None = None):
     """
     scoped_sales_orders = bool(sales_orders)
     sales_invoices = _draft_amazon_sales_invoices(sales_orders)
-    if not sales_invoices:
-        return
 
     unscoped_mfn_finance_checks = 0
     for invoice_name in sales_invoices:
@@ -585,6 +631,7 @@ def enq_si_submit(sales_orders=None, amz_setting_name: str | None = None):
 
         source_rows = _amazon_source_sales_orders(si.name)
         source_order_id = None
+        afn_marked, afn_fee_je, afn_fingerprint = False, None, None
 
         if source_rows:
             order_ids = {
@@ -611,6 +658,19 @@ def enq_si_submit(sales_orders=None, amz_setting_name: str | None = None):
                 )
                 frappe.db.commit()
                 continue
+
+            if (source_so.fulfillment_channel or "").upper() == "AFN":
+                # Separate-fee AFN invoices are gated on their fee JE at every entry point,
+                # including this unscoped scheduled catch-up run.
+                gate_ok, gate_reason, afn_fee_je, afn_fingerprint, afn_marked = _afn_separate_fee_gate(
+                    si, source_so, amz_setting_name
+                )
+                if not gate_ok:
+                    _record_amazon_invoice_failure(
+                        si.name, f"{AFN_SEPARATE_FEE_DEFER_PREFIX}: {gate_reason}"
+                    )
+                    frappe.db.commit()
+                    continue
 
             if (source_so.fulfillment_channel or "").upper() == "MFN":
                 if (
@@ -660,6 +720,15 @@ def enq_si_submit(sales_orders=None, amz_setting_name: str | None = None):
         elif not (si.amazon_order_id or "").strip():
             # Neither direct ID nor SO lineage: this is not safely identifiable as an Amazon SI.
             continue
+        elif (si.get("custom_amazon_fee_accounting") or "") == "Separate Fee JE":
+            # A marked invoice without SO lineage cannot be verified against a snapshot or
+            # fee JE; never let it take the standalone fallback.
+            _record_amazon_invoice_failure(
+                si.name,
+                f"{AFN_SEPARATE_FEE_DEFER_PREFIX}: invoice is marked Separate Fee JE but has no Sales Order lineage; manual review",
+            )
+            frappe.db.commit()
+            continue
 
         # Preserve the legacy AFN/standalone path when no source SO lineage exists. MFN invoices
         # created from Sales Orders take the strict validation path above.
@@ -674,8 +743,20 @@ def enq_si_submit(sales_orders=None, amz_setting_name: str | None = None):
                 frappe.db.commit()
                 continue
 
+            needs_save = False
             if source_order_id and not (si.amazon_order_id or "").strip():
                 si.amazon_order_id = source_order_id
+                needs_save = True
+            if afn_marked:
+                # Map the frozen accounting decision and its fee JE onto the invoice.
+                from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_afn_fee_accounting import (
+                    FEE_ACCOUNTING_SEPARATE,
+                )
+                si.custom_amazon_fee_accounting = FEE_ACCOUNTING_SEPARATE
+                si.custom_amazon_fee_je = afn_fee_je
+                si.custom_amazon_fee_fingerprint = afn_fingerprint
+                needs_save = True
+            if needs_save:
                 si.save(ignore_permissions=True)
             si.submit()
             frappe.db.commit()
@@ -695,3 +776,44 @@ def enq_si_submit(sales_orders=None, amz_setting_name: str | None = None):
                 message = str(e)
             _record_amazon_invoice_failure(si.name, message)
             frappe.db.commit()
+            continue
+
+        if afn_marked:
+            # Allocate the fee credit promptly after submission (SI first, then any posted
+            # negative-sale settlement debit). Failures stay pending and are retried below.
+            try:
+                from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_afn_fee_accounting import (
+                    allocate_fee_credit_for_order,
+                )
+                alloc = allocate_fee_credit_for_order(source_order_id, company=si.company)
+                print(
+                    f"[AMZ-SI] {si.name}: fee allocation {alloc.status} "
+                    f"invoice={alloc.get('applied_to_invoice', 0)} settlement={alloc.get('applied_to_settlement', 0)} "
+                    f"{alloc.reason}",
+                    flush=True,
+                )
+            except Exception:
+                frappe.db.rollback()
+                frappe.log_error(
+                    title=f"Amazon AFN fee allocation {source_order_id}"[:140],
+                    message=frappe.get_traceback(),
+                )
+                frappe.db.commit()
+
+    # Bounded retry for already-submitted Separate-Fee SOs (missing fee JE, unallocated
+    # credit). Runs for scoped and unscoped invocations so submitted orders are never stranded.
+    try:
+        from eseller_suite.eseller_suite.doctype.amazon_sp_api_settings.amazon_afn_fee_accounting import (
+            retry_afn_fee_lifecycle,
+        )
+        for row in retry_afn_fee_lifecycle(
+            sales_orders=sales_orders if scoped_sales_orders else None,
+            amz_setting_name=amz_setting_name,
+        ):
+            if row.status not in ("complete", "submitted", "not_applicable"):
+                print(f"[AMZ-SI] AFN fee retry {row.amazon_order_id} ({row.sales_order}): {row.status} {row.reason}", flush=True)
+        frappe.db.commit()
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(title="Amazon AFN fee lifecycle retry", message=frappe.get_traceback())
+        frappe.db.commit()
