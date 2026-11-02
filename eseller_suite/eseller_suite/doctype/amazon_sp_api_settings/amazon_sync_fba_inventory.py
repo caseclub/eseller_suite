@@ -57,6 +57,7 @@ MYI_ALL_REPORT_TYPE = "GET_FBA_MYI_ALL_INVENTORY_DATA"
 MYI_REPORT_LOOKBACK_HOURS = 48
 MYI_US_MARKETPLACE_ID = "ATVPDKIKX0DER"
 FINISHED_GOODS_WAREHOUSE = "Finished Goods Post Production - CC"
+MAIN_TO_PREP_SOURCE_WAREHOUSE = "Main Warehouse - CC"
 MAX_INBOUND_FLOW_EXAMPLES_PER_GROUP = 10
 MAX_INBOUND_FLOW_EXAMPLES_TOTAL = 50
 MAX_DOCUMENT_NAMES_PER_GROUP = 10
@@ -1408,7 +1409,12 @@ def _new_inbound_flow_diagnostics(asin_inbound, settings):
         "drafts_submitted_verified": 0,
         "drafts_failed_submission": 0,
         "drafts_committed_unverified": 0,
+        "unverified_draft_item_codes": [],
+        "unverified_draft_scope_unknown": False,
+        "unverified_draft_scope_errors": [],
         "submitted_finished_to_prep_qty": 0,
+        "submitted_main_to_prep_qty": 0,
+        "submitted_draft_net_prep_qty": 0,
         "prep_valid_row_count": 0,
         "prep_valid_row_qty": 0,
         "finished_valid_row_count": 0,
@@ -1446,6 +1452,7 @@ def _new_inbound_flow_diagnostics(asin_inbound, settings):
             "second_pass_drafts_eligible": 0,
             "second_pass_drafts_submitted": 0,
             "second_pass_draft_qty": 0,
+            "second_pass_net_prep_qty": 0,
             "second_pass_draft_ids": [],
             "repayment_documents_created": 0,
             "repayment_document_ids": [],
@@ -1978,7 +1985,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                         f"{record.get('debt_verified_qty', 0)}",
                         f"  Remaining debt for referenced reconciliation: "
                         f"{record.get('debt_remaining_qty', 0)}",
-                        "  Relevant submitted Finished Goods-to-Prep Stock Entries: "
+                        "  Relevant submitted Main/Finished Goods-source Stock Entries: "
                         + (
                             ", ".join(record.get("debt_relevant_draft_ids") or [])
                             or "<none>"
@@ -2217,8 +2224,19 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 f"Drafts failing submission: {flow.get('drafts_failed_submission', 0)}",
                 f"Committed drafts whose submitted state could not be verified: "
                 f"{flow.get('drafts_committed_unverified', 0)}",
+                f"Items held from both passes after uncertain whole-draft movement: "
+                f"{len(flow.get('unverified_draft_item_codes') or [])}; examples: "
+                + ", ".join((flow.get('unverified_draft_item_codes') or [])[:10]),
+                f"All further stock processing stopped for unknown draft impact: "
+                f"{bool(flow.get('unverified_draft_scope_unknown'))}",
+                "Draft impact evidence errors: " + "; ".join(
+                    (flow.get("unverified_draft_scope_errors") or [])[:10]),
+                "Draft impact holds are run-local; after an unverified outcome, "
+                "review the named Stock Entry and ledger before the next sync run.",
                 f"Total submitted Finished Goods to Prep quantity: "
                 f"{flow.get('submitted_finished_to_prep_qty', 0)}",
+                f"Total submitted Main Warehouse to Prep quantity: {flow.get('submitted_main_to_prep_qty', 0)}",
+                f"Total verified draft net Prep change: {flow.get('submitted_draft_net_prep_qty', 0)}",
                 f"Valid Prep to Inbound rows: {flow.get('prep_valid_row_count', 0)}; "
                 f"quantity: {flow.get('prep_valid_row_qty', 0)}",
                 f"Valid Finished Goods to Inbound rows: "
@@ -2297,8 +2315,9 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 f"{debt.get('second_pass_drafts_eligible', 0)}",
                 f"Second-pass draft Stock Entries submitted and verified: "
                 f"{debt.get('second_pass_drafts_submitted', 0)}",
-                f"Second-pass Finished Goods-to-Prep quantity submitted: "
+                f"Second-pass whole-draft stock quantity submitted (all destinations): "
                 f"{debt.get('second_pass_draft_qty', 0)}",
+                f"Second-pass verified net Prep increase: {debt.get('second_pass_net_prep_qty', 0)}",
                 "Second-pass submitted draft IDs: "
                 + (
                     ", ".join(debt.get("second_pass_draft_ids") or [])
@@ -2427,7 +2446,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                         f"{event.get('initial_positive_shortage')}",
                         f"    Eligible draft Stock Entries: {eligible_name_text}",
                         f"    Draft status/outcome: {event.get('draft_outcome') or '<none>'}",
-                        f"    Draft expected movement quantity: "
+                        f"    Draft verified net Prep change: "
                         f"{event.get('draft_expected_qty') or 0}",
                         f"    Fresh post-draft Inbound quantity: {event.get('fresh_inbound_qty')}",
                         f"    Fresh post-draft Prep quantity: {event.get('fresh_prep_qty')}",
@@ -2508,6 +2527,177 @@ def _stock_entry_item_quantities(stock_entry):
     return dict(quantities)
 
 
+def _prep_draft_movement_plan(stock_entry, prep_wh):
+    """Read the whole draft in stock units; relevance is separate from effects."""
+    effects, item_totals, qualifying, prep_sources = (defaultdict(float) for _ in range(4))
+    signature, sources, targets = [], set(), set()
+    if not stock_entry.items:
+        raise ValueError("Transfer draft has no child rows")
+    for row in stock_entry.items:
+        if not row.item_code or not row.s_warehouse or not row.t_warehouse:
+            raise ValueError("Transfer child is missing item/source/destination")
+        if row.s_warehouse == row.t_warehouse:
+            raise ValueError("Transfer child source equals destination")
+        def positive(value, field):
+            if value is None or isinstance(value, bool):
+                raise ValueError("Missing/invalid transfer " + field)
+            number = float(value)
+            if not math.isfinite(number) or number <= 0:
+                raise ValueError("Nonpositive/nonfinite transfer " + field)
+            return number
+        qty = positive(row.qty, "qty")
+        factor = positive(row.conversion_factor, "conversion_factor")
+        calculated = qty * factor
+        if not math.isfinite(calculated):
+            raise ValueError("Nonfinite transfer stock quantity")
+        stock_qty = (calculated if row.transfer_qty is None
+                     else positive(row.transfer_qty, "transfer_qty"))
+        if abs(stock_qty - calculated) > INBOUND_DEBT_QTY_TOLERANCE:
+            raise ValueError("Transfer stock quantity disagrees with qty/conversion factor")
+        source, target, item = row.s_warehouse, row.t_warehouse, row.item_code
+        signature.append((item, source, target, stock_qty))
+        sources.add(source)
+        targets.add(target)
+        effects[(item, source)] -= stock_qty
+        effects[(item, target)] += stock_qty
+        item_totals[item] += stock_qty
+        if target == prep_wh:
+            prep_sources[source] += stock_qty
+            if source in (FINISHED_GOODS_WAREHOUSE, MAIN_TO_PREP_SOURCE_WAREHOUSE):
+                qualifying[item] += stock_qty
+    if any(not math.isfinite(value) for value in list(effects.values()) + list(item_totals.values())):
+        raise ValueError("Nonfinite aggregate transfer stock quantity")
+    if not math.isfinite(sum(item_totals.values())):
+        raise ValueError("Nonfinite total transfer stock quantity")
+    if len(sources) != 1 or not sources <= {FINISHED_GOODS_WAREHOUSE, MAIN_TO_PREP_SOURCE_WAREHOUSE}:
+        raise ValueError("Transfer draft must have one homogeneous Main or Finished Goods source")
+    return {"effects": dict(effects), "signature": sorted(signature),
+        "company": stock_entry.company, "posting_date": str(stock_entry.posting_date),
+        "item_quantities": dict(item_totals), "qualifying_prep_quantities": dict(qualifying),
+        "prep_net": {item: effects.get((item, prep_wh), 0) for item in item_totals},
+        "prep_by_source": dict(prep_sources), "total_stock_qty": sum(item_totals.values()),
+        "sources": sorted(sources), "targets": sorted(targets), "prep_warehouse": prep_wh}
+
+
+def _read_prep_draft_balances(plan):
+    balances = {key: _read_bin_actual_qty(*key) for key in plan["effects"]}
+    if any(not math.isfinite(value) for value in balances.values()):
+        raise RuntimeError("Nonfinite whole-draft warehouse balance")
+    return balances
+
+
+def _verify_prep_draft_movement(stock_entry, plan, before):
+    """Verify every route/item, including non-Prep rows, without any stock write."""
+    affected_items = set(plan["item_quantities"])
+    try:
+        affected_items.update(row.item_code for row in stock_entry.items if row.item_code)
+        stock_entry.reload()
+        affected_items.update(row.item_code for row in stock_entry.items if row.item_code)
+        if stock_entry.docstatus != 1 or stock_entry.company != plan["company"]:
+            raise RuntimeError("Committed transfer is not submitted in the expected company")
+        current_plan = _prep_draft_movement_plan(stock_entry, plan["prep_warehouse"])
+        if (current_plan["signature"] != plan["signature"]
+                or current_plan["posting_date"] != plan["posting_date"]
+                or stock_entry.stock_entry_type != "Material Transfer"):
+            raise RuntimeError("Committed transfer routes/quantities changed after revalidation")
+        ledger = frappe.get_all("Stock Ledger Entry", filters={
+            "voucher_type": "Stock Entry", "voucher_no": stock_entry.name, "is_cancelled": 0},
+            fields=["item_code", "warehouse", "actual_qty", "company"])
+        affected_items.update(row.item_code for row in ledger if row.item_code)
+        if not ledger:
+            raise RuntimeError("Committed transfer has no uncancelled Stock Ledger evidence")
+        posted = defaultdict(float)
+        for row in ledger:
+            if row.company != plan["company"] or row.actual_qty is None:
+                raise RuntimeError("Missing/foreign transfer Stock Ledger evidence")
+            delta = float(row.actual_qty)
+            if not math.isfinite(delta):
+                raise RuntimeError("Nonfinite transfer Stock Ledger movement")
+            posted[(row.item_code, row.warehouse)] += delta
+        if set(posted) != set(plan["effects"]):
+            raise RuntimeError("Transfer Stock Ledger item/warehouse coverage differs from full draft")
+        for key, expected in plan["effects"].items():
+            if abs(posted[key] - expected) > INBOUND_DEBT_QTY_TOLERANCE:
+                raise RuntimeError(f"Transfer Stock Ledger net movement differs: {key}")
+        after = _read_prep_draft_balances(plan)
+        for key, expected in plan["effects"].items():
+            if abs(after[key] - before[key] - expected) > INBOUND_DEBT_QTY_TOLERANCE:
+                raise RuntimeError(f"Fresh whole-draft warehouse net movement differs: {key}")
+    except Exception as exc:
+        # Carry every observed item into both-pass holds, even when a hook or
+        # unexpected ledger row changed the document beyond the original plan.
+        try:
+            exc._fba_draft_affected_item_codes = sorted(affected_items)
+        except Exception:
+            pass
+        raise
+
+
+def _hold_unverified_prep_draft(draft_name, stock_entry, plan, diagnostics, exception):
+    """Read both evidence channels independently; never mutate or replay stock.
+
+    A failed reload must not hide an unexpected ledger item, and a failed
+    commit response must receive the same scope checks as failed verification.
+    If either channel is unavailable, no finite item list is safe: stop the
+    remaining run, including debt repayment and zero-out reconciliation.
+    These holds are deliberately run-local, not a new persistent debt journal.
+    """
+    affected = set(plan["item_quantities"])
+    affected.update(getattr(exception, "_fba_draft_affected_item_codes", ()))
+    errors = []
+
+    def collect(rows, label):
+        if not rows:
+            raise RuntimeError(label + " has no item evidence")
+        malformed = False
+        for row in rows:
+            item = getattr(row, "item_code", None)
+            if not isinstance(item, str) or not item.strip():
+                malformed = True
+            else:
+                affected.add(item)
+        if malformed:
+            raise RuntimeError(label + " contains an unidentified item")
+
+    # Preserve hook-added rows already present in memory, even if refresh fails.
+    try:
+        collect(stock_entry.items, "In-memory draft")
+    except Exception as exc:
+        errors.append("cached document: " + _concise_inventory_exception(exc))
+    try:
+        fresh = frappe.get_doc("Stock Entry", draft_name)
+        fresh.reload()
+        collect(fresh.items, "Reloaded draft")
+        if fresh.name != draft_name:
+            raise RuntimeError("Reloaded draft identity differs from submitted voucher")
+    except Exception as exc:
+        errors.append("document reread: " + _concise_inventory_exception(exc))
+    # Use the original voucher name, not a possibly changed document attribute.
+    # Always try this even if document collection/reload already failed.
+    try:
+        ledger = frappe.get_all("Stock Ledger Entry", filters={
+            "voucher_type": "Stock Entry", "voucher_no": draft_name, "is_cancelled": 0},
+            fields=["item_code", "warehouse", "actual_qty", "company"])
+        collect(ledger, "Voucher ledger")
+    except Exception as exc:
+        errors.append("ledger reread: " + _concise_inventory_exception(exc))
+
+    diagnostics["unverified_draft_item_codes"] = sorted(
+        set(diagnostics.get("unverified_draft_item_codes") or []) | affected)
+    if errors:
+        diagnostics["unverified_draft_scope_unknown"] = True
+        diagnostics.setdefault("unverified_draft_scope_errors", []).extend(
+            draft_name + ": " + reason for reason in errors)
+    window = diagnostics.get("_transition_window")
+    if window is not None:
+        # finish() must not shrink pending CSV obligations from uncertain Bins.
+        window.blocked_items.update(affected)
+        if diagnostics.get("unverified_draft_scope_unknown"):
+            window.blocked_items.update(window.items)
+            window.blocked_items.update(row["item_code"] for row in window.lots)
+    return affected
+
+
 def _eligible_finished_to_prep_draft(
     stock_entry,
     needed_item_codes,
@@ -2523,13 +2713,11 @@ def _eligible_finished_to_prep_draft(
         or not stock_entry.items
     ):
         return False
-    if any(
-        row.s_warehouse != FINISHED_GOODS_WAREHOUSE
-        or row.t_warehouse != prep_wh
-        for row in stock_entry.items
-    ):
+    try:
+        plan = _prep_draft_movement_plan(stock_entry, prep_wh)
+    except (AttributeError, TypeError, ValueError, OverflowError):
         return False
-    return any(row.item_code in needed_item_codes for row in stock_entry.items)
+    return bool(set(plan["qualifying_prep_quantities"]) & set(needed_item_codes))
 
 
 def _historical_debt_details(diagnostics):
@@ -3187,10 +3375,12 @@ def _submit_historical_debt_drafts(
     debt_ids_by_item,
     diagnostics,
 ):
-    """Submit whole relevant Finished Goods-to-Prep drafts before repayment."""
+    """Submit whole relevant Main/Finished Goods transfer drafts before repayment."""
     debt = _historical_debt_details(diagnostics)
-    blocked_items = set()
+    blocked_items = set(diagnostics.get("unverified_draft_item_codes") or [])
     submitted_by_item = defaultdict(list)
+    if diagnostics.get("unverified_draft_scope_unknown"):
+        return blocked_items | set(need_map), submitted_by_item
     if not need_map:
         return blocked_items, submitted_by_item
 
@@ -3212,7 +3402,7 @@ def _submit_historical_debt_drafts(
         _record_historical_debt_failure(
             diagnostics,
             "52",
-            "Historical-debt Finished Goods-to-Prep draft discovery or inspection failed",
+            "Historical-debt Main/Finished Goods transfer draft discovery or inspection failed",
             detail=_concise_inventory_exception(exc),
         )
         _record_inbound_flow_global_error(
@@ -3227,7 +3417,7 @@ def _submit_historical_debt_drafts(
     needed_item_codes = {
         item_code
         for item_code, quantity in need_map.items()
-        if quantity > INBOUND_DEBT_QTY_TOLERANCE
+        if quantity > INBOUND_DEBT_QTY_TOLERANCE and item_code not in blocked_items
     }
     for draft_row in draft_rows:
         try:
@@ -3239,8 +3429,12 @@ def _submit_historical_debt_drafts(
                 prep_wh,
             ):
                 continue
-            quantities = _stock_entry_item_quantities(draft)
-            relevant_codes = sorted(set(quantities) & needed_item_codes)
+            draft_plan = _prep_draft_movement_plan(draft, prep_wh)
+            quantities = draft_plan["item_quantities"]
+            if set(quantities) & blocked_items:
+                blocked_items.update(quantities)
+                continue
+            relevant_codes = sorted(set(draft_plan["qualifying_prep_quantities"]) & needed_item_codes)
             eligible_drafts.append((draft.name, relevant_codes))
             debt["second_pass_drafts_eligible"] += 1
             diagnostics["drafts_eligible"] += 1
@@ -3253,12 +3447,12 @@ def _submit_historical_debt_drafts(
                 diagnostics,
                 "Stock Entry",
                 draft.name,
-                "Complete an existing Finished Goods-to-Prep transfer before "
+                "Complete an existing Main/Finished Goods transfer draft before "
                 "historical synthetic Inbound debt repayment",
                 "pre-existing draft acted upon by the historical-debt phase",
                 "selected; pending immediate revalidation",
-                source_warehouses=[FINISHED_GOODS_WAREHOUSE],
-                target_warehouse=prep_wh,
+                source_warehouses=draft_plan["sources"],
+                target_warehouse=", ".join(draft_plan["targets"]),
                 movement_quantity=sum(quantities.values()),
                 affected_item_count=len(quantities),
                 extra_details={
@@ -3270,7 +3464,7 @@ def _submit_historical_debt_drafts(
             _record_historical_debt_failure(
                 diagnostics,
                 "52",
-                "Historical-debt Finished Goods-to-Prep draft discovery or inspection failed",
+                "Historical-debt Main/Finished Goods transfer draft discovery or inspection failed",
                 draft_row.name,
                 _concise_inventory_exception(exc),
             )
@@ -3281,6 +3475,9 @@ def _submit_historical_debt_drafts(
         return set(need_map), submitted_by_item
 
     for draft_name, initially_relevant_codes in eligible_drafts:
+        if diagnostics.get("unverified_draft_scope_unknown"):
+            blocked_items.update(need_map)
+            break
         try:
             draft = frappe.get_doc("Stock Entry", draft_name)
             draft.reload()
@@ -3298,17 +3495,15 @@ def _submit_historical_debt_drafts(
             ):
                 raise RuntimeError(
                     "draft no longer satisfies the existing whole-document "
-                    "Finished Goods-to-Prep eligibility rules"
+                    "Main/Finished Goods-source draft eligibility rules"
                 )
-            draft_quantities = _stock_entry_item_quantities(draft)
-            relevant_codes = sorted(set(draft_quantities) & currently_needed)
-            before_quantities = {
-                item_code: (
-                    _read_bin_actual_qty(item_code, FINISHED_GOODS_WAREHOUSE),
-                    _read_bin_actual_qty(item_code, prep_wh),
-                )
-                for item_code in draft_quantities
-            }
+            draft_plan = _prep_draft_movement_plan(draft, prep_wh)
+            draft_quantities = draft_plan["item_quantities"]
+            if set(draft_quantities) & blocked_items:
+                blocked_items.update(draft_quantities)
+                raise RuntimeError("Whole draft touches an item held after an unverified transfer")
+            relevant_codes = sorted(set(draft_plan["qualifying_prep_quantities"]) & currently_needed)
+            before_quantities = _read_prep_draft_balances(draft_plan)
         except Exception as exc:
             diagnostics["drafts_revalidation_ineligible"] += 1
             blocked_items.update(initially_relevant_codes)
@@ -3323,13 +3518,17 @@ def _submit_historical_debt_drafts(
                 diagnostics,
                 "Stock Entry",
                 draft_name,
-                "Complete an existing Finished Goods-to-Prep transfer before "
+                "Complete an existing Main/Finished Goods transfer draft before "
                 "historical synthetic Inbound debt repayment",
                 "pre-existing draft acted upon by the historical-debt phase",
                 "revalidation failed; not submitted",
             )
             continue
 
+        _upsert_inventory_document(diagnostics, "Stock Entry", draft_name,
+            "Complete an existing Main/Finished Goods source draft before historical debt repayment",
+            "pre-existing draft acted upon by the historical-debt phase", "revalidated; pending submission",
+            source_warehouses=draft_plan["sources"], target_warehouse=", ".join(draft_plan["targets"]))
         if DEBUG:
             diagnostics["drafts_debug_would_submit"] += 1
             blocked_items.update(relevant_codes)
@@ -3337,7 +3536,7 @@ def _submit_historical_debt_drafts(
                 diagnostics,
                 "Stock Entry",
                 draft_name,
-                "Complete an existing Finished Goods-to-Prep transfer before "
+                "Complete an existing Main/Finished Goods transfer draft before "
                 "historical synthetic Inbound debt repayment",
                 "pre-existing draft acted upon by the historical-debt phase",
                 "DEBUG: remained draft; submission not attempted",
@@ -3356,39 +3555,22 @@ def _submit_historical_debt_drafts(
             r"[^A-Za-z0-9_]", "_", draft_name
         )
         committed = False
+        commit_attempted = False
         try:
             frappe.db.savepoint(savepoint_name)
             draft.submit()
+            commit_attempted = True
             frappe.db.commit()
             committed = True
-            draft.reload()
-            if draft.docstatus != 1:
-                raise RuntimeError(
-                    f"committed Stock Entry reloaded with docstatus={draft.docstatus}"
-                )
-            movement_failures = []
-            for item_code, moved_qty in draft_quantities.items():
-                before_finished, before_prep = before_quantities[item_code]
-                after_finished = _read_bin_actual_qty(
-                    item_code, FINISHED_GOODS_WAREHOUSE
-                )
-                after_prep = _read_bin_actual_qty(item_code, prep_wh)
-                if (
-                    after_finished
-                    > before_finished - moved_qty + INBOUND_DEBT_QTY_TOLERANCE
-                    or after_prep
-                    < before_prep + moved_qty - INBOUND_DEBT_QTY_TOLERANCE
-                ):
-                    movement_failures.append(item_code)
-            if movement_failures:
-                raise RuntimeError(
-                    "fresh source quantities did not verify the submitted "
-                    "movement for item(s): " + ", ".join(movement_failures)
-                )
+            _verify_prep_draft_movement(draft, draft_plan, before_quantities)
 
             moved_total = sum(draft_quantities.values())
             diagnostics["drafts_submitted_verified"] += 1
-            diagnostics["submitted_finished_to_prep_qty"] += moved_total
+            diagnostics["submitted_finished_to_prep_qty"] += draft_plan["prep_by_source"].get(FINISHED_GOODS_WAREHOUSE, 0)
+            diagnostics["submitted_main_to_prep_qty"] = diagnostics.get("submitted_main_to_prep_qty", 0) + draft_plan["prep_by_source"].get(MAIN_TO_PREP_SOURCE_WAREHOUSE, 0)
+            net_prep = sum(draft_plan["prep_net"].values())
+            diagnostics["submitted_draft_net_prep_qty"] = diagnostics.get("submitted_draft_net_prep_qty", 0) + net_prep
+            debt["second_pass_net_prep_qty"] = debt.get("second_pass_net_prep_qty", 0) + net_prep
             debt["second_pass_drafts_submitted"] += 1
             debt["second_pass_draft_qty"] += moved_total
             if draft_name not in debt["second_pass_draft_ids"]:
@@ -3399,14 +3581,14 @@ def _submit_historical_debt_drafts(
                 diagnostics,
                 "Stock Entry",
                 draft_name,
-                "Complete an existing Finished Goods-to-Prep transfer before "
+                "Complete an existing Main/Finished Goods transfer draft before "
                 "historical synthetic Inbound debt repayment",
                 "pre-existing draft acted upon by the historical-debt phase",
                 "submitted, committed, and movement verified",
             )
             _record_inbound_flow_event(
                 diagnostics,
-                "Historical-debt Finished Goods-to-Prep draft submitted and verified",
+                "Historical-debt Main/Finished Goods transfer draft submitted and verified",
                 reason=(
                     "The entire eligible existing draft was submitted before "
                     "historical debt repayment"
@@ -3415,17 +3597,31 @@ def _submit_historical_debt_drafts(
                 quantity=moved_total,
             )
         except Exception as exc:
-            blocked_items.update(relevant_codes)
+            # Whole-document uncertainty includes debt items routed somewhere
+            # other than Prep, not merely the rows that triggered eligibility.
+            affected_items = set(draft_quantities) | set(getattr(exc, "_fba_draft_affected_item_codes", ()))
+            blocked_items.update(affected_items)
             reason = _concise_inventory_exception(exc)
-            if committed:
+            if committed or commit_attempted:
+                affected_items = _hold_unverified_prep_draft(
+                    draft_name, draft, draft_plan, diagnostics, exc)
+                blocked_items.update(affected_items)
+                if diagnostics.get("unverified_draft_scope_unknown"):
+                    blocked_items.update(need_map)
                 diagnostics["drafts_committed_unverified"] += 1
-                status = "submitted and committed; movement verification failed"
+                status = ("submitted and committed; movement verification failed" if committed
+                          else "commit attempted; transfer outcome unverified; held for review")
             else:
                 diagnostics["drafts_failed_submission"] += 1
                 status = "submission failed"
                 try:
                     frappe.db.rollback(save_point=savepoint_name)
                 except Exception as rollback_exc:
+                    affected_items = _hold_unverified_prep_draft(
+                        draft_name, draft, draft_plan, diagnostics, exc)
+                    blocked_items.update(affected_items)
+                    if diagnostics.get("unverified_draft_scope_unknown"):
+                        blocked_items.update(need_map)
                     reason += "; savepoint rollback failed: " + _concise_inventory_exception(
                         rollback_exc
                     )
@@ -3440,7 +3636,7 @@ def _submit_historical_debt_drafts(
                 diagnostics,
                 "Stock Entry",
                 draft_name,
-                "Complete an existing Finished Goods-to-Prep transfer before "
+                "Complete an existing Main/Finished Goods transfer draft before "
                 "historical synthetic Inbound debt repayment",
                 "pre-existing draft acted upon by the historical-debt phase",
                 status,
@@ -3679,6 +3875,9 @@ def _process_historical_inbound_debt(settings, diagnostics):
     if diagnostics is None:
         return
     debt = _historical_debt_details(diagnostics)
+    if diagnostics.get("unverified_draft_scope_unknown"):
+        debt["status"] = "stopped: unverified draft impact could not be bounded"
+        return
     debt["status"] = "starting"
     debt["older_context_review"] = {"status": "not assessed; real debt phase not completed"}
     lock = None
@@ -3822,6 +4021,10 @@ def _process_historical_inbound_debt(settings, diagnostics):
                 diagnostics,
             )
         )
+
+        if diagnostics.get("unverified_draft_scope_unknown"):
+            debt["status"] = "stopped: unverified draft impact could not be bounded"
+            return
 
         buckets_by_source = defaultdict(list)
         for bucket in repayable_buckets:
@@ -4311,7 +4514,11 @@ def _transition_age_seconds(lot, now):
 
 
 def _transition_item_blocked(diagnostics, item_code, asin=None):
-    window = (diagnostics or {}).get("_transition_window")
+    diagnostics = diagnostics or {}
+    if (diagnostics.get("unverified_draft_scope_unknown")
+            or item_code in (diagnostics.get("unverified_draft_item_codes") or [])):
+        return True
+    window = diagnostics.get("_transition_window")
     return bool(window and (item_code in window.blocked_items or
                             asin in window.blocked_asins))
 
@@ -5210,8 +5417,10 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
     diagnostics = diagnostics or _new_inbound_flow_diagnostics(
         asin_inbound, settings
     )
+    if diagnostics.get("unverified_draft_scope_unknown"):
+        raise RuntimeError("Unverified draft impact is unknown; further stock writes stopped")
     existing_draft_purpose = (
-        "Complete an existing Finished Goods-to-Prep transfer needed by the "
+        "Complete an existing Main/Finished Goods transfer draft needed by the "
         "inbound workflow"
     )
     aggregated_entry_purpose = (
@@ -5342,7 +5551,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 quantity=diff - max(current_prep, 0),
             )
 
-    # Existing Finished Goods-to-Prep drafts are considered only when useful.
+    # Existing Main/Finished Goods transfer drafts are considered only when useful.
     eligible_drafts = []
     if initially_needed_beyond_prep:
         try:
@@ -5380,10 +5589,9 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     prep_wh,
                 ):
                     continue
-                quantities = _stock_entry_item_quantities(draft)
-                relevant_codes = sorted(
-                    set(quantities) & initially_needed_beyond_prep
-                )
+                draft_plan = _prep_draft_movement_plan(draft, prep_wh)
+                quantities = draft_plan["item_quantities"]
+                relevant_codes = sorted(set(draft_plan["qualifying_prep_quantities"]) & initially_needed_beyond_prep)
                 eligible_drafts.append((draft.name, relevant_codes))
                 diagnostics["drafts_eligible"] += 1
                 _upsert_inventory_document(
@@ -5396,7 +5604,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     source_warehouses=sorted({
                         row.s_warehouse for row in draft.items if row.s_warehouse
                     }),
-                    target_warehouse=prep_wh,
+                    target_warehouse=", ".join(draft_plan["targets"]),
                     movement_quantity=sum(quantities.values()),
                     affected_item_count=len(quantities),
                 )
@@ -5405,7 +5613,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     state["eligible_draft_names"].append(draft.name)
                     _record_inbound_flow_event(
                         diagnostics,
-                        "Eligible Finished Goods to Prep draft discovered",
+                        "Eligible Main/Finished Goods source draft discovered",
                         state,
                         "Draft met all initial eligibility conditions",
                         draft.name,
@@ -5424,10 +5632,10 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     + _concise_inventory_exception(exc),
                 )
 
-    submitted_draft_baselines = {}
-    submitted_draft_qty_by_item = defaultdict(float)
     submitted_draft_names_by_item = defaultdict(list)
     for draft_name, initially_relevant_codes in eligible_drafts:
+        if diagnostics.get("unverified_draft_scope_unknown"):
+            break
         try:
             draft = frappe.get_doc("Stock Entry", draft_name)
             draft.reload()
@@ -5507,13 +5715,33 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     diagnostics,
                     "Eligible draft became ineligible during revalidation",
                     state,
-                    "Draft was no longer a valid, currently useful Finished Goods to Prep draft",
+                    "Draft was no longer a valid, currently useful Main/Finished Goods source draft",
                     draft_name,
                 )
             continue
 
-        draft_quantities = _stock_entry_item_quantities(draft)
-        revalidated_codes = sorted(set(draft_quantities) & currently_needed)
+        draft_plan = _prep_draft_movement_plan(draft, prep_wh)
+        draft_quantities = draft_plan["item_quantities"]
+        held = set(diagnostics.get("unverified_draft_item_codes") or [])
+        if set(draft_quantities) & held:
+            for item_code in set(draft_quantities) & set(item_states):
+                mark_item_skipped(item_states[item_code],
+                    "Whole draft touches an item held after an unverified transfer", draft_name)
+            continue
+        revalidated_codes = sorted(set(draft_plan["qualifying_prep_quantities"]) & currently_needed)
+        try:
+            before_draft_balances = _read_prep_draft_balances(draft_plan)
+        except Exception as exc:
+            diagnostics["drafts_revalidation_ineligible"] += 1
+            reason = "Immediate whole-draft Bin reread failed: " + _concise_inventory_exception(exc)
+            _upsert_inventory_document(diagnostics, "Stock Entry", draft_name,
+                existing_draft_purpose, "pre-existing draft acted upon by this run", "quantity read failed; not submitted")
+            for item_code in revalidated_codes:
+                mark_item_skipped(item_states[item_code], reason, draft_name)
+            continue
+        _upsert_inventory_document(diagnostics, "Stock Entry", draft_name,
+            existing_draft_purpose, "pre-existing draft acted upon by this run", "revalidated; pending submission",
+            source_warehouses=draft_plan["sources"], target_warehouse=", ".join(draft_plan["targets"]))
         for item_code in revalidated_codes:
             state = item_states[item_code]
             state["draft_outcome"] = "revalidated and eligible"
@@ -5571,54 +5799,51 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             r"[^A-Za-z0-9_]", "_", draft_name
         )
         committed = False
+        commit_attempted = False
         try:
             frappe.db.savepoint(savepoint_name)
             draft.submit()
+            commit_attempted = True
             frappe.db.commit()
             committed = True
-            for item_code, quantities in pre_submit_quantities.items():
-                if item_code not in draft_quantities:
-                    continue
-                submitted_draft_baselines.setdefault(item_code, quantities)
-            draft.reload()
-            if draft.docstatus != 1:
-                raise RuntimeError(
-                    f"committed Stock Entry reloaded with docstatus={draft.docstatus}"
-                )
+            _verify_prep_draft_movement(draft, draft_plan, before_draft_balances)
             diagnostics["drafts_submitted_verified"] += 1
-            diagnostics["submitted_finished_to_prep_qty"] += sum(
-                draft_quantities.values()
-            )
+            diagnostics["submitted_finished_to_prep_qty"] += draft_plan["prep_by_source"].get(FINISHED_GOODS_WAREHOUSE, 0)
+            diagnostics["submitted_main_to_prep_qty"] = diagnostics.get("submitted_main_to_prep_qty", 0) + draft_plan["prep_by_source"].get(MAIN_TO_PREP_SOURCE_WAREHOUSE, 0)
+            diagnostics["submitted_draft_net_prep_qty"] = diagnostics.get("submitted_draft_net_prep_qty", 0) + sum(draft_plan["prep_net"].values())
             _upsert_inventory_document(
                 diagnostics,
                 "Stock Entry",
                 draft_name,
                 existing_draft_purpose,
                 "pre-existing draft acted upon by this run",
-                "submitted, committed, and docstatus verified",
+                "submitted, committed, and whole-draft ledger/Bin movement verified",
             )
             for item_code, moved_qty in draft_quantities.items():
                 if item_code not in item_states:
                     continue
-                submitted_draft_qty_by_item[item_code] += moved_qty
                 submitted_draft_names_by_item[item_code].append(draft_name)
                 state = item_states[item_code]
-                state["draft_expected_qty"] += moved_qty
-                state["draft_outcome"] = "submitted, committed, and docstatus verified"
+                state["draft_expected_qty"] += draft_plan["prep_net"].get(item_code, 0)
+                state["draft_outcome"] = "submitted, committed, and whole-draft ledger/Bin movement verified"
                 _record_inbound_flow_event(
                     diagnostics,
                     "Eligible draft submitted and verified",
                     state,
-                    "Submission committed and reloaded with docstatus 1",
+                    "Whole draft committed; all source/destination ledger and Bin movements verified",
                     draft_name,
                     moved_qty,
                 )
         except Exception as exc:
+            affected_items = set(draft_quantities) | set(getattr(exc, "_fba_draft_affected_item_codes", ()))
             reason = _concise_inventory_exception(exc)
-            if committed:
+            if committed or commit_attempted:
+                affected_items = _hold_unverified_prep_draft(
+                    draft_name, draft, draft_plan, diagnostics, exc)
                 diagnostics["drafts_committed_unverified"] += 1
                 outcome = "Submitted draft could not be verified"
-                reason = "Committed state could not be safely verified: " + reason
+                reason = ("Committed state could not be safely verified: " if committed
+                          else "Commit attempted; transfer outcome unverified: ") + reason
                 _record_inventory_trigger(
                     diagnostics,
                     "33",
@@ -5633,7 +5858,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     "pre-existing draft acted upon by this run",
                     "submission state unverified after commit",
                 )
-                for item_code in set(draft_quantities) & set(item_states):
+                for item_code in affected_items & set(item_states):
                     state = item_states[item_code]
                     state["draft_outcome"] = "committed state could not be verified"
                     mark_item_skipped(state, reason, draft_name)
@@ -5664,6 +5889,10 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 try:
                     frappe.db.rollback(save_point=savepoint_name)
                 except Exception as rollback_exc:
+                    affected_items = _hold_unverified_prep_draft(
+                        draft_name, draft, draft_plan, diagnostics, exc)
+                    for item_code in affected_items & set(item_states):
+                        mark_item_skipped(item_states[item_code], "Draft rollback unverified", draft_name)
                     _record_inbound_flow_global_error(
                         diagnostics,
                         f"Draft {draft_name} savepoint rollback failed: "
@@ -5680,6 +5909,11 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                         draft_name,
                         draft_quantities.get(item_code, 0),
                     )
+
+    if diagnostics.get("unverified_draft_scope_unknown"):
+        for state in item_states.values():
+            mark_item_skipped(state, "Unverified draft impact could not be bounded")
+        raise RuntimeError("Unverified draft impact is unknown; further stock writes stopped")
 
     # Always allocate from fresh Bins after draft processing. Submitted-draft
     # deltas are verified before either source can be used.
@@ -5703,38 +5937,9 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             "fresh_prep_qty": current_prep,
             "fresh_finished_goods_qty": current_finished,
         })
-        moved_qty = submitted_draft_qty_by_item.get(item_code, 0)
-        if moved_qty:
-            baseline = submitted_draft_baselines.get(item_code)
-            delta_verified = bool(
-                baseline
-                and current_prep >= baseline[1] + moved_qty
-                and current_finished <= baseline[2] - moved_qty
-            )
-            if not delta_verified:
-                reason = (
-                    "Fresh post-draft quantities did not safely reflect the "
-                    f"submitted movement of {moved_qty}"
-                )
-                _record_inventory_trigger(
-                    diagnostics,
-                    "34",
-                    "A draft's expected warehouse quantity movement could not be verified",
-                    (submitted_draft_names_by_item.get(item_code) or [item_code])[-1],
-                )
-                mark_item_skipped(
-                    state,
-                    reason,
-                    (submitted_draft_names_by_item.get(item_code) or [None])[-1],
-                )
-                _record_inbound_flow_event(
-                    diagnostics,
-                    "Fresh Bin reread or submitted-draft delta verification failed",
-                    state,
-                    reason,
-                    (submitted_draft_names_by_item.get(item_code) or [None])[-1],
-                    moved_qty,
-                )
+        # Every submitted draft was already verified across all its warehouse
+        # routes, in stock units. Allocation still uses these fresh Bins only;
+        # non-Prep destinations are never mistaken for extra Prep supply.
 
     def add_source_transfer_rows(source_wh, request_key, valid_key, states):
         correction_rows = []
