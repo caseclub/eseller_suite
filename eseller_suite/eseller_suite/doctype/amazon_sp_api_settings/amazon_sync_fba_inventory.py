@@ -1947,6 +1947,9 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                     f"  Purpose: {record['purpose']}",
                     f"  Origin: {record['origin']}",
                     f"  Final known status/outcome: {record['status']}",
+                    *(["  Draft posting verification: " + json.dumps(
+                        record["draft_posting_verification"], sort_keys=True, default=str)]
+                      if record.get("draft_posting_verification") else []),
                     "  Source warehouse(s): "
                     + (", ".join(source_warehouses) or "<none>"),
                     f"  Target warehouse: "
@@ -2527,6 +2530,26 @@ def _stock_entry_item_quantities(stock_entry):
     return dict(quantities)
 
 
+def _prep_draft_posting_mode(value):
+    """Read ERP's Edit Posting Date and Time checkbox without truthy strings."""
+    if value in (None, False, 0, "", "0"):
+        return 0
+    if value in (True, 1, "1"):
+        return 1
+    raise ValueError(f"Invalid transfer set_posting_time value: {value!r}")
+
+
+def _prep_draft_posting_datetime(posting_date, posting_time, label):
+    """Normalize SQL date/time values to ERP's site-local naive datetime."""
+    if posting_date in (None, "") or posting_time in (None, ""):
+        raise ValueError(f"{label}: missing posting date/time")
+    date_value = frappe.utils.getdate(posting_date)
+    time_value = frappe.utils.get_timedelta(posting_time)
+    if not isinstance(time_value, timedelta) or not timedelta(0) <= time_value < timedelta(days=1):
+        raise ValueError(f"{label}: invalid posting time {posting_time!r}")
+    return datetime.combine(date_value, datetime.min.time()) + time_value
+
+
 def _prep_draft_movement_plan(stock_entry, prep_wh):
     """Read the whole draft in stock units; relevance is separate from effects."""
     effects, item_totals, qualifying, prep_sources = (defaultdict(float) for _ in range(4))
@@ -2571,8 +2594,15 @@ def _prep_draft_movement_plan(stock_entry, prep_wh):
         raise ValueError("Nonfinite total transfer stock quantity")
     if len(sources) != 1 or not sources <= {FINISHED_GOODS_WAREHOUSE, MAIN_TO_PREP_SOURCE_WAREHOUSE}:
         raise ValueError("Transfer draft must have one homogeneous Main or Finished Goods source")
+    posting_mode = _prep_draft_posting_mode(getattr(stock_entry, "set_posting_time", None))
+    posting_time = getattr(stock_entry, "posting_time", None)
+    if posting_mode:
+        # An explicit backdate must be complete before we attempt submission.
+        _prep_draft_posting_datetime(stock_entry.posting_date, posting_time, "Draft")
     return {"effects": dict(effects), "signature": sorted(signature),
         "company": stock_entry.company, "posting_date": str(stock_entry.posting_date),
+        "posting_time": posting_time, "set_posting_time": posting_mode,
+        "voucher_name": getattr(stock_entry, "name", None),
         "item_quantities": dict(item_totals), "qualifying_prep_quantities": dict(qualifying),
         "prep_net": {item: effects.get((item, prep_wh), 0) for item in item_totals},
         "prep_by_source": dict(prep_sources), "total_stock_qty": sum(item_totals.values()),
@@ -2587,22 +2617,73 @@ def _read_prep_draft_balances(plan):
 
 
 def _verify_prep_draft_movement(stock_entry, plan, before):
-    """Verify every route/item, including non-Prep rows, without any stock write."""
+    """Verify the entire posted transfer, including ERP's normal timestamp reset."""
     affected_items = set(plan["item_quantities"])
+    details = {"original_posting_date": plan["posting_date"],
+               "original_posting_time": str(plan.get("posting_time")),
+               "original_set_posting_time": plan["set_posting_time"],
+               "submit_started_at": str(plan.get("submit_started_at")),
+               "submit_finished_at": str(plan.get("submit_finished_at"))}
+    plan["posting_verification"] = details
     try:
         affected_items.update(row.item_code for row in stock_entry.items if row.item_code)
         stock_entry.reload()
         affected_items.update(row.item_code for row in stock_entry.items if row.item_code)
-        if stock_entry.docstatus != 1 or stock_entry.company != plan["company"]:
-            raise RuntimeError("Committed transfer is not submitted in the expected company")
+        details.update({"committed_posting_date": str(stock_entry.posting_date),
+                        "committed_posting_time": str(getattr(stock_entry, "posting_time", None)),
+                        "committed_set_posting_time": getattr(stock_entry, "set_posting_time", None)})
+        if stock_entry.docstatus != 1:
+            raise RuntimeError(f"Transfer docstatus mismatch: expected 1, found {stock_entry.docstatus!r}")
+        if stock_entry.company != plan["company"]:
+            raise RuntimeError(f"Transfer company mismatch: expected {plan['company']!r}, found {stock_entry.company!r}")
+        if stock_entry.name != plan["voucher_name"]:
+            raise RuntimeError(f"Transfer voucher identity mismatch: expected {plan['voucher_name']!r}, found {stock_entry.name!r}")
+        if stock_entry.stock_entry_type != "Material Transfer":
+            raise RuntimeError(f"Transfer type mismatch: expected 'Material Transfer', found {stock_entry.stock_entry_type!r}")
         current_plan = _prep_draft_movement_plan(stock_entry, plan["prep_warehouse"])
-        if (current_plan["signature"] != plan["signature"]
-                or current_plan["posting_date"] != plan["posting_date"]
-                or stock_entry.stock_entry_type != "Material Transfer"):
-            raise RuntimeError("Committed transfer routes/quantities changed after revalidation")
+        if current_plan["signature"] != plan["signature"]:
+            raise RuntimeError("Transfer route/stock-quantity mismatch: "
+                f"expected {plan['signature'][:5]!r} ({len(plan['signature'])} rows); "
+                f"found {current_plan['signature'][:5]!r} ({len(current_plan['signature'])} rows)")
+        if current_plan["set_posting_time"] != plan["set_posting_time"]:
+            raise RuntimeError("Transfer posting-mode mismatch: "
+                f"set_posting_time {plan['set_posting_time']} -> {current_plan['set_posting_time']}")
+        committed_at = _prep_draft_posting_datetime(
+            stock_entry.posting_date, stock_entry.posting_time, "Committed transfer")
+        started, finished = plan.get("submit_started_at"), plan.get("submit_finished_at")
+        if (not isinstance(started, datetime) or not isinstance(finished, datetime)
+                or started.tzinfo is not None or finished.tzinfo is not None
+                or finished < started):
+            raise RuntimeError("Missing/invalid site-local transfer submission time bounds")
+        if plan["set_posting_time"]:
+            if committed_at > started:
+                raise RuntimeError(f"Explicit transfer posting timestamp is in the future: {committed_at}; submit start={started}")
+            original_at = _prep_draft_posting_datetime(
+                plan["posting_date"], plan["posting_time"], "Original draft")
+            if committed_at != original_at:
+                raise RuntimeError(f"Explicit transfer posting timestamp changed: {original_at} -> {committed_at}")
+            details["posting_policy"] = "explicit posting date/time preserved"
+        else:
+            # ERPNext validate_posting_time sets both fields to site now when
+            # set_posting_time is false. Require the actual submit interval,
+            # not merely the same day, and do not backdate the document ourselves.
+            if not started <= committed_at <= finished:
+                raise RuntimeError("Automatic transfer posting timestamp outside submission interval: "
+                    f"posted={committed_at}; expected between {started} and {finished}")
+            details["posting_policy"] = "ERP automatic posting timestamp verified within submit interval"
+
+        # A deliberately backdated entry can need later ledger/valuation replay.
+        # Do not treat a pending replay or a masked Bin delta as usable supply.
+        reposts = frappe.get_all("Repost Item Valuation", filters={
+            "voucher_type": "Stock Entry", "voucher_no": plan["voucher_name"],
+            "docstatus": ["!=", 2]}, fields=["name", "status"])
+        pending = [row for row in reposts if row.status != "Completed"]
+        if pending:
+            raise RuntimeError("Transfer repost pending/failed: " + ", ".join(
+                f"{row.name} ({row.status})" for row in pending[:5]))
         ledger = frappe.get_all("Stock Ledger Entry", filters={
-            "voucher_type": "Stock Entry", "voucher_no": stock_entry.name, "is_cancelled": 0},
-            fields=["item_code", "warehouse", "actual_qty", "company"])
+            "voucher_type": "Stock Entry", "voucher_no": plan["voucher_name"], "is_cancelled": 0},
+            fields=["item_code", "warehouse", "actual_qty", "company", "posting_date", "posting_time"])
         affected_items.update(row.item_code for row in ledger if row.item_code)
         if not ledger:
             raise RuntimeError("Committed transfer has no uncancelled Stock Ledger evidence")
@@ -2610,6 +2691,11 @@ def _verify_prep_draft_movement(stock_entry, plan, before):
         for row in ledger:
             if row.company != plan["company"] or row.actual_qty is None:
                 raise RuntimeError("Missing/foreign transfer Stock Ledger evidence")
+            ledger_at = _prep_draft_posting_datetime(
+                row.posting_date, row.posting_time, "Transfer Stock Ledger")
+            if ledger_at != committed_at:
+                raise RuntimeError(f"Transfer ledger posting timestamp mismatch for {(row.item_code, row.warehouse)!r}: "
+                    f"document={committed_at}; ledger={ledger_at}")
             delta = float(row.actual_qty)
             if not math.isfinite(delta):
                 raise RuntimeError("Nonfinite transfer Stock Ledger movement")
@@ -2618,14 +2704,17 @@ def _verify_prep_draft_movement(stock_entry, plan, before):
             raise RuntimeError("Transfer Stock Ledger item/warehouse coverage differs from full draft")
         for key, expected in plan["effects"].items():
             if abs(posted[key] - expected) > INBOUND_DEBT_QTY_TOLERANCE:
-                raise RuntimeError(f"Transfer Stock Ledger net movement differs: {key}")
+                raise RuntimeError(f"Transfer Stock Ledger net movement differs: {key}; expected={expected}; posted={posted[key]}")
         after = _read_prep_draft_balances(plan)
         for key, expected in plan["effects"].items():
             if abs(after[key] - before[key] - expected) > INBOUND_DEBT_QTY_TOLERANCE:
-                raise RuntimeError(f"Fresh whole-draft warehouse net movement differs: {key}")
+                raise RuntimeError(f"Fresh whole-draft warehouse net movement differs: {key}; "
+                    f"before={before[key]}; after={after[key]}; expected_delta={expected}; "
+                    f"posting_timestamp={committed_at}. Backdated resets/reposts or concurrent stock activity require review.")
+        details["ledger_and_bin_verification"] = "all routes verified"
     except Exception as exc:
-        # Carry every observed item into both-pass holds, even when a hook or
-        # unexpected ledger row changed the document beyond the original plan.
+        details["verification_failure"] = str(exc)
+        # Retain every observed item for the independent uncertainty collector.
         try:
             exc._fba_draft_affected_item_codes = sorted(affected_items)
         except Exception:
@@ -3558,7 +3647,13 @@ def _submit_historical_debt_drafts(
         commit_attempted = False
         try:
             frappe.db.savepoint(savepoint_name)
+            draft_plan["submit_started_at"] = frappe.utils.now_datetime()
+            if (draft_plan["set_posting_time"] and _prep_draft_posting_datetime(
+                    draft_plan["posting_date"], draft_plan["posting_time"], "Explicit draft")
+                    > draft_plan["submit_started_at"]):
+                raise RuntimeError("Explicit transfer posting timestamp is in the future; draft not submitted")
             draft.submit()
+            draft_plan["submit_finished_at"] = frappe.utils.now_datetime()
             commit_attempted = True
             frappe.db.commit()
             committed = True
@@ -3585,6 +3680,7 @@ def _submit_historical_debt_drafts(
                 "historical synthetic Inbound debt repayment",
                 "pre-existing draft acted upon by the historical-debt phase",
                 "submitted, committed, and movement verified",
+                extra_details={"draft_posting_verification": draft_plan.get("posting_verification", {})},
             )
             _record_inbound_flow_event(
                 diagnostics,
@@ -3640,6 +3736,7 @@ def _submit_historical_debt_drafts(
                 "historical synthetic Inbound debt repayment",
                 "pre-existing draft acted upon by the historical-debt phase",
                 status,
+                extra_details={"draft_posting_verification": draft_plan.get("posting_verification", {})},
             )
             _record_inbound_flow_event(
                 diagnostics,
@@ -5802,7 +5899,13 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
         commit_attempted = False
         try:
             frappe.db.savepoint(savepoint_name)
+            draft_plan["submit_started_at"] = frappe.utils.now_datetime()
+            if (draft_plan["set_posting_time"] and _prep_draft_posting_datetime(
+                    draft_plan["posting_date"], draft_plan["posting_time"], "Explicit draft")
+                    > draft_plan["submit_started_at"]):
+                raise RuntimeError("Explicit transfer posting timestamp is in the future; draft not submitted")
             draft.submit()
+            draft_plan["submit_finished_at"] = frappe.utils.now_datetime()
             commit_attempted = True
             frappe.db.commit()
             committed = True
@@ -5818,6 +5921,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 existing_draft_purpose,
                 "pre-existing draft acted upon by this run",
                 "submitted, committed, and whole-draft ledger/Bin movement verified",
+                extra_details={"draft_posting_verification": draft_plan.get("posting_verification", {})},
             )
             for item_code, moved_qty in draft_quantities.items():
                 if item_code not in item_states:
@@ -5857,6 +5961,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     existing_draft_purpose,
                     "pre-existing draft acted upon by this run",
                     "submission state unverified after commit",
+                    extra_details={"draft_posting_verification": draft_plan.get("posting_verification", {})},
                 )
                 for item_code in affected_items & set(item_states):
                     state = item_states[item_code]
