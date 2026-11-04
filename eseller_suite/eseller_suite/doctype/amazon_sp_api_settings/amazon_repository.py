@@ -1504,8 +1504,8 @@ class AmazonRepository:
         channel_hint = (order.get("FulfillmentChannel") or "").upper()
         incoming_status = order.get("OrderStatus")
         if so_id and not so_docstatus and channel_hint == "MFN":
-            # Normal Orders sync may rediscover the same MFN order every run because this
-            # repository queries by CreatedAfter. Same-status drafts obey the retry cadence;
+            # Overlapping update windows may rediscover the same MFN order every run.
+            # Same-status drafts obey the retry cadence;
             # status transitions (especially -> Shipped/InvoiceUnconfirmed) bypass it once.
             same_status = existing_order_status == incoming_status
             horizon_cutoff = get_datetime(add_days(nowdate(), -MFN_FINANCE_RETRY_HORIZON_DAYS))
@@ -2069,7 +2069,10 @@ class AmazonRepository:
             )
         return newly_submitted
 
-    def _fetch_and_process_orders(self, statuses, channel, last_updated_after, last_updated_before, sales_orders):
+    def _fetch_and_process_orders(
+        self, statuses, channel, last_updated_after, last_updated_before, sales_orders,
+        *, use_last_updated=True,
+    ):
         # ── first fetch ──────────────────────────────────────────────────
         orders_payload = _list_orders(
             self.amz_setting,
@@ -2078,9 +2081,9 @@ class AmazonRepository:
             order_statuses=",".join(statuses),
             fulfillment_channels=channel,  # Note: Pass as str, not list (e.g., "AFN")
             max_results=50,
-            # MFN must be rediscovered when an older order changes status to Shipped.
-            # Preserve the established AFN CreatedAfter behavior unchanged.
-            use_last_updated=(channel == "MFN"),
+            # Discover older orders when their status changes to Shipped.
+            # AFN manual single-day imports explicitly retain creation-date filtering.
+            use_last_updated=use_last_updated,
         )
 
         #print(f"Orders Payload: {orders_payload}", flush=True)
@@ -2155,21 +2158,25 @@ class AmazonRepository:
 
         dt = getdate(last_updated_after)
         
-        # NOTE: Now treating last_updated_after as the "created after" guard date for filtering.
-        created_after = f"{dt.strftime('%Y-%m-%d')}T00:00:00Z"
+        # Scheduled searches use update dates; AFN manual single-day imports use creation dates.
+        window_after = f"{dt.strftime('%Y-%m-%d')}T00:00:00Z"
         
         if sync_selected_date_only:
-            last_updated_before = (add_days(getdate(created_after), 1).strftime("%Y-%m-%dT00:00:00Z"))
+            last_updated_before = (add_days(getdate(window_after), 1).strftime("%Y-%m-%dT00:00:00Z"))
         else:
             last_updated_before = None
             
         sales_orders = []
         
-        # Fetch AFN orders
-        self._fetch_and_process_orders(afn_statuses, "AFN", created_after, last_updated_before, sales_orders)
+        # Scheduled AFN searches catch late shipments regardless of purchase date.
+        # Keep manual single-day imports scoped to orders created on the selected date.
+        self._fetch_and_process_orders(
+            afn_statuses, "AFN", window_after, last_updated_before, sales_orders,
+            use_last_updated=not bool(sync_selected_date_only),
+        )
 
-        # Fetch MFN orders
-        self._fetch_and_process_orders(mfn_statuses, "MFN", created_after, last_updated_before, sales_orders)
+        # Fetch MFN orders (existing update-date behavior).
+        self._fetch_and_process_orders(mfn_statuses, "MFN", window_after, last_updated_before, sales_orders)
 
         # Financial Events can lag. Recheck only recent MFN drafts on a bounded cadence, and
         # pass an MFN SO to the invoice submitter only when this repository just finalized it.
