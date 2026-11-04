@@ -2809,6 +2809,227 @@ def _eligible_finished_to_prep_draft(
     return bool(set(plan["qualifying_prep_quantities"]) & set(needed_item_codes))
 
 
+# Main Warehouse draft authorization is independent of ERP shortages, synthetic
+# debt, protected targets, and the transition-window CSV. Only raw LIVE S+R is
+# observed here. A durable high-water mark prevents overlapping/replayed gains.
+class _MainToPrepEvidence:
+    def __init__(self, settings, diagnostics, path=None):
+        self.settings = settings
+        self.diagnostics = diagnostics
+        self.available = {}
+        self.ready = False
+        self.state = None
+        self.scope = {
+            "site": str(getattr(getattr(frappe, "local", None), "site", "") or ""),
+            "settings": str(getattr(settings, "name", "") or ""),
+            "company": settings.company,
+            "marketplaces": sorted(parse_marketplaces(settings.custom_marketplace)),
+            "source": MAIN_TO_PREP_SOURCE_WAREHOUSE,
+            "prep": settings.custom_amazon_fba_staging_area,
+        }
+        scope_id = hashlib.sha256(json.dumps(self.scope, sort_keys=True).encode()).hexdigest()[:24]
+        self.path = (Path(path) if path is not None else Path(__file__).resolve().parent /
+                     ("amazon_main_to_prep_evidence_" + scope_id + ".json"))
+        diagnostics["_main_to_prep_evidence"] = self
+
+    def hold(self, draft_name, reason):
+        _upsert_inventory_document(self.diagnostics, "Stock Entry", draft_name,
+            "Authorize existing Main Warehouse to Prep draft from independent Amazon S+R increase",
+            "pre-existing draft", "held; not submitted", extra_details={"main_to_prep_hold": reason})
+        _record_inbound_flow_event(self.diagnostics, "Main Warehouse to Prep draft held",
+                                  reason=reason, document_name=draft_name)
+        return False
+
+    def observe(self, summaries, global_error):
+        """Observe independent LIVE gains, never ERP debt or protected targets.
+
+        Unallocated credit expires after 14 days; decreases never lower the
+        high-water mark because shipment identities are unavailable. Durable
+        reservations before submit prevent retry/commit-uncertainty reuse.
+        """
+        try:
+            window = self.diagnostics.get("_transition_window")
+            if not window or window.lock is None or not window.readable:
+                raise ValueError("Existing inventory-run lock/state is unavailable")
+            if global_error or not summaries:
+                raise ValueError("Complete LIVE Amazon observation is unavailable")
+            if not self.scope["site"] or not self.scope["settings"] or len(self.scope["marketplaces"]) != 1:
+                raise ValueError("Unambiguous site/account and single-marketplace scope required")
+            if self.path.is_symlink():
+                raise ValueError("Refusing symlink Main-to-Prep evidence state")
+            observed_at = datetime.now(timezone.utc)
+            state = {"schema": 1, "scope": self.scope, "observations": {},
+                     "observed_at": observed_at.isoformat(), "source": "LIVE Inventory Summaries S+R"}
+            if self.path.exists():
+                with self.path.open(encoding="utf-8") as handle:
+                    state = json.load(handle)
+                if state.get("schema") != 1 or state.get("scope") != self.scope or not isinstance(state.get("observations"), dict):
+                    raise ValueError("Invalid Main-to-Prep evidence state/scope")
+                previous_at = datetime.fromisoformat(state["observed_at"])
+                if (previous_at.tzinfo is None or previous_at >= observed_at
+                        or state.get("source") != "LIVE Inventory Summaries S+R"):
+                    raise ValueError("Nonmonotonic or untrusted Amazon observation provenance")
+                for old in state["observations"].values():
+                    if (not isinstance(old, dict) or not isinstance(old.get("sku"), str)
+                            or not isinstance(old.get("item"), str)):
+                        raise ValueError("Invalid stored Main-to-Prep observation")
+                    high_water = self.quantity(old.get("high_water"))
+                    if self.quantity(old.get("available")) > high_water:
+                        raise ValueError("Stored available evidence exceeds observed high-water quantity")
+                    since = datetime.fromisoformat(old["credit_since"])
+                    if since.tzinfo is None or since > previous_at:
+                        raise ValueError("Invalid stored evidence credit timestamp")
+            observations, ambiguous = {}, set()
+            for row in summaries:
+                if not isinstance(row, dict) or row.get("condition") != "NewItem":
+                    continue
+                asin = row.get("asin")
+                if not asin:
+                    continue
+                try:
+                    sku = row.get("sellerSku")
+                    if not isinstance(sku, str) or not sku:
+                        raise ValueError("Missing seller SKU")
+                    details = row.get("inventoryDetails") or {}
+                    shipped = self.quantity(details.get("inboundShippedQuantity"))
+                    receiving = self.quantity(details.get("inboundReceivingQuantity"))
+                    candidate = (sku, shipped, receiving)
+                    if asin in observations and observations[asin] != candidate:
+                        raise ValueError("Conflicting ASIN/SKU observations")
+                    observations[asin] = candidate
+                except (TypeError, ValueError, OverflowError):
+                    ambiguous.add(asin)
+            credits = {}
+            for asin, (sku, shipped, receiving) in observations.items():
+                if asin in ambiguous:
+                    continue
+                matches = frappe.get_all("Item", filters={"custom_asin": asin, "disabled": 0},
+                                         fields=["name", "is_stock_item"])
+                if len(matches) != 1 or not matches[0].is_stock_item:
+                    continue
+                item = matches[0].name
+                total = shipped + receiving
+                old = state["observations"].get(asin)
+                high_water = self.quantity(old["high_water"]) if old else total
+                available = 0
+                since = observed_at
+                if old and old["sku"] == sku and old["item"] == item:
+                    since = datetime.fromisoformat(old["credit_since"])
+                    if (observed_at - since).total_seconds() <= 14 * 86400:
+                        available = self.quantity(old["available"])
+                    if not available:
+                        since = observed_at
+                    available += max(total - high_water, 0)
+                    if available:
+                        credits[item] = available
+                state["observations"][asin] = {"sku": sku, "item": item,
+                    "high_water": max(high_water, total), "available": available,
+                    "credit_since": since.isoformat()}
+            state["observed_at"] = observed_at.isoformat()
+            if DEBUG:
+                # Debug must not establish/spend production evidence.
+                raise ValueError("DEBUG mode does not authorize Main Warehouse submissions")
+            self.persist(state)
+            self.state = state
+            self.available = credits
+            self.ready = True
+            _record_inbound_flow_event(self.diagnostics, "Main Warehouse evidence observed",
+                reason=("Durable raw LIVE S+R high-water observation; first observations grant no credit; "
+                        "unspent credit expires after 14 days; rebounds below previous peaks are not new evidence"),
+                quantity=sum(credits.values()))
+        except Exception as exc:
+            self.available = {}
+            self.ready = False
+            _record_inbound_flow_global_error(self.diagnostics,
+                "Main Warehouse to Prep automation held: " + _concise_inventory_exception(exc))
+    def persist(self, state):
+        """Atomic fsynced state write, always under the inventory-run lock."""
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(self.path.parent),
+                                             prefix=self.path.name + ".", delete=False) as handle:
+                temporary = handle.name
+                json.dump(state, handle, sort_keys=True, allow_nan=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+            directory_fd = os.open(str(self.path.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def quantity(value):
+        if value is None or isinstance(value, bool):
+            raise ValueError("Missing/invalid Amazon unit quantity")
+        number = float(value)
+        if not math.isfinite(number) or number < 0 or not number.is_integer():
+            raise ValueError("Amazon unit quantity must be a nonnegative integer")
+        return int(number)
+
+    def authorize(self, draft, plan, consume=False):
+        if MAIN_TO_PREP_SOURCE_WAREHOUSE not in plan["sources"]:
+            return True  # Preserve existing Finished Goods behavior exactly.
+        if plan["sources"] != [MAIN_TO_PREP_SOURCE_WAREHOUSE] or plan["targets"] != [plan["prep_warehouse"]]:
+            return self.hold(draft.name, "Main-source whole draft contains an unsupported/mixed route")
+        if not self.ready:
+            return self.hold(draft.name, "Independent durable Amazon S+R increase evidence is unavailable")
+        allocation = {}
+        for item, quantity in plan["item_quantities"].items():
+            try:
+                units = self.quantity(quantity)
+            except (TypeError, ValueError, OverflowError):
+                return self.hold(draft.name, "Nonintegral/ambiguous draft units for " + item)
+            # Exact integer ceiling: a 522-unit draft requires 470 observed units.
+            required = (9 * units + 9) // 10
+            available = self.available.get(item, 0)
+            if not units or available < required:
+                return self.hold(draft.name,
+                    f"{item}: independent unspent S+R increase {available}; required {required} of {units}")
+            allocation[item] = min(units, available)
+        if consume:
+            if DEBUG:
+                return self.hold(draft.name, "DEBUG must not reserve production evidence")
+            # Reserve the entire allocation in one durable write BEFORE submit.
+            # Never refund, even after a failed submit or uncertain DB commit.
+            try:
+                reserved = json.loads(json.dumps(self.state))
+                for item, quantity in allocation.items():
+                    matching = [row for row in reserved["observations"].values() if row["item"] == item]
+                    if len(matching) != 1 or matching[0]["available"] < quantity:
+                        raise ValueError("Ambiguous or insufficient durable item evidence")
+                    matching[0]["available"] -= quantity
+                self.persist(reserved)
+                self.state = reserved
+                for item, quantity in allocation.items():
+                    self.available[item] -= quantity
+            except Exception as exc:
+                self.ready = False
+                self.available = {}
+                return self.hold(draft.name, "Evidence reservation failed/uncertain: " + str(exc))
+        return True
+
+
+def _authorize_main_to_prep_draft(draft, plan, diagnostics, consume=False):
+    if MAIN_TO_PREP_SOURCE_WAREHOUSE not in plan["sources"]:
+        return True
+    evidence = diagnostics.get("_main_to_prep_evidence")
+    if evidence is None:
+        _record_inbound_flow_event(diagnostics, "Main Warehouse to Prep draft held",
+            reason="Independent Amazon S+R evidence gate was not initialized; synthetic debt is not authorization",
+            document_name=draft.name)
+        return False
+    return evidence.authorize(draft, plan, consume=consume)
+
+
 def _historical_debt_details(diagnostics):
     return diagnostics.setdefault("historical_debt", {})
 
@@ -3618,6 +3839,8 @@ def _submit_historical_debt_drafts(
             "Complete an existing Main/Finished Goods source draft before historical debt repayment",
             "pre-existing draft acted upon by the historical-debt phase", "revalidated; pending submission",
             source_warehouses=draft_plan["sources"], target_warehouse=", ".join(draft_plan["targets"]))
+        if not _authorize_main_to_prep_draft(draft, draft_plan, diagnostics):
+            continue
         if DEBUG:
             diagnostics["drafts_debug_would_submit"] += 1
             blocked_items.update(relevant_codes)
@@ -3652,6 +3875,8 @@ def _submit_historical_debt_drafts(
                     draft_plan["posting_date"], draft_plan["posting_time"], "Explicit draft")
                     > draft_plan["submit_started_at"]):
                 raise RuntimeError("Explicit transfer posting timestamp is in the future; draft not submitted")
+            if not _authorize_main_to_prep_draft(draft, draft_plan, diagnostics, consume=True):
+                continue
             draft.submit()
             draft_plan["submit_finished_at"] = frappe.utils.now_datetime()
             commit_attempted = True
@@ -5851,6 +6076,8 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 draft_quantities.get(item_code, 0),
             )
 
+        if not _authorize_main_to_prep_draft(draft, draft_plan, diagnostics):
+            continue
         if DEBUG:
             diagnostics["drafts_debug_would_submit"] += 1
             _upsert_inventory_document(
@@ -5904,6 +6131,8 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     draft_plan["posting_date"], draft_plan["posting_time"], "Explicit draft")
                     > draft_plan["submit_started_at"]):
                 raise RuntimeError("Explicit transfer posting timestamp is in the future; draft not submitted")
+            if not _authorize_main_to_prep_draft(draft, draft_plan, diagnostics, consume=True):
+                continue
             draft.submit()
             draft_plan["submit_finished_at"] = frappe.utils.now_datetime()
             commit_attempted = True
@@ -6981,6 +7210,8 @@ def process_fba_inventory():
         transition_window = _FbaTransitionWindow(settings, inbound_flow_diagnostics)
         if not transition_window.open():
             return  # A concurrent run must not use stale effective targets.
+        main_to_prep_evidence = _MainToPrepEvidence(settings, inbound_flow_diagnostics)
+        main_to_prep_evidence.observe(summaries, live_global_error)
         effective_main_targets, effective_inbound_targets = transition_window.prepare(
             asin_fulfillable, final_inbound_by_asin
         )
