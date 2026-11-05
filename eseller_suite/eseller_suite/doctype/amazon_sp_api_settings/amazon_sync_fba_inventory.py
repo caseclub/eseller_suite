@@ -3,6 +3,10 @@
 #  Syncs Amazon FBA inventory quantities to ERPNext using the FBA Inventory API,
 #  with a 6 AM MYI ALL report request and 7 AM report comparison for inbound inventory.
 # =========================================
+# New FC-transfer disappearances are protected for 96 elapsed hours.
+# Keep amazon_fba_fc_transfer_hold.json and its .initialized marker beside
+# this program across restarts and upgrades. No historical quantities are seeded.
+# The independent 14-day Inbound/Main transition window is unchanged.
 from __future__ import annotations
 import csv
 import base64
@@ -2488,6 +2492,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                     f"items in this group; {omitted_items} additional items omitted."
                 )
 
+        lines.extend(_fc_transfer_report_lines(inbound_flow_diagnostics))
         lines.extend(_transition_report_lines(inbound_flow_diagnostics))
         lines.extend(
             [
@@ -4800,6 +4805,391 @@ def _process_historical_inbound_debt(settings, diagnostics):
                 )
 
 
+# Persistent FC-transfer protection is separate from the 14-day Inbound/Main
+# transition ledger. Four days means 96 elapsed UTC hours, not calendar dates.
+FC_TRANSFER_HOLD_DAYS = 4
+FC_TRANSFER_STATE_NAME = "amazon_fba_fc_transfer_hold.json"
+FC_TRANSFER_MAX_STATE_BYTES = 32 * 1024 * 1024
+FC_TRANSFER_MAX_ASINS = 50000
+FC_TRANSFER_MAX_LOTS_PER_ASIN = 1000
+FC_TRANSFER_IDLE_RETENTION_DAYS = 30
+
+
+def _fc_transfer_time(value):
+    if not isinstance(value, str):
+        raise ValueError("FC-transfer timestamp must be a string")
+    # Python 3.10 does not accept Amazon's trailing Z directly.
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    result = datetime.fromisoformat(normalized)
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("FC-transfer timestamp must have a UTC offset")
+    return result.astimezone(timezone.utc)
+
+
+def _fc_transfer_int(value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 10 ** 12:
+        raise ValueError("FC-transfer quantity must be a bounded nonnegative integer")
+    return value
+
+
+def _fc_transfer_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate FC-transfer state key")
+        result[key] = value
+    return result
+
+
+class _FbaFcTransferWindow:
+    """Durable raw observations and independently expiring missing-FC lots.
+
+    First observations only establish baselines: no past-report backfill. The
+    old one-cycle inbound matcher keeps its behavior. Any reduction in its
+    protected inbound target has first claim on fresh C/F gains on the same
+    saved-observation edge (F first, then Core).
+    Only the unused fresh gains retire FC lots FIFO. This deliberately retains
+    ambiguous FC stock until its original deadline rather than spending one
+    arrival twice across different report/LIVE time horizons.
+
+    The state is observation evidence, not an ERP write queue. Saving it before
+    any ERP mutations makes retries/crashes idempotent, even when a later stock
+    document fails. Corrupt/unwritable state stops the run before stock writes.
+    """
+
+    def __init__(self, settings, diagnostics, now=None, path=None):
+        self.now = now or datetime.now(timezone.utc)
+        if self.now.tzinfo is None or self.now.utcoffset() is None:
+            raise ValueError("FC-transfer clock must be timezone aware")
+        self.now = self.now.astimezone(timezone.utc)
+        self.path = Path(path) if path is not None else Path(__file__).resolve().parent / FC_TRANSFER_STATE_NAME
+        self.marker = self.path.with_suffix(".initialized")
+        self.scope = {
+            "site": str(getattr(getattr(frappe, "local", None), "site", "") or ""),
+            "account": str(getattr(settings, "name", "") or ""),
+            "company": settings.company,
+            "main_warehouse": settings.afn_warehouse,
+            "inbound_warehouse": settings.custom_amazon_inbound_warehouse,
+            "marketplaces": sorted(set(parse_marketplaces(settings.custom_marketplace))),
+        }
+        self.diagnostics = diagnostics
+        self.entries = {}
+        self.lock = None
+        self.ready = False
+        self.stats = {"state_filename": self.path.name, "status": "not opened",
+                      "baselines_created": 0, "lots_created": 0,
+                      "new_missing_quantity": 0, "reappeared_quantity": 0,
+                      "core_matched_quantity": 0, "expired_quantity": 0,
+                      "expired_lots": 0, "unknown_observations": 0,
+                      "replayed_observations": 0, "blocked_asins": 0,
+                      "errors": [], "examples": []}
+        diagnostics["fc_transfer_window"] = self.stats
+
+    def error(self, message, asin=None):
+        if len(self.stats["errors"]) < 10:
+            self.stats["errors"].append(f"{asin or '<run>'}: {message}")
+        _record_inventory_trigger(self.diagnostics, "FC_TRANSFER_HOLD",
+                                  "FC-transfer protection needs review", asin or "state")
+
+    def block(self, asin, reason, item_codes=()):
+        window = self.diagnostics.get("_transition_window")
+        if window is not None:
+            window.blocked_asins.add(asin)
+            window.blocked_items.update(item_codes)
+            entry = self.entries.get(asin)
+            if entry is not None:
+                window.blocked_items.add(entry["item_code"])
+        self.stats["blocked_asins"] += 1
+        self.error(reason, asin)
+
+    def open(self):
+        try:
+            fd = os.open(str(self.path.with_suffix(".lock")),
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            self.lock = os.fdopen(fd, "a+")
+            fcntl.flock(self.lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if self.path.is_symlink() or self.marker.is_symlink():
+                raise ValueError("Refusing symlink FC-transfer state or marker")
+            if not self.path.exists():
+                if self.marker.exists():
+                    raise ValueError("Initialized FC-transfer state is missing; restore it before syncing")
+                self.stats["status"] = "new; first observations are baselines only"
+            else:
+                if self.path.stat().st_size > FC_TRANSFER_MAX_STATE_BYTES:
+                    raise ValueError("FC-transfer state exceeds size limit")
+                with self.path.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle, object_pairs_hook=_fc_transfer_json_object)
+                self.validate(data)
+                self.entries = data["asins"]
+                self.stats["status"] = "loaded"
+            self.ready = True
+            return True
+        except Exception as exc:
+            self.error(_concise_inventory_exception(exc))
+            self.stats["status"] = "blocked; original state preserved; no ERP stock writes"
+            self.finish()
+            return False
+
+    def validate(self, data):
+        if (not isinstance(data, dict) or set(data) != {"schema_version", "scope", "updated_at", "asins"}
+                or data["schema_version"] != 1 or isinstance(data["schema_version"], bool)
+                or data["scope"] != self.scope):
+            raise ValueError("Unsupported FC-transfer schema or account/site/warehouse scope")
+        updated = _fc_transfer_time(data["updated_at"])
+        if updated > self.now:
+            raise ValueError("FC-transfer state is newer than the current clock")
+        entries = data["asins"]
+        if not isinstance(entries, dict) or len(entries) > FC_TRANSFER_MAX_ASINS:
+            raise ValueError("Invalid or oversized FC-transfer ASIN state")
+        seen_lots = set()
+        for asin, entry in entries.items():
+            if not isinstance(asin, str) or not asin.strip() or len(asin) > 100:
+                raise ValueError("Invalid FC-transfer ASIN key")
+            if (not isinstance(entry, dict) or set(entry) != {
+                    "item_code", "observed_at", "source_key", "snapshot", "protected_inbound", "lots"}):
+                raise ValueError("Invalid FC-transfer entry fields")
+            if (not isinstance(entry["item_code"], str) or not entry["item_code"]
+                    or len(entry["item_code"]) > 1000
+                    or not isinstance(entry["source_key"], str) or not entry["source_key"]
+                    or len(entry["source_key"]) > 1000):
+                raise ValueError("Invalid FC-transfer item/source identity")
+            observed = _fc_transfer_time(entry["observed_at"])
+            if observed > updated:
+                raise ValueError("FC-transfer observation is after state update")
+            snapshot = entry["snapshot"]
+            if not isinstance(snapshot, dict) or set(snapshot) != {"C", "S", "R", "F"}:
+                raise ValueError("Invalid FC-transfer raw snapshot")
+            for value in snapshot.values():
+                _fc_transfer_int(value)
+            if _fc_transfer_int(entry["protected_inbound"]) < snapshot["S"] + snapshot["R"]:
+                raise ValueError("Protected inbound cannot be less than its raw S+R snapshot")
+            lots = entry["lots"]
+            if not isinstance(lots, list) or len(lots) > FC_TRANSFER_MAX_LOTS_PER_ASIN:
+                raise ValueError("Invalid or oversized FC-transfer lot list")
+            for lot in lots:
+                if not isinstance(lot, dict) or set(lot) != {
+                        "lot_id", "first_seen_at", "original_quantity", "remaining_quantity"}:
+                    raise ValueError("Invalid FC-transfer lot fields")
+                lot_id = lot["lot_id"]
+                if not isinstance(lot_id, str) or not lot_id or len(lot_id) > 100 or lot_id in seen_lots:
+                    raise ValueError("Missing/duplicate FC-transfer lot identity")
+                seen_lots.add(lot_id)
+                if _fc_transfer_time(lot["first_seen_at"]) > updated:
+                    raise ValueError("FC-transfer lot begins in the future")
+                original = _fc_transfer_int(lot["original_quantity"])
+                remaining = _fc_transfer_int(lot["remaining_quantity"])
+                if not 0 < remaining <= original:
+                    raise ValueError("Invalid FC-transfer lot balance")
+
+    def save(self):
+        data = {"schema_version": 1, "scope": self.scope,
+                "updated_at": self.now.isoformat(), "asins": self.entries}
+        self.validate(data)
+        payload = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        if len(payload.encode("utf-8")) > FC_TRANSFER_MAX_STATE_BYTES:
+            raise ValueError("FC-transfer state exceeds size limit; no stock writes permitted")
+        if DEBUG:
+            self.stats["status"] = "DEBUG preview; production FC state unchanged"
+            return
+        if self.path.is_symlink() or self.marker.is_symlink():
+            raise ValueError("Refusing symlink FC-transfer state or marker")
+        # A separate permanent marker distinguishes first installation from a
+        # later lost state file. A crash during initial setup fails closed.
+        if not self.marker.exists():
+            fd = os.open(str(self.marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as marker:
+                marker.write("FC-transfer state initialized; retain this marker and its JSON state.\n")
+                marker.flush()
+                os.fsync(marker.fileno())
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=str(self.path.parent),
+                                             prefix=self.path.name + ".", suffix=".tmp", delete=False) as handle:
+                temporary = handle.name
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+            directory_fd = os.open(str(self.path.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
+        self.stats["status"] = "saved before ERP stock writes"
+
+    def consume(self, entry, quantity):
+        consumed = 0
+        for lot in sorted(entry["lots"], key=lambda row: (_fc_transfer_time(row["first_seen_at"]), row["lot_id"])):
+            taken = min(quantity, lot["remaining_quantity"])
+            lot["remaining_quantity"] -= taken
+            consumed += taken
+            quantity -= taken
+            if not quantity:
+                break
+        entry["lots"] = [lot for lot in entry["lots"] if lot["remaining_quantity"]]
+        return consumed
+
+    def observe(self, asin, item_code, snapshot, observed_at, source_key,
+                protected_inbound, legacy_main, current_main):
+        """Return one protected Main target; never uses protected F as raw F."""
+        snapshot = {key: _fc_transfer_int(snapshot[key]) for key in ("C", "S", "R", "F")}
+        protected_inbound = _fc_transfer_int(protected_inbound)
+        if protected_inbound < snapshot["S"] + snapshot["R"]:
+            raise ValueError("Protected inbound cannot be less than raw S+R")
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("FC-transfer source clock must be timezone aware")
+        observed_at = observed_at.astimezone(timezone.utc)
+        if observed_at > self.now:
+            raise ValueError("FC-transfer source observation is in the future")
+        entry = self.entries.get(asin)
+        if entry is not None and entry["item_code"] != item_code:
+            self.block(asin, "ERP item mapping changed while FC evidence exists", (item_code,))
+            return max(legacy_main, current_main)
+        if entry is not None and observed_at <= _fc_transfer_time(entry["observed_at"]):
+            self.stats["replayed_observations"] += 1
+            # Identical reports may be reused, but cannot age or consume lots.
+            if source_key == entry["source_key"] and snapshot == entry["snapshot"]:
+                return snapshot["C"] + snapshot["F"] + sum(l["remaining_quantity"] for l in entry["lots"])
+            self.block(asin, "Older or conflicting FC observation cannot replace the saved baseline")
+            return max(legacy_main, current_main)
+        # First installation is forward-only. An established positive raw FC
+        # baseline survives outages: a newly observed loss starts its own clock.
+        if entry is None:
+            self.entries[asin] = {"item_code": item_code, "observed_at": observed_at.isoformat(),
+                                  "source_key": source_key, "snapshot": snapshot,
+                                  "protected_inbound": _fc_transfer_int(protected_inbound), "lots": []}
+            self.stats["baselines_created"] += 1
+            # Preserve the pre-existing one-cycle behavior on this initial run,
+            # but never turn a past-report difference into a four-day FC lot.
+            return legacy_main
+        old = entry["snapshot"]
+        f_gain = max(snapshot["F"] - old["F"], 0)
+        c_gain = max(snapshot["C"] - old["C"], 0)
+        inbound_drop = max(entry["protected_inbound"] - protected_inbound, 0)
+        # Only the actual protected-Inbound reduction on this saved raw edge
+        # claims fresh gains. Replaying an older report's allocations here would
+        # incorrectly attribute a new FC reappearance to an already-received
+        # inbound shipment. Ambiguous reductions get inbound priority.
+        reserved_f = min(f_gain, inbound_drop)
+        reserved_c = min(c_gain, max(inbound_drop - reserved_f, 0))
+        self.stats["reappeared_quantity"] += self.consume(entry, f_gain - reserved_f)
+        missing = max(old["F"] - snapshot["F"], 0)
+        if missing:
+            entry["lots"].append({"lot_id": uuid.uuid4().hex, "first_seen_at": self.now.isoformat(),
+                                  "original_quantity": missing, "remaining_quantity": missing})
+            self.stats["lots_created"] += 1
+            self.stats["new_missing_quantity"] += missing
+        self.stats["core_matched_quantity"] += self.consume(entry, c_gain - reserved_c)
+        # Match FIFO before expiry: a return at the old lot's deadline must not
+        # consume a newer, still-protected lot after discarding the oldest lot.
+        remaining = []
+        for lot in entry["lots"]:
+            if (self.now - _fc_transfer_time(lot["first_seen_at"])).total_seconds() >= FC_TRANSFER_HOLD_DAYS * 86400:
+                self.stats["expired_quantity"] += lot["remaining_quantity"]
+                self.stats["expired_lots"] += 1
+            else:
+                remaining.append(lot)
+        entry["lots"] = remaining
+        entry.update(observed_at=observed_at.isoformat(), source_key=source_key,
+                     snapshot=snapshot, protected_inbound=_fc_transfer_int(protected_inbound))
+        held = sum(lot["remaining_quantity"] for lot in entry["lots"])
+        if held and len(self.stats["examples"]) < 10:
+            self.stats["examples"].append({"asin": asin, "item_code": item_code,
+                "raw_fc": snapshot["F"], "held_fc": held,
+                "oldest_expires_at": (min(_fc_transfer_time(lot["first_seen_at"]) for lot in entry["lots"])
+                    + timedelta(days=FC_TRANSFER_HOLD_DAYS)).isoformat()})
+        return snapshot["C"] + snapshot["F"] + held
+
+    def prepare(self, main_targets, inbound_targets, today_source,
+                live_snapshots, live_invalid_asins, live_global_error,
+                live_observed_at, current_main_by_asin):
+        if not self.ready:
+            raise RuntimeError("FC-transfer protection is not ready")
+        targets = sorted(set(main_targets) | set(self.entries))
+        mappings = frappe.get_all("Item", filters={"custom_asin": ["in", targets],
+            "disabled": 0, "is_stock_item": 1}, fields=["name", "custom_asin"])
+        by_asin = defaultdict(list)
+        for row in mappings:
+            by_asin[row.custom_asin].append(row.name)
+        for asin in targets:
+            matches = by_asin.get(asin, [])
+            if len(matches) != 1:
+                if asin in self.entries:
+                    self.block(asin, "Saved FC evidence has no unique enabled ERP item mapping", matches)
+                continue
+            snapshot = None
+            observed_at = None
+            source_key = None
+            if not live_global_error and asin not in live_invalid_asins:
+                candidate = live_snapshots.get(asin)
+                if _snapshot_is_complete(candidate):
+                    snapshot, observed_at = candidate, live_observed_at
+                    source_key = "LIVE:" + live_observed_at.isoformat()
+            if snapshot is None and today_source.get("available") and asin not in today_source.get("invalid_asins", {}):
+                candidate = today_source.get("snapshots", {}).get(asin)
+                report = today_source.get("report") or {}
+                if _snapshot_is_complete(candidate) and report.get("reportId") and report.get("createdTime"):
+                    try:
+                        report_at = _fc_transfer_time(report["createdTime"])
+                        if 0 <= (self.now - report_at).total_seconds() <= MYI_REPORT_LOOKBACK_HOURS * 3600:
+                            snapshot, observed_at = candidate, report_at
+                            source_key = "MYI:" + str(report["reportId"])
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+            legacy_main = main_targets.get(asin, max(current_main_by_asin.get(asin, 0), 0))
+            current_main = max(current_main_by_asin.get(asin, 0), 0)
+            if snapshot is None:
+                self.stats["unknown_observations"] += 1
+                # Unknown F/absence is never zero and never expiry evidence.
+                if asin in self.entries:
+                    self.block(asin, "No complete current FC observation; existing protection retained")
+                main_targets[asin] = max(legacy_main, current_main)
+                continue
+            main_targets[asin] = self.observe(
+                asin, matches[0], snapshot, observed_at, source_key,
+                int(inbound_targets.get(asin, 0)), legacy_main, current_main)
+        # Compact only idle entries with no unresolved protection. No unbounded
+        # daily history or processed-ID set is stored. Never evict pending lots
+        # or a positive raw-F baseline merely because the source went missing.
+        self.entries = {asin: entry for asin, entry in self.entries.items()
+            if entry["lots"] or entry["snapshot"]["F"] or (self.now - _fc_transfer_time(entry["observed_at"])).total_seconds()
+            <= FC_TRANSFER_IDLE_RETENTION_DAYS * 86400}
+        self.stats["pending_lots"] = sum(len(entry["lots"]) for entry in self.entries.values())
+        self.stats["pending_quantity"] = sum(lot["remaining_quantity"] for entry in self.entries.values() for lot in entry["lots"])
+        try:
+            self.save()
+        except Exception as exc:
+            self.error("FC state could not be durably saved; no ERP stock writes: " + _concise_inventory_exception(exc))
+            self.stats["status"] = "save failed; stock sync stopped"
+            raise
+
+    def finish(self):
+        if self.lock is not None:
+            try:
+                fcntl.flock(self.lock.fileno(), fcntl.LOCK_UN)
+            finally:
+                self.lock.close()
+                self.lock = None
+
+
+def _fc_transfer_report_lines(diagnostics):
+    stats = (diagnostics or {}).get("fc_transfer_window")
+    if not stats:
+        return []
+    lines = ["", "FOUR-DAY FC-TRANSFER PROTECTION (96 ELAPSED HOURS)",
+             "Forward-only raw observations; separate from the 14-day Inbound/Main window."]
+    for key, value in stats.items():
+        if key not in ("errors", "examples"):
+            lines.append(f"{key}: {value}")
+    lines.extend("FC-transfer error: " + value for value in stats["errors"])
+    lines.extend("FC-transfer hold: " + json.dumps(value, sort_keys=True) for value in stats["examples"])
+    return lines
+
+
 # The transition ledger is deliberately separate from synthetic Inbound debt.
 # Schema v1: one unresolved quantity lot per row, keyed by ERP item_code.
 # context records company/site/warehouses and protected targets, never report IDs.
@@ -7007,6 +7397,7 @@ def process_fba_inventory():
     temporary_log_inputs = None
     inbound_flow_diagnostics = None
     transition_window = None
+    fc_transfer_window = None
     try:  # ADDED: High-level wrap for entire function
         repo = AmazonRepository("q3opu7c5ac")
         settings = repo.amz_setting
@@ -7023,6 +7414,9 @@ def process_fba_inventory():
         # Gather LIVE data after report discovery. Do not abort if the live pull
         # is unavailable; report-only Mode 1 and per-ASIN Mode 4 must still run.
         summaries = []
+        # Capture before fetching, so a slower earlier pull cannot overwrite a
+        # newer observation saved by a concurrent run.
+        live_observed_at = datetime.now(timezone.utc)
         live_global_error = None
         try:
             for mkt_id in marketplace_ids:
@@ -7210,6 +7604,14 @@ def process_fba_inventory():
         transition_window = _FbaTransitionWindow(settings, inbound_flow_diagnostics)
         if not transition_window.open():
             return  # A concurrent run must not use stale effective targets.
+        fc_transfer_window = _FbaFcTransferWindow(settings, inbound_flow_diagnostics)
+        if not fc_transfer_window.open():
+            return  # Never mutate ERP using missing/corrupt/unlocked FC state.
+        fc_transfer_window.prepare(
+            asin_fulfillable, final_inbound_by_asin,
+            today_source, live_snapshots, live_invalid_asins,
+            live_global_error, live_observed_at, current_main_by_asin,
+        )
         main_to_prep_evidence = _MainToPrepEvidence(settings, inbound_flow_diagnostics)
         main_to_prep_evidence.observe(summaries, live_global_error)
         effective_main_targets, effective_inbound_targets = transition_window.prepare(
@@ -7449,6 +7851,8 @@ def process_fba_inventory():
         frappe.log_error(frappe.get_traceback(), "FBA Inventory Process Error")
         raise
     finally:
+        if fc_transfer_window is not None:
+            fc_transfer_window.finish()
         if transition_window is not None:
             transition_window.finish()
         if temporary_log_inputs is not None:
