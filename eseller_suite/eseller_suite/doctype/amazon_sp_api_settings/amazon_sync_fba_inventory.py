@@ -7,6 +7,8 @@
 # Keep amazon_fba_fc_transfer_hold.json and its .initialized marker beside
 # this program across restarts and upgrades. No historical quantities are seeded.
 # The independent 14-day Inbound/Main transition window is unchanged.
+# 2026-11-12: ERP-ledger Prep aging; 14-day evidence-based debt repayment.
+# Existing transfer gates and synthetic-duplicate reconciliation safeguards remain.
 from __future__ import annotations
 import csv
 import base64
@@ -65,8 +67,9 @@ MAIN_TO_PREP_SOURCE_WAREHOUSE = "Main Warehouse - CC"
 MAX_INBOUND_FLOW_EXAMPLES_PER_GROUP = 10
 MAX_INBOUND_FLOW_EXAMPLES_TOTAL = 50
 MAX_DOCUMENT_NAMES_PER_GROUP = 10
-INBOUND_DEBT_LOOKBACK_DAYS = 7
+INBOUND_DEBT_LOOKBACK_DAYS = 14
 INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS = 14
+INBOUND_DEBT_HISTORY_ROW_LIMIT = 100000
 INBOUND_DEBT_TIMEZONE = "America/Los_Angeles"
 INBOUND_DEBT_WINDOW_START_SECONDS = 6 * 60 * 60
 INBOUND_DEBT_WINDOW_END_SECONDS = 8 * 60 * 60
@@ -2297,7 +2300,7 @@ def _log_temporary_consolidated_fallbacks_and_failures(
                 "HISTORICAL SYNTHETIC INBOUND DEBT REPAYMENT SUMMARY",
                 "Summary totals are complete and are not truncated.",
                 f"Actionable original ages: 1-{INBOUND_DEBT_LOOKBACK_DAYS} prior calendar days; "
-                f"older attribution-only ages: {INBOUND_DEBT_LOOKBACK_DAYS + 1}-{INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS}; "
+                "attribution: complete verified history for relevant items; "
                 f"manual-credit event age limit: {INBOUND_DEBT_LOOKBACK_DAYS} days.",
                 f"Phase status: {debt.get('status', 'not run')}",
                 f"Distributed lock status: "
@@ -3232,8 +3235,8 @@ def _verified_reconciliation_movements(voucher_names, warehouses, company):
 def _reconstruct_historical_debt_credits(original_buckets, events, manual_credit_days):
     """Replay verified credits on fresh bucket copies; never mutate the inputs.
 
-    The real phase uses seven days. The separate informational older-window
-    review may replay fourteen days without changing real debt or stock.
+    The real phase uses fourteen days. Discovery includes the complete
+    relevant item history so earlier FIFO credits cannot move to newer debt.
     """
     buckets = {}
     for key, source in original_buckets.items():
@@ -3338,43 +3341,43 @@ def _reconstruct_historical_debt_credits(original_buckets, events, manual_credit
     return buckets, inconsistencies
 
 
+def _inbound_debt_chunks(values, size=500):
+    for offset in range(0, len(values), size):
+        yield values[offset:offset + size]
+
+
+def _inbound_debt_history_rows(doctype, **kwargs):
+    """Never authorize repayment using a silently truncated historical query."""
+    rows = frappe.get_all(doctype, limit_page_length=INBOUND_DEBT_HISTORY_ROW_LIMIT + 1, **kwargs)
+    if len(rows) > INBOUND_DEBT_HISTORY_ROW_LIMIT:
+        raise RuntimeError("Historical debt evidence exceeds safe query limit; cleanup requires review")
+    return rows
+
+
 def _discover_historical_inbound_debt(company, inbound_wh, prep_wh):
     """Reconstruct original debt, linked repayments, and manual FIFO credits."""
     debt_tz = ZoneInfo(INBOUND_DEBT_TIMEZONE)
     now_local = datetime.now(debt_tz)
     today = now_local.date()
-    context_start_local = datetime.combine(
-        today - timedelta(days=INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS),
-        datetime.min.time(),
-        tzinfo=debt_tz,
-    )
-    today_start_local = datetime.combine(
-        today,
-        datetime.min.time(),
-        tzinfo=debt_tz,
-    )
-    context_start = _inbound_debt_system_naive(context_start_local)
+    today_start_local = datetime.combine(today, datetime.min.time(), tzinfo=debt_tz)
     today_start = _inbound_debt_system_naive(today_start_local)
     now_system = _inbound_debt_system_naive(now_local)
 
-    original_rows = frappe.get_all(
+    # A fixed lookback can move old manual FIFO credits onto newer debt when
+    # the original they paid ages out. Fetch the complete original chronology,
+    # then restrict expensive ledger verification to items with recent origins.
+    original_rows = _inbound_debt_history_rows(
         "Stock Reconciliation",
-        filters=[
-            ["docstatus", "=", 1],
-            ["company", "=", company],
-            ["creation", ">=", context_start],
-            ["creation", "<", today_start],
-        ],
-        fields=["name", "creation"],
-        order_by="creation asc, name asc",
-    )
+        filters=[["docstatus", "=", 1], ["company", "=", company],
+                 ["creation", "<", today_start]],
+        fields=["name", "creation"], order_by="creation asc, name asc")
     originals = {}
     for row in original_rows:
         local_creation = _inbound_debt_local_datetime(row.creation)
         if not _inbound_debt_creation_in_window(
             local_creation,
             today,
-            INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS,
+            max((today - local_creation.date()).days, INBOUND_DEBT_LOOKBACK_DAYS),
         ):
             continue
         originals[row.name] = {
@@ -3382,7 +3385,28 @@ def _discover_historical_inbound_debt(company, inbound_wh, prep_wh):
             "created_at": local_creation,
         }
 
+    # Child metadata only selects relevant vouchers; all selected movements
+    # still require the established document + uncancelled SLE proof below.
+    recent_ids = {name for name, info in originals.items()
+                  if _inbound_debt_creation_in_window(info["created_at"], today,
+                                                      INBOUND_DEBT_LOOKBACK_DAYS)}
+    relevant_items = set()
+    for names in _inbound_debt_chunks(sorted(recent_ids)):
+        rows = _inbound_debt_history_rows("Stock Reconciliation Item",
+            filters=[["parent", "in", names], ["warehouse", "=", inbound_wh]],
+            fields=["parent", "item_code"])
+        relevant_items.update(row.item_code for row in rows if row.item_code)
+    selected_ids = set()
+    if relevant_items:
+        for names in _inbound_debt_chunks(sorted(originals)):
+            rows = _inbound_debt_history_rows("Stock Reconciliation Item",
+                filters=[["parent", "in", names], ["warehouse", "=", inbound_wh],
+                         ["item_code", "in", sorted(relevant_items)]],
+                fields=["parent", "item_code"])
+            selected_ids.update(row.parent for row in rows)
+    originals = {name: info for name, info in originals.items() if name in selected_ids}
     original_sles = _verified_reconciliation_movements(originals, [inbound_wh], company)
+    original_sles = [row for row in original_sles if row.item_code in relevant_items]
     buckets = {}
     for sle in original_sles:
         if sle.actual_qty <= INBOUND_DEBT_QTY_TOLERANCE:
@@ -3433,6 +3457,8 @@ def _discover_historical_inbound_debt(company, inbound_wh, prep_wh):
         linked_by_name, [prep_wh, FINISHED_GOODS_WAREHOUSE], company)
     linked_events = {}
     for sle in linked_sles:
+        if sle.item_code not in relevant_items:
+            continue
         if sle.actual_qty >= -INBOUND_DEBT_QTY_TOLERANCE:
             continue
         linked_doc = linked_by_name[sle.voucher_no]
@@ -3459,14 +3485,14 @@ def _discover_historical_inbound_debt(company, inbound_wh, prep_wh):
             _inbound_debt_local_datetime(sle.creation or linked_doc.creation),
         )
 
-    manual_sles = frappe.get_all(
+    manual_sles = _inbound_debt_history_rows(
         "Stock Ledger Entry",
         filters=[
             ["voucher_type", "=", "Stock Reconciliation"],
             ["warehouse", "in", [prep_wh, FINISHED_GOODS_WAREHOUSE]],
             ["is_cancelled", "=", 0],
             # Discover resets too: ordinary SR actual_qty may be zero.
-            ["creation", ">=", context_start],
+            ["item_code", "in", sorted(relevant_items) or ["__no_actionable_debt__"]],
             ["creation", "<=", now_system],
         ],
         fields=[
@@ -3505,7 +3531,9 @@ def _discover_historical_inbound_debt(company, inbound_wh, prep_wh):
     for sle in manual_sles:
         if sle.actual_qty >= -INBOUND_DEBT_QTY_TOLERANCE:
             continue
-        if not context_start_local <= _inbound_debt_local_datetime(sle.creation) <= now_local:
+        if _inbound_debt_local_datetime(sle.creation) > now_local:
+            continue
+        if sle.item_code not in relevant_items:
             continue
         if sle.voucher_no not in manual_docs:
             continue
@@ -3689,6 +3717,7 @@ def _submit_historical_debt_drafts(
     need_map,
     debt_ids_by_item,
     diagnostics,
+    debt_lock=None,
 ):
     """Submit whole relevant Main/Finished Goods transfer drafts before repayment."""
     debt = _historical_debt_details(diagnostics)
@@ -3882,6 +3911,8 @@ def _submit_historical_debt_drafts(
                 raise RuntimeError("Explicit transfer posting timestamp is in the future; draft not submitted")
             if not _authorize_main_to_prep_draft(draft, draft_plan, diagnostics, consume=True):
                 continue
+            if debt_lock is not None and (not hasattr(debt_lock, "owned") or not debt_lock.owned()):
+                raise RuntimeError("Debt lock ownership lost before draft submission")
             draft.submit()
             draft_plan["submit_finished_at"] = frappe.utils.now_datetime()
             commit_attempted = True
@@ -3993,212 +4024,28 @@ def _historical_debt_bin_data(item_code, warehouse):
 
 
 def _older_context_debt_report_lines(review):
-    """Informational section only; never merge hypothetical into real totals."""
     if not review:
         return []
-    lines = ["", "DAYS 8-14 CONTEXT: READ-ONLY CONDITIONAL USEFULNESS ESTIMATE",
-        "This section does not authorize repayments or add quantities to the real totals above.",
-        "Status: " + str(review.get("status", "unavailable"))]
-    if "context_bucket_count" not in review:
-        if review.get("reason"):
-            lines.append("Reason: " + str(review["reason"]))
-        return lines
-    labels = (
-        ("context_bucket_count", "Older context buckets inspected"),
-        ("actual_context_remaining_qty", "Older outstanding quantity after actual-policy verified credits"),
-        ("scenario_context_remaining_qty", "Older outstanding after isolated 14-day credit replay and verified real payments"),
-        ("actual_manual_credit_qty_all_buckets", "Actual 7-day manual credits across all context buckets"),
-        ("scenario_manual_credit_qty_all_buckets", "Scenario 14-day manual credits across all context buckets (not extra real credits)"),
-        ("verified_new_repayments_accounted_qty", "This run's verified real repayments accounted for in scenario"),
-        ("source_stock_available_qty", "Fresh Prep/Finished availability for relevant items, counted once"),
-        ("reserved_for_younger_qty", "Stock reserved first for outstanding days 1-7 obligations"),
-        ("younger_uncovered_qty", "Younger priority obligation still lacking current stock"),
-        ("available_after_younger_reservation_qty", "Stock remaining after younger reservation"),
-        ("stock_shortage_qty", "Unblocked older quantity not covered by current stock"),
-        ("blocked_context_qty", "Older outstanding quantity blocked by identified conditions"),
-        ("unknown_context_qty", "Older outstanding quantity whose usefulness remains unknown"),
-        ("overpaid_bucket_count", "Older overpaid/inconsistent buckets"),
-        ("draft_blocked_bucket_count", "Older buckets with linked repayment drafts"),
-        ("scenario_overpayment_qty", "Scenario credit-reallocation excess over already-real payments; not repayable"),
-    )
-    for key, label in labels:
-        lines.append(f"{label}: {review.get(key, 0)}")
-    qualifier = "PARTIAL; remaining usefulness unknown" if review.get("hypothetical_total_is_partial") else "conditional, not executable"
-    lines.append("Additional older quantity coverable now under stated assumptions: "
-                 + str(review.get("hypothetical_additional_repayment_qty", 0)) + " (" + qualifier + ")")
-    if review.get("manual_credit_boundary_uncertain"):
-        lines.append("Credit-history boundary uncertain: pre-today manual events might belong to older originals outside the inspected context; displayed coverage is conditional, not an authoritative 14-day-policy total.")
-    for assumption in review.get("assumptions", []):
-        lines.append("Assumption: " + assumption)
-    if review.get("blocker_counts"):
-        lines.append("Blocker counts: " + json.dumps(review["blocker_counts"], sort_keys=True, default=str))
-    for detail in review.get("scenario_credit_inconsistency_examples", [])[:10]:
-        lines.append("Scenario credit issue: " + str(detail))
-    for example in review.get("examples", [])[:10]:
-        lines.append("Older context example: " + json.dumps(example, sort_keys=True, default=str))
-    if review.get("example_count", 0) > 10:
-        lines.append("TRUNCATED: first 10 older context examples; aggregate counts/quantities above are complete where evidence is available.")
-    return lines
+    return ["", "Historical credit attribution: complete relevant ERP history; "
+            "only original debt ages 1-14 days may be repaid.",
+            "Status: " + str(review.get("status", "unavailable"))]
 
 
 def _older_context_debt_diagnostic(discovery, settings, debt, blocked_items=()):
-    """Read-only conditional estimate for days 8-14, after the real phase.
-
-    Replay already-verified credits with a 14-day manual-credit age, subtract
-    only this run's verified repayments, and reserve the larger real/scenario
-    younger obligation before sharing fresh stock once across older buckets.
-    This is NOT proof of historical stock availability or a full alternate run:
-    no draft is submitted, no new live document is verified, and no debt or
-    inventory object is modified. Ambiguities are reported rather than funded.
-    """
-    actual = discovery["buckets"]
-    today = discovery["now_local"].date()
-    older = {key: bucket for key, bucket in actual.items()
-             if INBOUND_DEBT_LOOKBACK_DAYS < (today - bucket["created_at"].date()).days
-             <= INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS}
-    review = {"status": "read-only conditional estimate", "context_bucket_count": len(older),
-        "window": "previous calendar days 8-14; never actionable in this run",
-        "assumptions": [
-            "Only already-verified original/repayment/manual events are replayed; manual-credit age extends to 14 days in this isolated scenario.",
-            "Replay is limited to observed days 1-14 originals; older originals were not inspected and could alter FIFO credits. This is not a complete 14-day policy counterfactual.",
-            "Only verified new repayments from this run are subtracted, by source and item.",
-            "Fresh post-phase Prep/Finished stock is used; this does not prove stock existed historically.",
-            "Outstanding days 1-7 retain first priority: reserve the larger actual or scenario younger balance per item.",
-            "No extra draft submissions, stock writes, debt edits, or future replenishment are assumed.",
-            "Hypothetical quantities are separate from all real debt/repayment totals.",
-        ],
-        "actual_context_remaining_qty": sum(b["remaining_qty"] for b in older.values()),
-        "scenario_context_remaining_qty": 0.0, "scenario_overpayment_qty": 0.0,
-        "verified_new_repayments_accounted_qty": 0.0,
-        "source_stock_available_qty": 0.0, "reserved_for_younger_qty": 0.0,
-        "younger_uncovered_qty": 0.0, "available_after_younger_reservation_qty": 0.0,
-        "hypothetical_additional_repayment_qty": 0.0, "stock_shortage_qty": 0.0,
-        "blocked_context_qty": 0.0, "unknown_context_qty": 0.0,
-        "fully_credited_context_buckets": 0, "blocked_bucket_count": 0,
-        "overpaid_bucket_count": 0, "draft_blocked_bucket_count": 0,
-        "unknown_bucket_count": 0, "readable_stock_item_count": 0,
-        "blocker_counts": {}, "example_count": 0, "examples": [],
-        "debug": bool(DEBUG), "real_phase_has_failures": bool(debt.get("failure_examples"))}
-    if not older:
-        review["status"] = "no days 8-14 context buckets"
-        return review
-    scenario, inconsistencies = _reconstruct_historical_debt_credits(
-        actual, discovery["credit_events"], INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS)
-    review["scenario_original_context_days"] = INBOUND_DEBT_ATTRIBUTION_CONTEXT_DAYS
-    review["manual_credit_boundary_uncertain"] = any(
-        event["kind"] == "manual" and event["event_at"].date() < today
-        for event in discovery["credit_events"])
-    review["scenario_credit_inconsistency_count"] = len(inconsistencies)
-    review["scenario_credit_inconsistency_examples"] = [str(x)[:500] for x in inconsistencies[:10]]
-    review["actual_manual_credit_qty_all_buckets"] = sum(b["manual_reduction_qty"] for b in actual.values())
-    review["scenario_manual_credit_qty_all_buckets"] = sum(b["manual_reduction_qty"] for b in scenario.values())
-    initial = discovery["initial_remaining_by_bucket"]
-    younger_actual, younger_scenario = defaultdict(float), defaultdict(float)
-    scenario_remaining = {}
-    for key, bucket in scenario.items():
-        verified_new = max(initial[key] - actual[key]["remaining_qty"], 0)
-        review["verified_new_repayments_accounted_qty"] += verified_new
-        residual = bucket["remaining_qty"] - verified_new
-        # Reallocated historical credits can make an already-real repayment
-        # excessive in the scenario. Flag it; never hide it as useful capacity.
-        if residual < -INBOUND_DEBT_QTY_TOLERANCE:
-            review["scenario_overpayment_qty"] += -residual
-        scenario_remaining[key] = max(residual, 0)
-        if key in older:
-            review["scenario_context_remaining_qty"] += max(residual, 0)
-        elif actual[key]["actionable"]:
-            item = bucket["item_code"]
-            younger_actual[item] += actual[key]["remaining_qty"]
-            younger_scenario[item] += max(residual, 0)
-    uncertain = bool(inconsistencies or review["scenario_overpayment_qty"]
-                     or review["real_phase_has_failures"])
-    if uncertain:
-        review["status"] = "conditional quantities unavailable: real/scenario verification failures or credit inconsistency"
-    elif DEBUG:
-        review["status"] = "DEBUG-only conditional estimate; no real repayment assumed beyond verified outcomes"
-    blocked_items = set(blocked_items)
-    pools, item_reasons, item_errors = {}, {}, {}
-    for item in sorted({b["item_code"] for b in older.values()}):
-        reasons = []
-        try:
-            flags = frappe.db.get_value("Item", item, ["has_batch_no", "has_serial_no"], as_dict=True)
-            if flags is None:
-                raise RuntimeError("Item flags unavailable")
-            if flags.get("has_batch_no") or flags.get("has_serial_no"):
-                reasons.append("serial/batch repayment unsupported")
-            if item in blocked_items:
-                reasons.append("item blocked by real phase")
-            prep = _read_bin_actual_qty(item, settings.custom_amazon_fba_staging_area)
-            finished = _read_bin_actual_qty(item, FINISHED_GOODS_WAREHOUSE)
-            if not math.isfinite(prep) or not math.isfinite(finished) or min(prep, finished) < -INBOUND_DEBT_QTY_TOLERANCE:
-                raise RuntimeError("nonfinite/negative source balance")
-            available = max(prep, 0) + max(finished, 0)
-            reserve_need = max(younger_actual[item], younger_scenario[item])
-            reserved = min(available, reserve_need)
-            pools[item] = available - reserved
-            review["source_stock_available_qty"] += available
-            review["reserved_for_younger_qty"] += reserved
-            review["younger_uncovered_qty"] += max(reserve_need - available, 0)
-            review["available_after_younger_reservation_qty"] += pools[item]
-            review["readable_stock_item_count"] += 1
-        except Exception as exc:
-            pools[item] = None
-            reasons.append("stock/flags unavailable")
-            item_errors[item] = _concise_inventory_exception(exc)[:400]
-        item_reasons[item] = reasons
-    ordered = sorted(older.items(), key=lambda pair: (pair[1]["created_at"], pair[1]["source_id"], pair[1]["item_code"]))
-    for key, bucket in ordered:
-        item, remaining = bucket["item_code"], scenario_remaining[key]
-        reasons = list(item_reasons[item])
-        if bucket["overpaid"] or scenario[key]["overpaid"]:
-            review["overpaid_bucket_count"] += 1
-            reasons.append("overpaid/inconsistent source bucket")
-        drafts = discovery["draft_repayments_by_source"].get(bucket["source_id"], [])
-        if drafts:
-            review["draft_blocked_bucket_count"] += 1
-            reasons.append("existing draft linked repayment requires review")
-        if uncertain:
-            reasons.append("real/scenario verification uncertainty; not an executable estimate")
-        allocation = 0.0
-        unknown = pools[item] is None or uncertain
-        if remaining <= INBOUND_DEBT_QTY_TOLERANCE:
-            if (not bucket["overpaid"] and not scenario[key]["overpaid"]
-                    and not review["manual_credit_boundary_uncertain"]):
-                review["fully_credited_context_buckets"] += 1
-        elif unknown:
-            review["unknown_context_qty"] += remaining
-            review["unknown_bucket_count"] += 1
-        elif reasons:
-            review["blocked_context_qty"] += remaining
-            review["blocked_bucket_count"] += 1
-        else:
-            allocation = min(remaining, pools[item])
-            pools[item] -= allocation
-            review["hypothetical_additional_repayment_qty"] += allocation
-            review["stock_shortage_qty"] += remaining - allocation
-        for reason in reasons:
-            review["blocker_counts"][reason] = review["blocker_counts"].get(reason, 0) + 1
-        review["example_count"] += 1
-        if len(review["examples"]) < 10:
-            review["examples"].append({"source_id": bucket["source_id"], "item_code": item,
-                "age_days": (today - bucket["created_at"].date()).days,
-                "actual_remaining_after_verified_7_day_credits": bucket["remaining_qty"],
-                "scenario_remaining_after_14_day_credits_and_real_payments": remaining,
-                "credit_history_boundary_uncertain": review["manual_credit_boundary_uncertain"],
-                "zero_scenario_balance_is_not_proof_fully_repaid": review["manual_credit_boundary_uncertain"],
-                "hypothetical_repayable_now": None if unknown else allocation,
-                "linked_draft_ids": sorted(drafts)[:10], "blockers": reasons,
-                "stock_read_error": item_errors.get(item)})
-    if review["unknown_bucket_count"] or review["manual_credit_boundary_uncertain"]:
-        # Do not present incomplete source/credit-history coverage as complete.
-        review["hypothetical_total_is_partial"] = True
-    else:
-        review["hypothetical_total_is_partial"] = False
-    return review
+    # Former 8-14-day what-if is now the real policy. Older origins are retained
+    # only to keep manual FIFO credits attached to the obligations they paid.
+    return {"status": "days 1-14 actionable; older evidence is attribution only",
+            "historical_attribution_only": True}
 
 
 def _process_historical_inbound_debt(settings, diagnostics):
-    """Repay recent synthetic Inbound stock after the regular run is complete."""
+    """Repay recent synthetic Inbound stock after the regular run is complete.
+
+    Known new warehouse movements use the existing Material Transfer paths.
+    Here the destination was already credited synthetically, without a proven
+    physical destination for the duplicate source balance. A source-only
+    reconciliation repairs that duplicate; a transfer would add Inbound twice.
+    """
     if diagnostics is None:
         return
     debt = _historical_debt_details(diagnostics)
@@ -4339,6 +4186,8 @@ def _process_historical_inbound_debt(settings, diagnostics):
             if bucket["source_id"] not in debt_ids_by_item[bucket["item_code"]]:
                 debt_ids_by_item[bucket["item_code"]].append(bucket["source_id"])
 
+        if not hasattr(lock, "owned") or not lock.owned():
+            raise RuntimeError("Debt lock ownership lost during history scan; no new repayment authorized")
         blocked_items, submitted_drafts_by_item = (
             _submit_historical_debt_drafts(
                 company,
@@ -4346,6 +4195,7 @@ def _process_historical_inbound_debt(settings, diagnostics):
                 need_map,
                 debt_ids_by_item,
                 diagnostics,
+                debt_lock=lock,
             )
         )
 
@@ -4370,6 +4220,8 @@ def _process_historical_inbound_debt(settings, diagnostics):
         source_read_reported = set()
 
         for source_id in source_order:
+            if not hasattr(lock, "owned") or not lock.owned():
+                raise RuntimeError("Debt lock ownership lost; remaining repayments stopped")
             source_buckets = sorted(
                 buckets_by_source[source_id],
                 key=lambda bucket: bucket["item_code"],
@@ -4554,6 +4406,8 @@ def _process_historical_inbound_debt(settings, diagnostics):
                     INBOUND_DEBT_SOURCE_FIELD: source_id,
                     "items": rows,
                 })
+                if not lock.owned():
+                    raise RuntimeError("Debt lock ownership lost before repayment insertion")
                 repayment_sr.insert(ignore_permissions=True)
                 inserted = True
                 debt["repayment_documents_created"] += 1
@@ -4600,6 +4454,8 @@ def _process_historical_inbound_debt(settings, diagnostics):
                     )
                     continue
 
+                if not lock.owned():
+                    raise RuntimeError("Debt lock ownership lost before repayment submission")
                 repayment_sr.submit()
                 submitted = True
                 frappe.db.commit()
@@ -7393,7 +7249,216 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
 # ──────────────────────────────────────────
 # Orchestrator
 # ──────────────────────────────────────────
+# Prep aging is rebuilt from ERP on each run. It never changes inventory.
+PREP_ORPHAN_AGE_DAYS = 14
+PREP_ORPHAN_LOG_TITLE = "Suspected Orphaned Inventory in AMA Prep Warehouse"
+PREP_AGING_MAX_LEDGER_ROWS = 50000
+PREP_AGING_ITEM_BATCH_SIZE = 50
+
+
+def _prep_aging_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Non-finite ledger quantity")
+    return number
+
+
+def _prep_aging_utc(value, latest=False):
+    """Resolve site-local naive dates conservatively across DST folds."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc)
+    zone = ZoneInfo(frappe.utils.get_system_timezone())
+    choices = []
+    for fold in (0, 1):
+        utc = value.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc)
+        if utc.astimezone(zone).replace(tzinfo=None) == value:
+            choices.append(utc)
+    if not choices:
+        raise ValueError("Nonexistent ERP local timestamp across DST change")
+    return max(choices) if latest else min(choices)
+
+
+def _prep_aging_reconstruct(rows, current_qty, observed_at):
+    """FIFO estimate of remaining stock residence, not proof of physical identity."""
+    tolerance = INBOUND_DEBT_QTY_TOLERANCE
+    current_qty = _prep_aging_number(current_qty)
+    if current_qty < -tolerance:
+        raise ValueError("Negative current stock")
+    lots, head, balance = [], 0, 0.0
+    previous_key = None
+    observed_utc = _prep_aging_utc(observed_at)
+    for row in rows:
+        if row.get("is_cancelled") or int(row.get("docstatus", 0)) != 1:
+            raise ValueError("Unverified or cancelled ledger row")
+        stamp = frappe.utils.get_datetime(
+            str(row["posting_date"]) + " " + str(row["posting_time"])
+        )
+        key = (stamp, str(row.get("creation") or ""), str(row["name"]))
+        if previous_key is not None and key < previous_key:
+            raise ValueError("Ledger ordering is inconsistent")
+        previous_key = key
+        received_utc = _prep_aging_utc(stamp, latest=True)
+        if received_utc > observed_utc:
+            raise ValueError("Future-dated ledger movement")
+        delta = _prep_aging_number(row["actual_qty"])
+        after = _prep_aging_number(row["qty_after_transaction"])
+        if row.get("voucher_type") == "Stock Reconciliation":
+            if "_verified_reconciliation_delta" not in row:
+                raise ValueError("Reconciliation movement lacks verified child/SLE evidence")
+            proven_delta = _prep_aging_number(row["_verified_reconciliation_delta"])
+            if abs(delta) > tolerance and abs(delta - proven_delta) > tolerance:
+                raise ValueError("Reconciliation actual quantity conflicts with verified movement")
+            delta = proven_delta
+        balance += delta
+        if abs(balance - after) > tolerance:
+            raise ValueError("Incomplete or unreposted ledger history")
+        if balance < -tolerance:
+            raise ValueError("Negative historical balance prevents reliable aging")
+        if delta > tolerance:
+            lots.append({"qty": delta, "received_at": stamp,
+                         "voucher_type": row.get("voucher_type"),
+                         "voucher_no": row.get("voucher_no"),
+                         "ledger_entry": row["name"]})
+        elif delta < -tolerance:
+            remaining = -delta
+            while remaining > tolerance and head < len(lots):
+                take = min(lots[head]["qty"], remaining)
+                lots[head]["qty"] -= take
+                remaining -= take
+                if lots[head]["qty"] <= tolerance:
+                    head += 1
+            if remaining > tolerance:
+                raise ValueError("Issue exceeds reconstructed receipts")
+    if abs(balance - current_qty) > tolerance:
+        raise ValueError("Ledger total does not match current Bin")
+    if current_qty > tolerance and not rows:
+        raise ValueError("Positive Bin has no ledger history")
+    residual = [lot for lot in lots[head:] if lot["qty"] > tolerance]
+    old = [lot for lot in residual
+           if observed_utc - _prep_aging_utc(lot["received_at"], latest=True) > timedelta(days=PREP_ORPHAN_AGE_DAYS)]
+    return {"current_qty": current_qty, "old_qty": sum(lot["qty"] for lot in old),
+            "old_lots": old, "lots": residual}
+
+
+def _report_suspected_orphaned_prep(settings):
+    """Read ERP SLE/Bin only; diagnostic errors cannot stop the stock sync."""
+    report = {"warehouse": None, "candidates": [], "unavailable": [], "errors": []}
+    try:
+        warehouse = settings.custom_amazon_fba_staging_area
+        report["warehouse"] = warehouse
+        if not warehouse:
+            raise ValueError("No configured Prep warehouse")
+        company = frappe.db.get_value("Warehouse", warehouse, "company")
+        if not company or company != settings.company:
+            raise ValueError("Prep warehouse company does not match sync company")
+        # A company-wide pending repost may affect warehouse quantities through
+        # voucher-linked or item-level jobs. Fail closed rather than infer scope.
+        pending = frappe.get_all("Repost Item Valuation", filters={
+            "company": company, "docstatus": ["!=", 2], "status": ["!=", "Completed"]},
+            fields=["name", "status"], limit_page_length=5001)
+        if pending:
+            raise ValueError("Prep aging unavailable while company valuation reposts are pending/failed: "
+                             + ", ".join(str(row["name"]) for row in pending[:20]))
+        observed_at = frappe.utils.now_datetime()
+        bins = frappe.get_all("Bin", filters={"warehouse": warehouse,
+                             "actual_qty": [">", 0]},
+                             fields=["item_code", "actual_qty"], limit_page_length=0)
+        quantities = {}
+        for row in bins:
+            item = row["item_code"]
+            if item in quantities:
+                raise ValueError("Duplicate item Bin rows")
+            quantities[item] = _prep_aging_number(row["actual_qty"])
+        items = sorted(quantities)
+        reconciliation_cache = {}
+        fields = ["name", "item_code", "warehouse", "company", "posting_date",
+                  "posting_time", "creation", "actual_qty", "qty_after_transaction",
+                  "voucher_type", "voucher_no", "is_cancelled", "docstatus"]
+        for offset in range(0, len(items), PREP_AGING_ITEM_BATCH_SIZE):
+            group = items[offset:offset + PREP_AGING_ITEM_BATCH_SIZE]
+            rows = frappe.get_all("Stock Ledger Entry", filters={
+                "warehouse": warehouse, "company": company, "item_code": ["in", group],
+                "is_cancelled": 0, "docstatus": 1}, fields=fields,
+                order_by="posting_date asc, posting_time asc, creation asc, name asc",
+                limit_page_length=PREP_AGING_MAX_LEDGER_ROWS + 1)
+            if len(rows) > PREP_AGING_MAX_LEDGER_ROWS:
+                report["unavailable"].extend({"item_code": item,
+                    "reason": "Ledger batch exceeds safety limit; age not inferred"} for item in group)
+                continue
+            by_item = defaultdict(list)
+            for voucher in sorted(set(row.get("voucher_no") for row in rows
+                                     if row.get("voucher_type") == "Stock Reconciliation")):
+                if voucher not in reconciliation_cache:
+                    try:
+                        verified = _verified_reconciliation_movements([voucher], [warehouse], company)
+                        reconciliation_cache[voucher] = ({r["name"]: r["actual_qty"] for r in verified}, None)
+                    except Exception as exc:
+                        reconciliation_cache[voucher] = ({}, str(exc))
+            for row in rows:
+                if (row.get("item_code") not in quantities or row.get("item_code") not in group
+                        or row.get("warehouse") != warehouse or row.get("company") != company):
+                    raise ValueError("Unexpected ledger scope")
+                by_item[row["item_code"]].append(row)
+            for item in group:
+                try:
+                    fresh = _read_bin_actual_qty(item, warehouse)
+                    if abs(fresh - quantities[item]) > INBOUND_DEBT_QTY_TOLERANCE:
+                        raise ValueError("Bin changed during aging scan")
+                    for row in by_item[item]:
+                        if row.get("voucher_type") == "Stock Reconciliation":
+                            movements, error = reconciliation_cache[row.get("voucher_no")]
+                            if error or row["name"] not in movements:
+                                raise ValueError("Unverified reconciliation: " + str(error or row["name"]))
+                            row["_verified_reconciliation_delta"] = movements[row["name"]]
+                    result = _prep_aging_reconstruct(by_item[item], fresh, observed_at)
+                    if result["old_qty"] > INBOUND_DEBT_QTY_TOLERANCE:
+                        result["item_code"] = item
+                        report["candidates"].append(result)
+                except Exception as exc:
+                    report["unavailable"].append({"item_code": item, "reason": str(exc)})
+        report["observed_at"] = str(observed_at)
+        report["items_checked"] = len(items)
+    except Exception as exc:
+        report["errors"].append(str(exc))
+    try:
+        if report["candidates"] or report["unavailable"] or report["errors"]:
+            header = [PREP_ORPHAN_LOG_TITLE, "Warehouse: " + str(report["warehouse"]),
+                "Observation time (ERP site timezone): " + str(report.get("observed_at", "unavailable")),
+                "FIFO estimate from submitted, non-cancelled ERP Stock Ledger Entries; quantities are stock-UOM units.",
+                "Strictly older than 14 elapsed days; new receipts do not reset older stock.",
+                "Opening/reconciliation additions use their posting date as the earliest evidenced residence date.",
+                "Suspected only: verify physical stock and shipment history before correcting.",
+                "No stock was moved or reconciled by this diagnostic."]
+            lines = []
+            for item in report["candidates"]:
+                oldest = min(lot["received_at"] for lot in item["old_lots"])
+                lines.append("ITEM {0}: current Prep={1:g}; quantity over 14 days={2:g}; oldest remaining receipt={3}".format(
+                    item["item_code"], item["current_qty"], item["old_qty"], oldest))
+                for lot in item["old_lots"]:
+                    lines.append("  {qty:g} units since {received_at}; {voucher_type} {voucher_no}; SLE {ledger_entry}".format(**lot))
+            for item in report["unavailable"]:
+                lines.append("AGE UNAVAILABLE {item_code}: {reason}".format(**item))
+            lines.extend("SCAN ERROR: " + error for error in report["errors"])
+            # Preserve every item; bounded pages avoid Error Log text truncation.
+            pages, page, size = [], [], 0
+            for line in lines:
+                if size + len(line.encode("utf-8")) > 48000 and page:
+                    pages.append(page)
+                    page, size = [], 0
+                page.append(line)
+                size += len(line.encode("utf-8")) + 1
+            if page:
+                pages.append(page)
+            for index, page in enumerate(pages, 1):
+                frappe.log_error(message="\n".join(header + ["Part {0} of {1}".format(index, len(pages))] + page),
+                                 title=PREP_ORPHAN_LOG_TITLE)
+    except Exception as exc:
+        report["errors"].append("Could not publish Prep aging log: " + str(exc))
+    return report
+
+
 def process_fba_inventory():
+    settings = None
     temporary_log_inputs = None
     inbound_flow_diagnostics = None
     transition_window = None
@@ -7851,6 +7916,17 @@ def process_fba_inventory():
         frappe.log_error(frappe.get_traceback(), "FBA Inventory Process Error")
         raise
     finally:
+        # Observe persisted ERP balances after the sync/debt phases, including
+        # partial-run failures. Age never authorizes a movement or write-off.
+        if settings is not None:
+            try:
+                prep_aging_report = _report_suspected_orphaned_prep(settings)
+                if prep_aging_report.get("errors"):
+                    _record_inbound_flow_global_error(inbound_flow_diagnostics,
+                        "Prep aging diagnostic incomplete: " + "; ".join(prep_aging_report["errors"]))
+            except Exception:
+                # A diagnostic must not replace the original sync exception.
+                pass
         if fc_transfer_window is not None:
             fc_transfer_window.finish()
         if transition_window is not None:
