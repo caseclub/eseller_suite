@@ -10,5 +10,7 @@ __pycache__
 
 # Initialization markers, JSON files, and lock files
 *.initialized
-*.json
 *.lock
+
+# Generated Amazon runtime state
+/eseller_suite/eseller_suite/doctype/amazon_sp_api_settings/amazon_fba_fc_transfer_hold.json

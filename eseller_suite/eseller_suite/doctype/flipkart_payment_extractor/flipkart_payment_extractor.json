@@ -1,0 +1,101 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2024-05-27 12:31:24.780155",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "attachments_section",
+  "import_file",
+  "test",
+  "purchase_invoice_created",
+  "flipkart_order",
+  "section_break_uuhb",
+  "column_break_ncxc",
+  "flipkart_ads_details",
+  "section_break_abfi",
+  "flipkart_order_details"
+ ],
+ "fields": [
+  {
+   "fieldname": "attachments_section",
+   "fieldtype": "Section Break",
+   "label": "Attachments"
+  },
+  {
+   "fieldname": "import_file",
+   "fieldtype": "Attach",
+   "label": "Import File"
+  },
+  {
+   "fieldname": "section_break_uuhb",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "flipkart_ads_details",
+   "fieldtype": "Table",
+   "label": "Flipkart Ads Details",
+   "options": "Flipkart Ads Details",
+   "read_only": 1
+  },
+  {
+   "fieldname": "test",
+   "fieldtype": "Data",
+   "label": "Test"
+  },
+  {
+   "fieldname": "column_break_ncxc",
+   "fieldtype": "Column Break",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "purchase_invoice_created",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Purchase Invoice Created"
+  },
+  {
+   "fieldname": "flipkart_order_details",
+   "fieldtype": "Table",
+   "label": "Flipkart Order Details",
+   "options": "Flipkart Order Details",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_abfi",
+   "fieldtype": "Section Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "flipkart_order",
+   "fieldtype": "Check",
+   "hidden": 1,
+   "label": "Flipkart Order"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2024-05-31 16:43:16.279592",
+ "modified_by": "Administrator",
+ "module": "eSeller Suite",
+ "name": "Flipkart Payment Extractor",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
