@@ -7,3 +7,8 @@ node_modules
 __pycache__
 # Ignore CSV files
 *.csv
+
+# Initialization markers, JSON files, and lock files
+*.initialized
+*.json
+*.lock
