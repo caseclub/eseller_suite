@@ -9,6 +9,7 @@
 # The independent 14-day Inbound/Main transition window is unchanged.
 # 2026-11-12: ERP-ledger Prep aging; 14-day evidence-based debt repayment.
 # Existing transfer gates and synthetic-duplicate reconciliation safeguards remain.
+# 2026-11-13: Isolate Prep-aging item failures and conservatively scope valuation reposts.
 from __future__ import annotations
 import csv
 import base64
@@ -7340,10 +7341,105 @@ def _prep_aging_reconstruct(rows, current_qty, observed_at):
             "old_lots": old, "lots": residual}
 
 
+def _prep_aging_repost_scope(company):
+    """Conservative item dependency closure; never infer safety from seed warehouse.
+
+    Includes historical/cancelled SLE connections deliberately: valuation reposts
+    can propagate through manufacturing and transfers beyond the initiating item.
+    Unknown roots or bounded-query overflow leave the whole scan unresolved.
+    This is diagnostic-only and grants no authority for stock writes.
+    """
+    pending = frappe.get_all("Repost Item Valuation", filters={
+        "company": company, "docstatus": ["!=", 2],
+        "status": ["not in", ["Completed", "Skipped"]]},
+        fields=["name", "status"], limit_page_length=5001)
+    if len(pending) > 5000:
+        raise ValueError("Repost discovery exceeds safety limit")
+    affected, notes = set(), []
+    for job in pending:
+        doc = frappe.get_doc("Repost Item Valuation", job["name"])
+        if doc.get("company") != company or doc.get("docstatus") == 2:
+            raise ValueError("Repost scope changed during discovery: " + job["name"])
+        if doc.get("status") in ("Completed", "Skipped"):
+            # ERPNext uses Skipped for a job superseded by another repost.
+            # Any covering active job is still included by the discovery query.
+            continue
+        if doc.get("recreate_stock_ledgers"):
+            raise ValueError("Cannot prove dependency scope while ledger recreation is pending: " + job["name"])
+        roots = set()
+        if doc.get("item_code"):
+            roots.add(str(doc.get("item_code")))
+        voucher_type, voucher_no = doc.get("voucher_type"), doc.get("voucher_no")
+        if voucher_type and voucher_no:
+            rows = frappe.get_all("Stock Ledger Entry", filters={
+                "company": company, "voucher_type": voucher_type, "voucher_no": voucher_no},
+                fields=["item_code"], limit_page_length=50001)
+            if len(rows) > 50000:
+                raise ValueError("Repost voucher history exceeds safety limit: " + job["name"])
+            roots.update(str(r["item_code"]) for r in rows if r.get("item_code"))
+            # Also inspect current voucher children, because SLE recreation may
+            # temporarily remove ledger rows or include newly added items.
+            voucher = frappe.get_doc(voucher_type, voucher_no)
+            if voucher.get("company") != company:
+                raise ValueError("Repost voucher company mismatch: " + job["name"])
+            children = voucher.get("items") or []
+            roots.update(str(r.get("item_code")) for r in children if r.get("item_code"))
+        if not roots:
+            raise ValueError("Cannot establish affected items for repost {0} (status {1})".format(
+                job["name"], doc.get("status")))
+        affected.update(roots)
+        notes.append("{0} (status {1}); seed items: {2}".format(
+            job["name"], doc.get("status"), ", ".join(sorted(roots))))
+    frontier, seen_vouchers = set(affected), set()
+    queries = 0
+    while frontier:
+        if len(affected) > 5000 or queries >= 200:
+            raise ValueError("Repost dependency scope exceeds safety limit")
+        group = sorted(frontier)[:100]
+        frontier.difference_update(group)
+        rows = frappe.get_all("Stock Ledger Entry", filters={
+            "company": company, "item_code": ["in", group]},
+            fields=["voucher_type", "voucher_no"], limit_page_length=50001)
+        queries += 1
+        if len(rows) > 50000:
+            raise ValueError("Repost dependency ledger exceeds safety limit")
+        vouchers = set()
+        for row in rows:
+            if not row.get("voucher_type") or not row.get("voucher_no"):
+                raise ValueError("Repost dependency ledger has no voucher identity")
+            vouchers.add((row["voucher_type"], row["voucher_no"]))
+        for voucher_type in sorted({v[0] for v in vouchers - seen_vouchers}):
+            names = sorted(v[1] for v in vouchers - seen_vouchers if v[0] == voucher_type)
+            for offset in range(0, len(names), 100):
+                if queries >= 200:
+                    raise ValueError("Repost dependency query safety limit reached")
+                batch = names[offset:offset + 100]
+                linked = frappe.get_all("Stock Ledger Entry", filters={
+                    "company": company, "voucher_type": voucher_type,
+                    "voucher_no": ["in", batch]}, fields=["item_code"],
+                    limit_page_length=50001)
+                queries += 1
+                if len(linked) > 50000:
+                    raise ValueError("Repost linked ledger exceeds safety limit")
+                for row in linked:
+                    item = row.get("item_code")
+                    if not item:
+                        raise ValueError("Repost linked ledger has no item")
+                    if item not in affected:
+                        affected.add(item)
+                        frontier.add(item)
+        seen_vouchers.update(vouchers)
+    return affected, notes
+
+
 def _report_suspected_orphaned_prep(settings):
-    """Read ERP SLE/Bin only; diagnostic errors cannot stop the stock sync."""
-    report = {"warehouse": None, "candidates": [], "unavailable": [], "errors": []}
+    """Read-only diagnostic; isolate item failures, never manufacture missing ages."""
+    report = {"warehouse": None, "candidates": [], "unavailable": [], "errors": [],
+              "items_checked": 0, "items_considered": 0, "repost_notes": []}
     try:
+        # Set before any guard so a blocked/partial scan still has its timestamp.
+        observed_at = frappe.utils.now_datetime()
+        report["observed_at"] = str(observed_at)
         warehouse = settings.custom_amazon_fba_staging_area
         report["warehouse"] = warehouse
         if not warehouse:
@@ -7351,74 +7447,84 @@ def _report_suspected_orphaned_prep(settings):
         company = frappe.db.get_value("Warehouse", warehouse, "company")
         if not company or company != settings.company:
             raise ValueError("Prep warehouse company does not match sync company")
-        # A company-wide pending repost may affect warehouse quantities through
-        # voucher-linked or item-level jobs. Fail closed rather than infer scope.
-        pending = frappe.get_all("Repost Item Valuation", filters={
-            "company": company, "docstatus": ["!=", 2], "status": ["!=", "Completed"]},
-            fields=["name", "status"], limit_page_length=5001)
-        if pending:
-            raise ValueError("Prep aging unavailable while company valuation reposts are pending/failed: "
-                             + ", ".join(str(row["name"]) for row in pending[:20]))
-        observed_at = frappe.utils.now_datetime()
-        bins = frappe.get_all("Bin", filters={"warehouse": warehouse,
-                             "actual_qty": [">", 0]},
+        affected, report["repost_notes"] = _prep_aging_repost_scope(company)
+        bins = frappe.get_all("Bin", filters={"warehouse": warehouse, "actual_qty": [">", 0]},
                              fields=["item_code", "actual_qty"], limit_page_length=0)
-        quantities = {}
+        quantities, invalid = {}, {}
         for row in bins:
-            item = row["item_code"]
-            if item in quantities:
-                raise ValueError("Duplicate item Bin rows")
-            quantities[item] = _prep_aging_number(row["actual_qty"])
-        items = sorted(quantities)
+            item = row.get("item_code")
+            if not item:
+                report["errors"].append("Bin without item identity; that row could not be inspected")
+                continue
+            try:
+                if item in quantities or item in invalid:
+                    raise ValueError("Duplicate item Bin rows")
+                quantities[item] = _prep_aging_number(row["actual_qty"])
+            except Exception as exc:
+                quantities.pop(item, None)
+                invalid[item] = str(exc)
+        report["unavailable"].extend({"item_code": item, "reason": reason}
+                                     for item, reason in sorted(invalid.items()))
+        report["items_considered"] = len(quantities) + len(invalid)
         reconciliation_cache = {}
         fields = ["name", "item_code", "warehouse", "company", "posting_date",
                   "posting_time", "creation", "actual_qty", "qty_after_transaction",
                   "voucher_type", "voucher_no", "is_cancelled", "docstatus"]
-        for offset in range(0, len(items), PREP_AGING_ITEM_BATCH_SIZE):
-            group = items[offset:offset + PREP_AGING_ITEM_BATCH_SIZE]
-            rows = frappe.get_all("Stock Ledger Entry", filters={
-                "warehouse": warehouse, "company": company, "item_code": ["in", group],
-                "is_cancelled": 0, "docstatus": 1}, fields=fields,
-                order_by="posting_date asc, posting_time asc, creation asc, name asc",
-                limit_page_length=PREP_AGING_MAX_LEDGER_ROWS + 1)
-            if len(rows) > PREP_AGING_MAX_LEDGER_ROWS:
-                report["unavailable"].extend({"item_code": item,
-                    "reason": "Ledger batch exceeds safety limit; age not inferred"} for item in group)
-                continue
-            by_item = defaultdict(list)
-            for voucher in sorted(set(row.get("voucher_no") for row in rows
-                                     if row.get("voucher_type") == "Stock Reconciliation")):
-                if voucher not in reconciliation_cache:
-                    try:
-                        verified = _verified_reconciliation_movements([voucher], [warehouse], company)
-                        reconciliation_cache[voucher] = ({r["name"]: r["actual_qty"] for r in verified}, None)
-                    except Exception as exc:
-                        reconciliation_cache[voucher] = ({}, str(exc))
-            for row in rows:
-                if (row.get("item_code") not in quantities or row.get("item_code") not in group
-                        or row.get("warehouse") != warehouse or row.get("company") != company):
-                    raise ValueError("Unexpected ledger scope")
-                by_item[row["item_code"]].append(row)
-            for item in group:
-                try:
-                    fresh = _read_bin_actual_qty(item, warehouse)
-                    if abs(fresh - quantities[item]) > INBOUND_DEBT_QTY_TOLERANCE:
-                        raise ValueError("Bin changed during aging scan")
-                    for row in by_item[item]:
-                        if row.get("voucher_type") == "Stock Reconciliation":
-                            movements, error = reconciliation_cache[row.get("voucher_no")]
-                            if error or row["name"] not in movements:
-                                raise ValueError("Unverified reconciliation: " + str(error or row["name"]))
-                            row["_verified_reconciliation_delta"] = movements[row["name"]]
-                    result = _prep_aging_reconstruct(by_item[item], fresh, observed_at)
-                    if result["old_qty"] > INBOUND_DEBT_QTY_TOLERANCE:
-                        result["item_code"] = item
-                        report["candidates"].append(result)
-                except Exception as exc:
-                    report["unavailable"].append({"item_code": item, "reason": str(exc)})
-        report["observed_at"] = str(observed_at)
-        report["items_checked"] = len(items)
+        for item in sorted(quantities):
+            try:
+                if item in affected:
+                    raise ValueError("Pending/non-completed valuation repost may affect this item; "
+                                     "see repost scope notes")
+                # Per-item bounded reads: one malformed or oversized history must
+                # not prevent unrelated items from being inspected.
+                rows = frappe.get_all("Stock Ledger Entry", filters={
+                    "warehouse": warehouse, "company": company, "item_code": item,
+                    "is_cancelled": 0, "docstatus": 1}, fields=fields,
+                    order_by="posting_date asc, posting_time asc, creation asc, name asc",
+                    limit_page_length=PREP_AGING_MAX_LEDGER_ROWS + 1)
+                if len(rows) > PREP_AGING_MAX_LEDGER_ROWS:
+                    raise ValueError("Item ledger exceeds safety limit; age not inferred")
+                for row in rows:
+                    if (row.get("item_code") != item or row.get("warehouse") != warehouse
+                            or row.get("company") != company):
+                        raise ValueError("Unexpected ledger scope")
+                    if row.get("voucher_type") == "Stock Reconciliation":
+                        voucher = row.get("voucher_no")
+                        if voucher not in reconciliation_cache:
+                            try:
+                                verified = _verified_reconciliation_movements([voucher], [warehouse], company)
+                                reconciliation_cache[voucher] = ({r["name"]: r["actual_qty"] for r in verified}, None)
+                            except Exception as exc:
+                                reconciliation_cache[voucher] = ({}, str(exc))
+                        movements, error = reconciliation_cache[voucher]
+                        if error or row["name"] not in movements:
+                            raise ValueError("Unverified reconciliation: " + str(error or row["name"]))
+                        row["_verified_reconciliation_delta"] = movements[row["name"]]
+                fresh = _prep_aging_number(_read_bin_actual_qty(item, warehouse))
+                if abs(fresh - quantities[item]) > INBOUND_DEBT_QTY_TOLERANCE:
+                    raise ValueError("Bin changed during aging scan")
+                result = _prep_aging_reconstruct(rows, fresh, observed_at)
+                report["items_checked"] += 1
+                if result["old_qty"] > INBOUND_DEBT_QTY_TOLERANCE:
+                    result["item_code"] = item
+                    report["candidates"].append(result)
+            except Exception as exc:
+                report["unavailable"].append({"item_code": item, "reason": str(exc)})
+        # Recheck pending scope before publishing ages. A newly appearing or
+        # expanded job invalidates only its now-known impacted candidates.
+        after_affected, after_notes = _prep_aging_repost_scope(company)
+        newly_affected = after_affected - affected
+        if newly_affected:
+            report["candidates"] = [r for r in report["candidates"] if r["item_code"] not in newly_affected]
+            unavailable = {r["item_code"] for r in report["unavailable"]}
+            for item in sorted(newly_affected.intersection(quantities) - unavailable):
+                report["unavailable"].append({"item_code": item, "reason": "Valuation repost scope changed during scan"})
+                report["items_checked"] -= 1
+        report["repost_notes"] = sorted(set(report["repost_notes"] + after_notes))
     except Exception as exc:
+        # A global failure must not leave earlier candidates presented as verified.
+        report["candidates"] = []
+        report["items_checked"] = 0
         report["errors"].append(str(exc))
     try:
         if report["candidates"] or report["unavailable"] or report["errors"]:
@@ -7428,8 +7534,10 @@ def _report_suspected_orphaned_prep(settings):
                 "Strictly older than 14 elapsed days; new receipts do not reset older stock.",
                 "Opening/reconciliation additions use their posting date as the earliest evidenced residence date.",
                 "Suspected only: verify physical stock and shipment history before correcting.",
-                "No stock was moved or reconciled by this diagnostic."]
-            lines = []
+                "No stock was moved or reconciled by this diagnostic.",
+                "Items considered: {0}; ages resolved: {1}; unavailable: {2}".format(
+                    report["items_considered"], report["items_checked"], len(report["unavailable"]))]
+            lines = ["REPOST SCOPE: " + note for note in report["repost_notes"]]
             for item in report["candidates"]:
                 oldest = min(lot["received_at"] for lot in item["old_lots"])
                 lines.append("ITEM {0}: current Prep={1:g}; quantity over 14 days={2:g}; oldest remaining receipt={3}".format(
