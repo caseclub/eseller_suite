@@ -2832,10 +2832,19 @@ class _MainToPrepEvidence:
             "site": str(getattr(getattr(frappe, "local", None), "site", "") or ""),
             "settings": str(getattr(settings, "name", "") or ""),
             "company": settings.company,
-            "marketplaces": sorted(parse_marketplaces(settings.custom_marketplace)),
+            "marketplaces": sorted(set(parse_marketplaces(settings.custom_marketplace))),
             "source": MAIN_TO_PREP_SOURCE_WAREHOUSE,
             "prep": settings.custom_amazon_fba_staging_area,
         }
+        # Scheduled MYI reports are explicitly US-scoped. When the account
+        # fetches several marketplaces, authorize from the US LIVE slice only,
+        # never from a merged/summed observation. A sole marketplace retains its
+        # existing behavior. Multiple non-US markets remain deliberately held.
+        configured = self.scope["marketplaces"]
+        self.evidence_marketplace = (MYI_US_MARKETPLACE_ID if MYI_US_MARKETPLACE_ID in configured
+                                     else configured[0] if len(configured) == 1 else None)
+        if self.evidence_marketplace:
+            self.scope["marketplaces"] = [self.evidence_marketplace]
         scope_id = hashlib.sha256(json.dumps(self.scope, sort_keys=True).encode()).hexdigest()[:24]
         self.path = (Path(path) if path is not None else Path(__file__).resolve().parent /
                      ("amazon_main_to_prep_evidence_" + scope_id + ".json"))
@@ -2849,7 +2858,7 @@ class _MainToPrepEvidence:
                                   reason=reason, document_name=draft_name)
         return False
 
-    def observe(self, summaries, global_error):
+    def observe(self, summaries, global_error, summaries_by_marketplace=None):
         """Observe independent LIVE gains, never ERP debt or protected targets.
 
         Unallocated credit expires after 14 days; decreases never lower the
@@ -2862,8 +2871,21 @@ class _MainToPrepEvidence:
                 raise ValueError("Existing inventory-run lock/state is unavailable")
             if global_error or not summaries:
                 raise ValueError("Complete LIVE Amazon observation is unavailable")
-            if not self.scope["site"] or not self.scope["settings"] or len(self.scope["marketplaces"]) != 1:
-                raise ValueError("Unambiguous site/account and single-marketplace scope required")
+            if not self.scope["site"]:
+                raise ValueError("Main-to-Prep evidence requires the current ERP site identity")
+            if not self.scope["settings"]:
+                raise ValueError("Main-to-Prep evidence requires the Amazon settings/account identity")
+            if not self.evidence_marketplace:
+                raise ValueError("Main-to-Prep evidence requires one marketplace or the US marketplace used by MYI reports")
+            configured = sorted(set(parse_marketplaces(self.settings.custom_marketplace)))
+            if summaries_by_marketplace is not None:
+                if not isinstance(summaries_by_marketplace, dict):
+                    raise ValueError("Invalid per-marketplace LIVE evidence provenance")
+                summaries = summaries_by_marketplace.get(self.evidence_marketplace)
+                if not isinstance(summaries, list) or not summaries:
+                    raise ValueError("Complete selected-marketplace LIVE evidence is unavailable")
+            elif len(configured) != 1:
+                raise ValueError("Per-marketplace LIVE evidence provenance is required for multi-marketplace accounts")
             if self.path.is_symlink():
                 raise ValueError("Refusing symlink Main-to-Prep evidence state")
             observed_at = datetime.now(timezone.utc)
@@ -3522,6 +3544,8 @@ def _discover_historical_inbound_debt(company, inbound_wh, prep_wh):
             row.name: row
             for row in candidate_manual_docs
             if not str(row.get(INBOUND_DEBT_SOURCE_FIELD) or "").strip()
+            # Age-policy cleanup is not evidence of repayment of recent debt.
+            and not _orphan_cleanup_document(frappe.get_doc("Stock Reconciliation", row.name))
         }
 
     # Reconstruct signed movement from the same evidence used for originals
@@ -7565,6 +7589,230 @@ def _report_suspected_orphaned_prep(settings):
     return report
 
 
+# Receipt-age cleanup is independent of Amazon debt. DEBUG=True previews only;
+# DEBUG=False enables eligible cleanup. Neither mode creates reconciliation drafts.
+ORPHAN_CLEANUP_AGE_DAYS = 21
+ORPHAN_CLEANUP_LOG_TITLE = "Orphaned Transit Warehouse Inventory Cleanup"
+ORPHAN_CLEANUP_MARKER = "AMAZON_ORPHAN_RECEIPT_CLEANUP_V1:"
+
+
+def _orphan_cleanup_document(doc):
+    return str(doc.get("remarks") or "").startswith(ORPHAN_CLEANUP_MARKER)
+
+
+def _orphan_cleanup_lots(result, observed_at):
+    now = _prep_aging_utc(observed_at)
+    old = [dict(lot) for lot in result["lots"]
+           if now - _prep_aging_utc(lot["received_at"], latest=True)
+           > timedelta(days=ORPHAN_CLEANUP_AGE_DAYS)]
+    quantity = sum(lot["qty"] for lot in old)
+    target = result["current_qty"] - quantity
+    if target < -INBOUND_DEBT_QTY_TOLERANCE:
+        raise ValueError("Expired receipt quantities exceed current balance")
+    return old, quantity, max(target, 0.0)
+
+
+def _orphan_cleanup_snapshot(item, warehouse, company, observed_at):
+    # Current locking reads, not a repeatable-read snapshot from before the sync.
+    # Lock Bin before ledger replay; concurrent stock writes must update this Bin.
+    bins = frappe.db.sql("""SELECT name, actual_qty, valuation_rate FROM `tabBin`
+        WHERE item_code=%s AND warehouse=%s FOR UPDATE""", (item, warehouse), as_dict=True)
+    if len(bins) != 1:
+        raise ValueError("Expected exactly one source Bin")
+    current = _prep_aging_number(bins[0].actual_qty)
+    rows = frappe.db.sql("""SELECT name, item_code, warehouse, company, posting_date,
+        posting_time, creation, actual_qty, qty_after_transaction, voucher_type,
+        voucher_no, is_cancelled, docstatus, serial_no, batch_no, serial_and_batch_bundle
+        FROM `tabStock Ledger Entry` WHERE item_code=%s AND warehouse=%s AND company=%s
+        AND is_cancelled=0 AND docstatus=1
+        ORDER BY posting_date, posting_time, creation, name LIMIT %s FOR UPDATE""",
+        (item, warehouse, company, PREP_AGING_MAX_LEDGER_ROWS + 1), as_dict=True)
+    if len(rows) > PREP_AGING_MAX_LEDGER_ROWS:
+        raise ValueError("Item ledger exceeds cleanup safety limit")
+    verified = {}
+    for row in rows:
+        if any(row.get(k) for k in ("serial_no", "batch_no", "serial_and_batch_bundle")):
+            raise ValueError("Serial/batch history requires manual review")
+        if row.voucher_type == "Stock Reconciliation":
+            if row.voucher_no not in verified:
+                verified[row.voucher_no] = {r["name"]: r["actual_qty"] for r in
+                    _verified_reconciliation_movements([row.voucher_no], [warehouse], company)}
+            if row.name not in verified[row.voucher_no]:
+                raise ValueError("Unverified reconciliation ledger movement")
+            row["_verified_reconciliation_delta"] = verified[row.voucher_no][row.name]
+    result = _prep_aging_reconstruct(rows, current, observed_at)
+    result["valuation_rate"] = _prep_aging_number(bins[0].valuation_rate)
+    result["fingerprint"] = json.dumps([dict(row) for row in rows], sort_keys=True, default=str)
+    return result
+
+
+def _orphan_cleanup_item(item, warehouse, require_asin, company):
+    rows = frappe.db.sql("""SELECT name, is_stock_item, has_serial_no, has_batch_no,
+        custom_asin FROM `tabItem` WHERE name=%s FOR UPDATE""", (item,), as_dict=True)
+    if len(rows) != 1 or not rows[0].is_stock_item:
+        raise ValueError("Missing or non-stock Item")
+    row = rows[0]
+    if row.has_serial_no or row.has_batch_no:
+        raise ValueError("Serial/batch stock requires manual review")
+    if require_asin and not re.fullmatch(r"[A-Z0-9]{10}", str(row.custom_asin or "").strip()):
+        raise ValueError("Finished Goods requires one valid ASIN")
+    if frappe.db.get_value("Warehouse", warehouse, "company") != company:
+        raise ValueError("Cleanup warehouse company changed")
+    return row
+
+
+def _process_orphan_cleanup(settings, diagnostics):
+    """Run only after successful ordinary/debt phases; FIFO age is not identity.
+
+    Normal evidenced transfers already run first. This policy writes down only
+    the expired residual, never credits another warehouse or consumes debt.
+    Each item is one transaction; uncertain items are logged and left alone.
+    """
+    preview = bool(DEBUG)
+    lines = ["Mode: " + ("PREVIEW ONLY; no inventory changes" if preview else "ACTIVE"),
+        "Strictly older than 21 elapsed days; each remaining receipt has its own FIFO age.",
+        "Normal transfers and debt correction run first. Younger receipt dates are preserved."]
+    lock = None
+    acquired = False
+    try:
+        if diagnostics is None or diagnostics.get("unverified_draft_scope_unknown"):
+            raise ValueError("Prior inventory impact cannot be bounded")
+        debt = diagnostics.get("historical_debt") or {}
+        if debt.get("status") != "completed":
+            raise ValueError("Historical debt phase did not complete cleanly; cleanup withheld")
+        if not frappe.get_meta("Stock Reconciliation").has_field("remarks"):
+            raise ValueError("Durable cleanup identification requires Stock Reconciliation remarks")
+        prep = settings.custom_amazon_fba_staging_area
+        company = settings.company
+        warehouses = [(prep, False), (FINISHED_GOODS_WAREHOUSE, True)]
+        if not prep or prep == FINISHED_GOODS_WAREHOUSE:
+            raise ValueError("Prep and Finished Goods must be distinct configured warehouses")
+        if any(w in (settings.afn_warehouse, settings.custom_amazon_inbound_warehouse,
+                      MAIN_TO_PREP_SOURCE_WAREHOUSE) for w, _ in warehouses):
+            raise ValueError("Cleanup warehouse overlaps a protected destination/source")
+        cache = frappe.cache
+        if callable(cache) and not hasattr(cache, "lock"):
+            cache = cache()
+        # Shares the debt lock: another worker cannot deduct source stock for
+        # debt while this phase reconstructs and writes expired receipt balances.
+        lock = cache.lock(INBOUND_DEBT_LOCK_KEY,
+            timeout=INBOUND_DEBT_LOCK_TIMEOUT_SECONDS, blocking_timeout=0)
+        acquired = bool(lock.acquire(blocking=False))
+        if not acquired:
+            raise ValueError("Another source cleanup owns the lock")
+        for warehouse, require_asin in warehouses:
+            if frappe.db.get_value("Warehouse", warehouse, "company") != company:
+                lines.append("SKIPPED WAREHOUSE {0}: company mismatch/missing".format(warehouse))
+                continue
+            candidates = frappe.get_all("Bin", filters={"warehouse": warehouse, "actual_qty": [">", 0]},
+                fields=["item_code"], limit_page_length=0)
+            for item in sorted({r.get("item_code") for r in candidates if r.get("item_code")}):
+                document = None
+                commit_attempted = False
+                try:
+                    # End prior read transaction before fresh locking reads.
+                    frappe.db.commit()
+                    if not lock.owned():
+                        raise RuntimeError("Cleanup lock ownership lost")
+                    meta = _orphan_cleanup_item(item, warehouse, require_asin, company)
+                    if _transition_item_blocked(diagnostics, item, meta.custom_asin):
+                        raise ValueError("Item has unresolved transition/draft evidence")
+                    if any(s.get("item_code") == item and s.get("skipped")
+                           for s in (diagnostics.get("items") or {}).values()):
+                        raise ValueError("Ordinary sync skipped this item's quantity verification")
+                    affected, _ = _prep_aging_repost_scope(company)
+                    if item in affected:
+                        raise ValueError("Pending valuation repost affects this item")
+                    observed = frappe.utils.now_datetime()
+                    before = _orphan_cleanup_snapshot(item, warehouse, company, observed)
+                    old, quantity, target = _orphan_cleanup_lots(before, observed)
+                    if quantity <= INBOUND_DEBT_QTY_TOLERANCE:
+                        frappe.db.rollback()
+                        continue
+                    evidence = {"item_code": item, "warehouse": warehouse, "observed_at": str(observed),
+                        "before": before["current_qty"], "removed": quantity, "after": target,
+                        "lots": old}
+                    # Keep complete receipt evidence in both the document and log;
+                    # never truncate it or post an untraceable large adjustment.
+                    if len(json.dumps(evidence, default=str, sort_keys=True).encode("utf-8")) > 32000:
+                        raise ValueError("Receipt evidence exceeds cleanup document/log safety limit")
+                    if preview:
+                        frappe.db.rollback()
+                        lines.append("WOULD REMOVE " + json.dumps(evidence, default=str, sort_keys=True))
+                        continue
+                    if before["valuation_rate"] < 0:
+                        raise ValueError("Negative source valuation")
+                    fresh = _orphan_cleanup_snapshot(item, warehouse, company, observed)
+                    if fresh["fingerprint"] != before["fingerprint"] or fresh["current_qty"] != before["current_qty"]:
+                        raise ValueError("Source changed during cleanup preparation")
+                    _orphan_cleanup_item(item, warehouse, require_asin, company)
+                    affected, _ = _prep_aging_repost_scope(company)
+                    if item in affected or not lock.owned():
+                        raise ValueError("Repost scope/lock changed before posting")
+                    document = frappe.get_doc({"doctype": "Stock Reconciliation", "company": company,
+                        "purpose": "Stock Reconciliation", "posting_date": str(observed.date()),
+                        "posting_time": str(observed.time()), "set_posting_time": 1,
+                        "expense_account": settings.custom_amazon_inventory_adjustment_account,
+                        "remarks": ORPHAN_CLEANUP_MARKER + json.dumps(evidence, default=str, sort_keys=True),
+                        "items": [{"item_code": item, "warehouse": warehouse, "qty": target,
+                                   "valuation_rate": before["valuation_rate"]}]})
+                    document.insert(ignore_permissions=True)
+                    document.submit()
+                    posted = _verified_reconciliation_movements([document.name], [warehouse], company)
+                    if (len(posted) != 1 or posted[0].item_code != item
+                            or abs(posted[0].actual_qty + quantity) > INBOUND_DEBT_QTY_TOLERANCE
+                            or abs(_read_bin_actual_qty(item, warehouse) - target) > INBOUND_DEBT_QTY_TOLERANCE):
+                        raise ValueError("Cleanup ledger/Bin reduction could not be verified")
+                    # Verify replay preserves every surviving younger receipt.
+                    after = _orphan_cleanup_snapshot(item, warehouse, company, frappe.utils.now_datetime())
+                    expected = [lot for lot in before["lots"] if lot["ledger_entry"] not in
+                                {old_lot["ledger_entry"] for old_lot in old}]
+                    if after["lots"] != expected:
+                        raise ValueError("Cleanup would alter younger receipt provenance")
+                    if not lock.owned():
+                        raise ValueError("Cleanup lock lost before commit")
+                    commit_attempted = True
+                    frappe.db.commit()
+                    evidence["reconciliation"] = document.name
+                    lines.append("REMOVED AND VERIFIED " + json.dumps(evidence, default=str, sort_keys=True))
+                    _upsert_inventory_document(diagnostics, "Stock Reconciliation", document.name,
+                        "Remove only receipt quantities older than 21 days from transit warehouse",
+                        "newly created by orphan cleanup", "submitted, committed, ledger/Bin and younger receipts verified",
+                        source_warehouses=[warehouse], movement_quantity=quantity, affected_item_count=1)
+                except Exception as exc:
+                    try:
+                        frappe.db.rollback()
+                    except Exception:
+                        raise RuntimeError("Cleanup rollback failed; remaining items withheld")
+                    label = "COMMIT OUTCOME UNCONFIRMED; review document " + str(getattr(document, "name", None)) if commit_attempted else "SKIPPED"
+                    lines.append("{0} {1}@{2}: {3}".format(label, item, warehouse, _concise_inventory_exception(exc)))
+                    if commit_attempted:
+                        raise RuntimeError("Uncertain cleanup commit; remaining items withheld")
+    except Exception as exc:
+        lines.append("CLEANUP WITHHELD: " + _concise_inventory_exception(exc))
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except Exception as exc:
+                lines.append("LOCK RELEASE ERROR: " + _concise_inventory_exception(exc))
+        pages, page, size = [], [], 0
+        for line in lines:
+            if size + len(line.encode("utf-8")) > 48000 and page:
+                pages.append(page)
+                page, size = [], 0
+            page.append(line)
+            size += len(line.encode("utf-8")) + 1
+        if page:
+            pages.append(page)
+        for number, page in enumerate(pages, 1):
+            try:
+                frappe.log_error(title=ORPHAN_CLEANUP_LOG_TITLE,
+                    message="Part {0} of {1}\n".format(number, len(pages)) + "\n".join(page))
+            except Exception as exc:
+                _record_inbound_flow_global_error(diagnostics, "Cleanup log failed: " + str(exc))
+
+
 def process_fba_inventory():
     settings = None
     temporary_log_inputs = None
@@ -7587,12 +7835,14 @@ def process_fba_inventory():
         # Gather LIVE data after report discovery. Do not abort if the live pull
         # is unavailable; report-only Mode 1 and per-ASIN Mode 4 must still run.
         summaries = []
+        summaries_by_marketplace = {}
         # Capture before fetching, so a slower earlier pull cannot overwrite a
         # newer observation saved by a concurrent run.
         live_observed_at = datetime.now(timezone.utc)
         live_global_error = None
         try:
-            for mkt_id in marketplace_ids:
+            for mkt_id in dict.fromkeys(marketplace_ids):
+                summaries_by_marketplace[mkt_id] = []
                 if DEBUG: print(f"[DEBUG] Querying marketplace: {mkt_id}")
                 base_qs = {
                     "granularityType": "Marketplace",
@@ -7617,6 +7867,7 @@ def process_fba_inventory():
                         "inventorySummaries", []
                     )
                     summaries.extend(page_summaries)
+                    summaries_by_marketplace[mkt_id].extend(page_summaries)
                     if DEBUG:
                         print(
                             f"[DEBUG] Fetched {len(page_summaries)} summaries "
@@ -7786,7 +8037,7 @@ def process_fba_inventory():
             live_global_error, live_observed_at, current_main_by_asin,
         )
         main_to_prep_evidence = _MainToPrepEvidence(settings, inbound_flow_diagnostics)
-        main_to_prep_evidence.observe(summaries, live_global_error)
+        main_to_prep_evidence.observe(summaries, live_global_error, summaries_by_marketplace)
         effective_main_targets, effective_inbound_targets = transition_window.prepare(
             asin_fulfillable, final_inbound_by_asin
         )
@@ -8013,6 +8264,7 @@ def process_fba_inventory():
             settings,
             inbound_flow_diagnostics,
         )
+        _process_orphan_cleanup(settings, inbound_flow_diagnostics)
 
     except Exception as exc:
         _record_inventory_trigger(
