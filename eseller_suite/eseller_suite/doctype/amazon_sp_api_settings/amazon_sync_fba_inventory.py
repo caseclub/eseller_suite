@@ -10,6 +10,7 @@
 # 2026-11-12: ERP-ledger Prep aging; 14-day evidence-based debt repayment.
 # Existing transfer gates and synthetic-duplicate reconciliation safeguards remain.
 # 2026-11-13: Isolate Prep-aging item failures and conservatively scope valuation reposts.
+# 2026-11-17: Atomic linked cleanup evidence; combined orphan aging/cleanup report.
 from __future__ import annotations
 import csv
 import base64
@@ -7456,7 +7457,35 @@ def _prep_aging_repost_scope(company):
     return affected, notes
 
 
-def _report_suspected_orphaned_prep(settings):
+def _orphan_report_pages(header, lines, max_bytes=48000):
+    prefix = "\n".join(header) + "\n"
+    # Ten digits per counter is well beyond any practical report; reserve that
+    # full overhead before splitting rather than guessing the final page count.
+    budget = max_bytes - len(prefix.encode("utf-8")) - len("Part 0000000000 of 0000000000\n".encode("utf-8"))
+    if budget < 4:
+        raise ValueError("Orphan report header exceeds safe log size")
+    body = "\n".join(lines).encode("utf-8")
+    pages = []
+    while body:
+        end = min(len(body), budget)
+        try:
+            body[:end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            end = exc.start  # only the trailing code point can be incomplete
+        if end < len(body):
+            newline = body.rfind(b"\n", 0, end)
+            if newline >= 0:
+                end = newline + 1
+        pages.append(body[:end].decode("utf-8"))
+        body = body[end:]
+    pages = pages or [""]
+    if len(pages) >= 10000000000:
+        raise ValueError("Orphan report exceeds page-count safety limit")
+    return [prefix + "Part {0} of {1}\n".format(i, len(pages)) + payload
+            for i, payload in enumerate(pages, 1)]
+
+
+def _report_suspected_orphaned_prep(settings, cleanup_lines=None):
     """Read-only diagnostic; isolate item failures, never manufacture missing ages."""
     report = {"warehouse": None, "candidates": [], "unavailable": [], "errors": [],
               "items_checked": 0, "items_considered": 0, "repost_notes": []}
@@ -7551,8 +7580,10 @@ def _report_suspected_orphaned_prep(settings):
         report["items_checked"] = 0
         report["errors"].append(str(exc))
     try:
-        if report["candidates"] or report["unavailable"] or report["errors"]:
-            header = [PREP_ORPHAN_LOG_TITLE, "Warehouse: " + str(report["warehouse"]),
+        if report["candidates"] or report["unavailable"] or report["errors"] or cleanup_lines:
+            header = [PREP_ORPHAN_LOG_TITLE, "Combined orphan aging and transit-warehouse cleanup report",
+                "Aging below observes balances AFTER any cleanup reported in this entry.",
+                "Warehouse: " + str(report["warehouse"]),
                 "Observation time (ERP site timezone): " + str(report.get("observed_at", "unavailable")),
                 "FIFO estimate from submitted, non-cancelled ERP Stock Ledger Entries; quantities are stock-UOM units.",
                 "Strictly older than 14 elapsed days; new receipts do not reset older stock.",
@@ -7561,7 +7592,10 @@ def _report_suspected_orphaned_prep(settings):
                 "No stock was moved or reconciled by this diagnostic.",
                 "Items considered: {0}; ages resolved: {1}; unavailable: {2}".format(
                     report["items_considered"], report["items_checked"], len(report["unavailable"]))]
-            lines = ["REPOST SCOPE: " + note for note in report["repost_notes"]]
+            lines = ["=== 21-DAY TRANSIT CLEANUP ==="] + list(cleanup_lines or
+                ["NOT RUN: cleanup was not reached in this sync run."])
+            lines += ["=== 14-DAY PREP AGING (READ ONLY) ==="]
+            lines += ["REPOST SCOPE: " + note for note in report["repost_notes"]]
             for item in report["candidates"]:
                 oldest = min(lot["received_at"] for lot in item["old_lots"])
                 lines.append("ITEM {0}: current Prep={1:g}; quantity over 14 days={2:g}; oldest remaining receipt={3}".format(
@@ -7571,19 +7605,10 @@ def _report_suspected_orphaned_prep(settings):
             for item in report["unavailable"]:
                 lines.append("AGE UNAVAILABLE {item_code}: {reason}".format(**item))
             lines.extend("SCAN ERROR: " + error for error in report["errors"])
-            # Preserve every item; bounded pages avoid Error Log text truncation.
-            pages, page, size = [], [], 0
-            for line in lines:
-                if size + len(line.encode("utf-8")) > 48000 and page:
-                    pages.append(page)
-                    page, size = [], 0
-                page.append(line)
-                size += len(line.encode("utf-8")) + 1
-            if page:
-                pages.append(page)
-            for index, page in enumerate(pages, 1):
-                frappe.log_error(message="\n".join(header + ["Part {0} of {1}".format(index, len(pages))] + page),
-                                 title=PREP_ORPHAN_LOG_TITLE)
+            # Include headers in the byte budget and split oversized individual
+            # lines without losing characters or cutting a UTF-8 code point.
+            for message in _orphan_report_pages(header, lines):
+                frappe.log_error(message=message, title=PREP_ORPHAN_LOG_TITLE)
     except Exception as exc:
         report["errors"].append("Could not publish Prep aging log: " + str(exc))
     return report
@@ -7597,7 +7622,49 @@ ORPHAN_CLEANUP_MARKER = "AMAZON_ORPHAN_RECEIPT_CLEANUP_V1:"
 
 
 def _orphan_cleanup_document(doc):
-    return str(doc.get("remarks") or "").startswith(ORPHAN_CLEANUP_MARKER)
+    """Recognize old remarks and durable linked evidence; lookup failures propagate.
+
+    Keep the linked cleanup Comment: manually deleting that audit evidence
+    removes the durable cleanup identity when no legacy remarks marker exists.
+    Do not turn an unavailable Comment lookup into False: that could let debt
+    discovery consume a cleanup adjustment as an unrelated manual repayment.
+    """
+    if str(doc.get("remarks") or "").startswith(ORPHAN_CLEANUP_MARKER):
+        return True
+    if not doc.get("name"):
+        return False
+    comments = frappe.get_all("Comment", filters={
+        "reference_doctype": "Stock Reconciliation", "reference_name": doc.name,
+        "comment_type": "Comment"}, fields=["name", "content"], limit_page_length=0)
+    return any(str(row.get("content") or "").startswith(ORPHAN_CLEANUP_MARKER)
+               for row in comments)
+
+
+def _orphan_cleanup_evidence_content(evidence):
+    # ASCII payload avoids rich-text/HTML interpretation of receipt identifiers.
+    payload = json.dumps(evidence, default=str, sort_keys=True).encode("utf-8")
+    return ORPHAN_CLEANUP_MARKER + base64.b64encode(payload).decode("ascii")
+
+
+def _orphan_cleanup_attach_evidence(document, evidence):
+    """Insert evidence in the SAME uncommitted transaction as the adjustment."""
+    content = _orphan_cleanup_evidence_content(evidence)
+    comment = frappe.get_doc({"doctype": "Comment", "comment_type": "Comment",
+        "reference_doctype": "Stock Reconciliation", "reference_name": document.name,
+        "content": content})
+    comment.insert(ignore_permissions=True)
+    _orphan_cleanup_verify_evidence(document, comment.name, content)
+    return comment.name, content
+
+
+def _orphan_cleanup_verify_evidence(document, comment_name, content):
+    saved = frappe.get_doc("Comment", comment_name)
+    if (saved.get("reference_doctype") != "Stock Reconciliation"
+            or saved.get("reference_name") != document.name
+            or saved.get("comment_type") != "Comment"
+            or saved.get("content") != content
+            or not _orphan_cleanup_document(document)):
+        raise ValueError("Durable cleanup evidence could not be verified")
 
 
 def _orphan_cleanup_lots(result, observed_at):
@@ -7680,8 +7747,10 @@ def _process_orphan_cleanup(settings, diagnostics):
         debt = diagnostics.get("historical_debt") or {}
         if debt.get("status") != "completed":
             raise ValueError("Historical debt phase did not complete cleanly; cleanup withheld")
-        if not frappe.get_meta("Stock Reconciliation").has_field("remarks"):
-            raise ValueError("Durable cleanup identification requires Stock Reconciliation remarks")
+        comment_meta = frappe.get_meta("Comment")
+        if not all(comment_meta.has_field(field) for field in
+                   ("comment_type", "reference_doctype", "reference_name", "content")):
+            raise ValueError("Durable cleanup identification requires standard linked Comment fields")
         prep = settings.custom_amazon_fba_staging_area
         company = settings.company
         warehouses = [(prep, False), (FINISHED_GOODS_WAREHOUSE, True)]
@@ -7753,10 +7822,11 @@ def _process_orphan_cleanup(settings, diagnostics):
                         "purpose": "Stock Reconciliation", "posting_date": str(observed.date()),
                         "posting_time": str(observed.time()), "set_posting_time": 1,
                         "expense_account": settings.custom_amazon_inventory_adjustment_account,
-                        "remarks": ORPHAN_CLEANUP_MARKER + json.dumps(evidence, default=str, sort_keys=True),
                         "items": [{"item_code": item, "warehouse": warehouse, "qty": target,
                                    "valuation_rate": before["valuation_rate"]}]})
                     document.insert(ignore_permissions=True)
+                    evidence["reconciliation"] = document.name
+                    evidence_name, evidence_content = _orphan_cleanup_attach_evidence(document, evidence)
                     document.submit()
                     posted = _verified_reconciliation_movements([document.name], [warehouse], company)
                     if (len(posted) != 1 or posted[0].item_code != item
@@ -7771,6 +7841,7 @@ def _process_orphan_cleanup(settings, diagnostics):
                         raise ValueError("Cleanup would alter younger receipt provenance")
                     if not lock.owned():
                         raise ValueError("Cleanup lock lost before commit")
+                    _orphan_cleanup_verify_evidence(document, evidence_name, evidence_content)
                     commit_attempted = True
                     frappe.db.commit()
                     evidence["reconciliation"] = document.name
@@ -7796,21 +7867,11 @@ def _process_orphan_cleanup(settings, diagnostics):
                 lock.release()
             except Exception as exc:
                 lines.append("LOCK RELEASE ERROR: " + _concise_inventory_exception(exc))
-        pages, page, size = [], [], 0
-        for line in lines:
-            if size + len(line.encode("utf-8")) > 48000 and page:
-                pages.append(page)
-                page, size = [], 0
-            page.append(line)
-            size += len(line.encode("utf-8")) + 1
-        if page:
-            pages.append(page)
-        for number, page in enumerate(pages, 1):
-            try:
-                frappe.log_error(title=ORPHAN_CLEANUP_LOG_TITLE,
-                    message="Part {0} of {1}\n".format(number, len(pages)) + "\n".join(page))
-            except Exception as exc:
-                _record_inbound_flow_global_error(diagnostics, "Cleanup log failed: " + str(exc))
+        # Publish once, together with the post-cleanup aging diagnostic, from
+        # the orchestrator's finally block (including partial-run failures).
+        if diagnostics is not None:
+            diagnostics["orphan_cleanup_lines"] = lines
+    return lines
 
 
 def process_fba_inventory():
@@ -8280,7 +8341,9 @@ def process_fba_inventory():
         # partial-run failures. Age never authorizes a movement or write-off.
         if settings is not None:
             try:
-                prep_aging_report = _report_suspected_orphaned_prep(settings)
+                prep_aging_report = _report_suspected_orphaned_prep(settings,
+                    cleanup_lines=(inbound_flow_diagnostics or {}).get("orphan_cleanup_lines")
+                    or ["NOT RUN: cleanup was not reached in this sync run."])
                 if prep_aging_report.get("errors"):
                     _record_inbound_flow_global_error(inbound_flow_diagnostics,
                         "Prep aging diagnostic incomplete: " + "; ".join(prep_aging_report["errors"]))
