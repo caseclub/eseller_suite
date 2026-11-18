@@ -11,6 +11,7 @@
 # Existing transfer gates and synthetic-duplicate reconciliation safeguards remain.
 # 2026-11-13: Isolate Prep-aging item failures and conservatively scope valuation reposts.
 # 2026-11-17: Atomic linked cleanup evidence; combined orphan aging/cleanup report.
+# 2026-11-18: Separate explanation/trace comments; corrected cleanup diagnostics.
 from __future__ import annotations
 import csv
 import base64
@@ -1570,6 +1571,271 @@ def _upsert_inventory_document(
             record.update(extra_details)
     except Exception:
         return
+
+
+# Human-readable audit comments are separate from durable recovery/debt markers.
+RECONCILIATION_EXPLANATION_MARKER = "AMAZON_RECONCILIATION_EXPLANATION_V1:"
+RECONCILIATION_TRACE_MARKER = "AMAZON_RECONCILIATION_TRACE_V1:"
+
+
+def _reconciliation_audit_read(label, operation):
+    """Isolate optional evidence reads, including database errors, with a savepoint."""
+    import uuid as _audit_uuid
+    point = "amazon_audit_read_" + _audit_uuid.uuid4().hex
+    frappe.db.savepoint(point)
+    try:
+        return operation(), None
+    except Exception as exc:
+        # Failure to restore a usable transaction is fatal, never swallowed.
+        frappe.db.rollback(save_point=point)
+        return None, label + ": unavailable (" + type(exc).__name__ + ")"
+
+
+def _reconciliation_audit_text(value):
+    """Bound one untrusted field; retain a visible omission indicator."""
+    text = str(value) if value is not None else "unknown"
+    if len(text) > 1500:
+        return text[:1500] + " [field truncated; inspect source document]"
+    return text
+
+
+def _reconciliation_manufacture_candidates(item, company, batch=None):
+    """Bounded candidate context; even matching batch IDs do not allocate stock."""
+    label = "matching batch" if batch else "same item across warehouses (no batch link)"
+    filters = {"item_code": item, "docstatus": 1, "is_finished_item": 1}
+    if batch:
+        filters["batch_no"] = batch
+    rows, error = _reconciliation_audit_read("Manufacturing candidates", lambda: frappe.get_all(
+        "Stock Entry Detail", filters=filters,
+        fields=["name", "parent", "item_code", "batch_no", "transfer_qty", "s_warehouse", "t_warehouse"],
+        order_by="creation desc, name desc", limit_page_length=6))
+    if error:
+        return [error + "; upstream manufacture remains unknown."]
+    lines = ["Upstream manufacturing search: " + label + ". Candidates do not establish a transfer-to-WO or reconciliation quantity allocation."]
+    if not rows:
+        lines.append("No manufacturing candidates returned in this search; provenance unknown.")
+    if len(rows or []) > 5:
+        lines.append("Only five recent manufacturing candidates inspected; additional history omitted.")
+    for row in (rows or [])[:5]:
+        entry, error = _reconciliation_audit_read("Manufacturing Stock Entry", lambda: frappe.get_doc("Stock Entry", row.get("parent")))
+        if error:
+            lines.append(error)
+            continue
+        if entry.get("company") != company or entry.get("docstatus") != 1 or entry.get("purpose") != "Manufacture":
+            continue
+        children = [child for child in entry.get("items") or [] if child.get("name") == row.get("name")
+                    and child.get("item_code") == item and child.get("is_finished_item")
+                    and (not batch or child.get("batch_no") == batch)]
+        if len(children) != 1:
+            lines.append("Manufacturing child changed or ambiguous; candidate unverified.")
+            continue
+        child = children[0]
+        lines.append("Candidate manufacturing SE={}; output child={}; explicit WO={}; batch={}; output stock quantity={}; destination={}. Link basis: {}. Quantity reaching this reconciliation from this WO: unknown.".format(
+            *[_reconciliation_audit_text(v) for v in (row.get("parent"), child.get("name"), entry.get("work_order"), child.get("batch_no"), child.get("transfer_qty"), child.get("t_warehouse"), label)]))
+    return lines
+
+
+def _reconciliation_trace_lines(document, evidence=None):
+    """Document relationships, never physical provenance inferred from proximity."""
+    lines = [
+        "Trace evidence collected before submission; this is not verification of the new reconciliation.",
+        "Each Case Club Work Order produces one batch, but later receipts/transfers can mix batches and Work Orders.",
+        "Historical same-item movements are candidates only. Quantity allocated from each Work Order to this reconciliation is unknown unless explicit source evidence establishes it.",
+        "FIFO receipt aging estimates residence; it does not prove physical identity. No WO is inferred from dates or quantity matches.",
+    ]
+    source = document.get(globals().get("INBOUND_DEBT_SOURCE_FIELD", "custom_amazon_inbound_debt_source_id"))
+    if source:
+        lines.append("Explicit debt-source reconciliation link: " + _reconciliation_audit_text(source) + "; not a WO provenance claim.")
+    if evidence is not None:
+        import json as _trace_json
+        lines.append("Caller receipt/debt/decision evidence (not independently verified here): " + _trace_json.dumps(evidence, default=str, sort_keys=True, ensure_ascii=False))
+    pairs = sorted({(str(row.get("item_code") or ""), str(row.get("warehouse") or ""))
+                    for row in document.get("items") or []})
+    # Bound database work independently of the number of reconciliation rows.
+    for item, warehouse in pairs[:20]:
+        lines.append("Item " + item + " @ " + warehouse + ":")
+        rows, error = _reconciliation_audit_read("Stock Ledger history", lambda: frappe.get_all(
+            "Stock Ledger Entry", filters={"item_code": item, "warehouse": warehouse,
+                "company": document.get("company"), "is_cancelled": 0, "docstatus": 1},
+            fields=["name", "voucher_type", "voucher_no", "voucher_detail_no", "posting_date",
+                    "posting_time", "actual_qty", "qty_after_transaction", "batch_no"],
+            order_by="posting_date desc, posting_time desc, creation desc, name desc", limit_page_length=11))
+        if error:
+            lines.append(error + "; receipt, transfer and WO links unknown.")
+            continue
+        if not rows:
+            lines.append("No matching submitted ledger rows returned; provenance unknown.")
+        if len(rows or []) > 10:
+            lines.append("Only the 10 most recent ledger rows are shown; older history omitted, not evidence of absence.")
+        seen = set()
+        work_orders = set()
+        upstream_searched = False
+        for sle in (rows or [])[:10]:
+            lines.append("SLE {name}; {posting_date} {posting_time}; {voucher_type} {voucher_no}; child {voucher_detail_no}; recorded actual_qty={actual_qty}; balance={qty_after_transaction}; batch={batch_no}".format(
+                **{key: _reconciliation_audit_text(sle.get(key)) for key in
+                   ("name", "posting_date", "posting_time", "voucher_type", "voucher_no", "voucher_detail_no", "actual_qty", "qty_after_transaction", "batch_no")}))
+            if sle.get("voucher_type") == "Stock Reconciliation":
+                lines.append("Reconciliation actual_qty is not assumed to be its quantity change; verified child/SLE reset evidence is required.")
+            if sle.get("voucher_type") != "Stock Entry" or not sle.get("voucher_no") or sle.get("voucher_no") in seen:
+                continue
+            seen.add(sle.get("voucher_no"))
+            entry, error = _reconciliation_audit_read("Stock Entry " + str(sle.get("voucher_no")),
+                lambda: frappe.get_doc("Stock Entry", sle.get("voucher_no")))
+            if error:
+                lines.append(error)
+                continue
+            if entry.get("company") != document.get("company") or entry.get("docstatus") != 1:
+                lines.append("Stock Entry company/status does not match submitted evidence; link unresolved.")
+                continue
+            children = [row for row in entry.get("items") or []
+                        if row.get("name") == sle.get("voucher_detail_no") and row.get("item_code") == item
+                        and warehouse in (row.get("s_warehouse"), row.get("t_warehouse"))]
+            if len(children) != 1:
+                lines.append("Exact Stock Entry child/warehouse link is missing or ambiguous; WO allocation unknown.")
+                continue
+            row = children[0]
+            lines.append("Linked Stock Entry child: purpose={}; source={}; destination={}; stock quantity={}; batch={}; finished-output flag={}.".format(
+                *[_reconciliation_audit_text(v) for v in (entry.get("purpose"), row.get("s_warehouse"), row.get("t_warehouse"), row.get("transfer_qty"), row.get("batch_no"), row.get("is_finished_item"))]))
+            wo_name = entry.get("work_order")
+            if not wo_name:
+                lines.append("No explicit Work Order on this Stock Entry; allocated quantities unknown.")
+                if not upstream_searched:
+                    lines.extend(_reconciliation_manufacture_candidates(item, document.get("company"), row.get("batch_no") or sle.get("batch_no")))
+                    upstream_searched = True
+                continue
+            work_orders.add(str(wo_name))
+            lines.append("Explicit Stock Entry.work_order link: " + _reconciliation_audit_text(wo_name) + ".")
+            wo, error = _reconciliation_audit_read("Work Order " + str(wo_name), lambda: frappe.get_doc("Work Order", wo_name))
+            if error:
+                lines.append(error)
+            elif wo.get("company") != document.get("company"):
+                lines.append("Work Order company mismatch; manufacturing relationship unverified.")
+            else:
+                lines.append("Work Order production item={}; planned quantity={}; recorded produced quantity={}; status={}; docstatus={}. These are WO totals, not quantity attributed to this reconciliation.".format(
+                    *[_reconciliation_audit_text(wo.get(k)) for k in ("production_item", "qty", "produced_qty", "status", "docstatus")]))
+                if entry.get("purpose") != "Manufacture" or not row.get("is_finished_item") or wo.get("production_item") != item:
+                    lines.append("This is not a confirmed matching manufacturing finished-output child; WO link alone does not establish item production.")
+        if not work_orders and not upstream_searched:
+            lines.extend(_reconciliation_manufacture_candidates(item, document.get("company")))
+        if len(work_orders) > 1:
+            lines.append("Multiple Work Orders appear in sampled history: mixed/ambiguous provenance; no per-WO reconciliation allocation is supported.")
+    if len(pairs) > 20:
+        lines.append("Trace query budget reached: {} additional item/warehouse pairs were not queried; their trace is unknown. All proposed quantities are in the explanation comment.".format(len(pairs) - 20))
+    return lines
+
+
+def _attach_reconciliation_comments(document, reason, before=None, evidence=None):
+    """Atomically attach two immutable readable comments; never commit or claim posting.
+
+    Retry identity is the reconciliation plus each exact marker prefix. Existing
+    readable comments are retained, and all older machine-readable comments remain
+    untouched. A failed lookup/write propagates after rolling back this helper's
+    savepoint, so callers retain ownership of inventory transaction recovery.
+    """
+    import html as _audit_html
+    import json as _audit_json
+    import uuid as _audit_uuid
+    if document.get("doctype") != "Stock Reconciliation" or not document.get("name"):
+        raise ValueError("Audit comments require an inserted Stock Reconciliation")
+    point = "amazon_audit_comments_" + _audit_uuid.uuid4().hex
+    frappe.db.savepoint(point)
+    try:
+        # Serialize retries on this document, without introducing a commit.
+        locked = frappe.db.sql("SELECT name FROM `tabStock Reconciliation` WHERE name=%s FOR UPDATE", (document.name,))
+        if not locked:
+            raise ValueError("Reconciliation disappeared before comment insertion")
+        existing = frappe.get_all("Comment", filters={"reference_doctype": "Stock Reconciliation",
+            "reference_name": document.name, "comment_type": "Comment"}, fields=["name", "content"], limit_page_length=0)
+        markers = (RECONCILIATION_EXPLANATION_MARKER, RECONCILIATION_TRACE_MARKER)
+        counts = {marker: sum(str(c.get("content") or "").startswith(marker) for c in existing) for marker in markers}
+        if any(count > 1 for count in counts.values()):
+            raise ValueError("Duplicate readable audit markers require review; no comments overwritten")
+        present = {marker for marker, count in counts.items() if count == 1}
+        if len(present) == 2:
+            return
+        explanation = ["Reconciliation " + str(document.name), "Reason: " + _reconciliation_audit_text(reason),
+            "Prepared at ERP local time: " + str(frappe.utils.now_datetime()),
+            "Posting date/time: {} {}".format(document.get("posting_date"), document.get("posting_time") or "not set"),
+            "Status at comment preparation: docstatus={}; DEBUG={}. Quantities below are proposed targets, not proof of submitted, committed or verified results.".format(document.get("docstatus"), bool(DEBUG)),
+            "Before quantities are caller observations; unknown means no supported baseline. Stock UOM quantities are used."]
+        before = before or {}
+        for index, row in enumerate(document.get("items") or [], 1):
+            key = (row.get("item_code"), row.get("warehouse"))
+            baseline = before.get(key)
+            explanation.append("Row {}: item={}; warehouse={}; before warehouse total={}; proposed row quantity={}; proposed valuation rate={}; batch={}; serial={}.".format(
+                index, *[_reconciliation_audit_text(v) for v in (key[0], key[1], baseline, row.get("qty"), row.get("valuation_rate"), row.get("batch_no"), row.get("serial_no"))]))
+        totals = {}
+        for row in document.get("items") or []:
+            key = (row.get("item_code"), row.get("warehouse"))
+            try:
+                value = float(row.get("qty"))
+                import math as _audit_math
+                if not _audit_math.isfinite(value):
+                    raise ValueError("Nonfinite quantity")
+                totals[key] = totals.get(key, 0.0) + value if totals.get(key, 0.0) is not None else None
+            except (TypeError, ValueError):
+                totals[key] = None
+        for key, total in totals.items():
+            delta = "unknown"
+            try:
+                if total is not None and _audit_math.isfinite(float(before[key])):
+                    delta = total - float(before[key])
+            except (KeyError, TypeError, ValueError):
+                pass
+            explanation.append("Item/warehouse proposed total {} @ {} = {}; proposed delta from observed total = {}.".format(key[0], key[1], total if total is not None else "unknown", delta))
+        explanation.append("For split batch/serial rows, the before value is the warehouse total, not a per-row allocation; do not sum repeated before totals.")
+        source = document.get(globals().get("INBOUND_DEBT_SOURCE_FIELD", "custom_amazon_inbound_debt_source_id"))
+        if source:
+            explanation.append("Explicit historical-debt source reconciliation: " + _reconciliation_audit_text(source) + "; this debt link does not establish a Work Order allocation.")
+        if evidence is not None:
+            explanation.append("Caller-supplied decision evidence (observations/proposals, not independently verified by this comment):\n" + _audit_json.dumps(evidence, default=str, sort_keys=True, ensure_ascii=False))
+        else:
+            explanation.append("Amazon targets, snapshot timing and additional decision evidence were not supplied; unknown, not inferred.")
+        for marker, lines in ((markers[0], explanation), (markers[1], None)):
+            if marker in present:
+                continue
+            if lines is None:
+                lines = _reconciliation_trace_lines(document, evidence=evidence)
+            if marker == RECONCILIATION_TRACE_MARKER:
+                # Keep whole lines and reserve space for an explicit omission notice.
+                # The explanation still retains every row or fails closed below.
+                trace_lines = "\n".join(lines).splitlines()
+                kept, encoded_bytes = [], len((marker + "<pre></pre>").encode("utf-8"))
+                for index, line in enumerate(trace_lines):
+                    line_bytes = len(_audit_html.escape(line, quote=True).encode("utf-8")) + 1
+                    if encoded_bytes + line_bytes > 59000:
+                        kept.append("TRACE SIZE LIMIT: {} remaining lines omitted. Omitted links and quantities are unknown; inspect source documents. This excerpt does not establish complete provenance or per-WO allocation.".format(len(trace_lines) - index))
+                        break
+                    kept.append(line)
+                    encoded_bytes += line_bytes
+                lines = kept
+            content = marker + "<pre>" + _audit_html.escape("\n".join(lines), quote=True) + "</pre>"
+            # Never silently lose item-level explanation or provenance warnings.
+            if len(content.encode("utf-8")) > 60000:
+                raise ValueError("Readable reconciliation comment exceeds 60000-byte safety limit")
+            comment = frappe.get_doc({"doctype": "Comment", "comment_type": "Comment",
+                "reference_doctype": "Stock Reconciliation", "reference_name": document.name, "content": content})
+            comment.insert(ignore_permissions=True)
+            saved = frappe.get_doc("Comment", comment.name)
+            if (saved.get("content") != content or saved.get("reference_name") != document.name
+                    or saved.get("reference_doctype") != "Stock Reconciliation" or saved.get("comment_type") != "Comment"):
+                raise ValueError("Readable reconciliation comment could not be verified")
+    except Exception:
+        frappe.db.rollback(save_point=point)
+        raise
+
+
+def _reconciliation_item_context(rows, states):
+    """Only existing run evidence for affected items; no inferred provenance."""
+    fields = ("asin", "target_inbound_qty", "main_target", "inbound_target",
+              "eligible_draft_names", "draft_outcome", "draft_expected_qty",
+              "submitted_prep_qty", "submitted_finished_qty",
+              "aggregated_entry_name", "aggregated_outcome", "final_inbound_qty",
+              "initial_inbound_qty", "fresh_inbound_qty", "reconciliation_qty",
+              "amazon_decision_evidence")
+    return {item: {key: states[item].get(key) for key in fields if key in states[item]}
+            for item in sorted({row.get("item_code") for row in rows})
+            if item in states}
 
 
 def _reconciliation_quantity_metrics(items, current_quantities):
@@ -4436,6 +4702,11 @@ def _process_historical_inbound_debt(settings, diagnostics):
                     raise RuntimeError("Debt lock ownership lost before repayment insertion")
                 repayment_sr.insert(ignore_permissions=True)
                 inserted = True
+                _attach_reconciliation_comments(repayment_sr, repayment_purpose, current_quantities,
+                    {"debt_source_reconciliation": source_id, "remaining_debt_before": remaining_before,
+                     "planned_prep_deduction": planned_prep, "planned_finished_deduction": planned_finished,
+                     "manual_offsets": manual_offset_details, "relevant_drafts": relevant_draft_ids,
+                     "matching_window_days": INBOUND_DEBT_LOOKBACK_DAYS})
                 debt["repayment_documents_created"] += 1
                 if repayment_sr.name not in debt["repayment_document_ids"]:
                     debt["repayment_document_ids"].append(repayment_sr.name)
@@ -5673,6 +5944,12 @@ class _FbaTransitionWindow:
             frappe.db.savepoint(savepoint)
             document = frappe.get_doc(values)
             document.insert(ignore_permissions=True)
+            if doctype == "Stock Reconciliation":
+                _attach_reconciliation_comments(document, purpose, before,
+                    {"transition_window_days": TRANSITION_WINDOW_DAYS,
+                     "lot_remaining_caps": lot_caps, "expected_movements":
+                         [[k[0], k[1], v] for k, v in sorted(expected.items())],
+                     "item_context": _reconciliation_item_context(values["items"], self.items)})
             if lot_caps:
                 # Stored in the same ERP transaction as the stock document;
                 # no historical rows or second journal are added to the CSV.
@@ -6003,7 +6280,7 @@ def _transition_report_lines(diagnostics):
     return lines
 
 
-def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
+def process_inbound_inventory(asin_inbound, settings, diagnostics=None, audit_context=None):
     prep_wh = settings.custom_amazon_fba_staging_area
     inbound_wh = settings.custom_amazon_inbound_warehouse
     company = settings.company
@@ -6092,6 +6369,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
             "asin": asin,
             "item_code": item_code,
             "target_inbound_qty": target_qty,
+            "amazon_decision_evidence": (audit_context or {}).get(asin, "not supplied"),
             "eligible_draft_names": [],
             "draft_outcome": None,
             "draft_expected_qty": 0,
@@ -6549,6 +6827,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
 
     def add_source_transfer_rows(source_wh, request_key, valid_key, states):
         correction_rows = []
+        correction_before = {}
         correction_states = []
         ready_states = []
         failed_corrections = set()
@@ -6616,6 +6895,7 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     )
                     continue
                 correction_rows.extend(item_rows)
+                correction_before[(item_code, source_wh)] = current_qty
                 correction_states.append(state)
             ready_states.append(state)
 
@@ -6641,8 +6921,18 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                     "expense_account": adjustment_account,
                     "items": correction_rows,
                 })
-                source_sr.insert(ignore_permissions=True)
-                source_sr_inserted = True
+                comment_savepoint = "amazon_reconciliation_insert_" + uuid.uuid4().hex
+                frappe.db.savepoint(comment_savepoint)
+                try:
+                    source_sr.insert(ignore_permissions=True)
+                    source_sr_inserted = True
+                    _attach_reconciliation_comments(source_sr, valuation_reconciliation_purpose,
+                        correction_before, {"item_context":
+                            _reconciliation_item_context(correction_rows, item_states)})
+                except Exception:
+                    frappe.db.rollback(save_point=comment_savepoint)
+                    source_sr_inserted = False
+                    raise
                 _upsert_inventory_document(
                     diagnostics,
                     "Stock Reconciliation",
@@ -7201,8 +7491,20 @@ def process_inbound_inventory(asin_inbound, settings, diagnostics=None):
                 "expense_account": adjustment_account,
                 "items": reconcile_items,
             })
-            inbound_sr.insert(ignore_permissions=True)
-            inbound_sr_inserted = True
+            comment_savepoint = "amazon_reconciliation_insert_" + uuid.uuid4().hex
+            frappe.db.savepoint(comment_savepoint)
+            try:
+                inbound_sr.insert(ignore_permissions=True)
+                inbound_sr_inserted = True
+                _attach_reconciliation_comments(inbound_sr, inbound_reconciliation_purpose,
+                    inbound_reconciliation_current_quantities,
+                    {"item_context": _reconciliation_item_context(reconcile_items, item_states),
+                     "targets": "Row quantities are effective protected inbound targets after transfer processing; guarded unreported rows target zero.",
+                     "raw_amazon_observation_time": "Not available in this phase; capture time is not Amazon observation time."})
+            except Exception:
+                frappe.db.rollback(save_point=comment_savepoint)
+                inbound_sr_inserted = False
+                raise
             _upsert_inventory_document(
                 diagnostics,
                 "Stock Reconciliation",
@@ -7589,7 +7891,7 @@ def _report_suspected_orphaned_prep(settings, cleanup_lines=None):
                 "Strictly older than 14 elapsed days; new receipts do not reset older stock.",
                 "Opening/reconciliation additions use their posting date as the earliest evidenced residence date.",
                 "Suspected only: verify physical stock and shipment history before correcting.",
-                "No stock was moved or reconciled by this diagnostic.",
+                "The 14-day aging diagnostic is read-only. The separate 21-day cleanup section records active changes or preview outcomes.",
                 "Items considered: {0}; ages resolved: {1}; unavailable: {2}".format(
                     report["items_considered"], report["items_checked"], len(report["unavailable"]))]
             lines = ["=== 21-DAY TRANSIT CLEANUP ==="] + list(cleanup_lines or
@@ -7825,6 +8127,9 @@ def _process_orphan_cleanup(settings, diagnostics):
                         "items": [{"item_code": item, "warehouse": warehouse, "qty": target,
                                    "valuation_rate": before["valuation_rate"]}]})
                     document.insert(ignore_permissions=True)
+                    _attach_reconciliation_comments(document,
+                        "Remove only remaining receipt quantities strictly older than 21 elapsed days; FIFO residence estimate, not physical batch attribution.",
+                        {(item, warehouse): before["current_qty"]}, evidence)
                     evidence["reconciliation"] = document.name
                     evidence_name, evidence_content = _orphan_cleanup_attach_evidence(document, evidence)
                     document.submit()
@@ -7849,7 +8154,10 @@ def _process_orphan_cleanup(settings, diagnostics):
                     _upsert_inventory_document(diagnostics, "Stock Reconciliation", document.name,
                         "Remove only receipt quantities older than 21 days from transit warehouse",
                         "newly created by orphan cleanup", "submitted, committed, ledger/Bin and younger receipts verified",
-                        source_warehouses=[warehouse], movement_quantity=quantity, affected_item_count=1)
+                        source_warehouses=[warehouse], movement_quantity=quantity, affected_item_count=1,
+                        reconciliation_metrics=_reconciliation_quantity_metrics(
+                            [{"item_code": item, "warehouse": warehouse, "qty": target}],
+                            {(item, warehouse): before["current_qty"]}))
                 except Exception as exc:
                     try:
                         frappe.db.rollback()
@@ -8103,12 +8411,35 @@ def process_fba_inventory():
             asin_fulfillable, final_inbound_by_asin
         )
 
+        # Read-only comment context from the exact sources already used by this run.
+        amazon_comment_context = {}
+        for audit_asin in sorted(set(effective_main_targets) | set(effective_inbound_targets)):
+            amazon_comment_context[audit_asin] = {
+                "asin": audit_asin, "mode": mode_by_asin.get(audit_asin),
+                "effective_main_target": effective_main_targets.get(audit_asin),
+                "effective_inbound_target": effective_inbound_targets.get(audit_asin),
+                "protected_main_before_transition": asin_fulfillable.get(audit_asin),
+                "protected_inbound_before_transition": final_inbound_by_asin.get(audit_asin),
+                "live_snapshot": live_snapshots.get(audit_asin),
+                "live_global_error": live_global_error,
+                "live_invalid_reason": live_invalid_asins.get(audit_asin),
+                "snapshot_units": "C=core, S=shipped, R=receiving, F=FC transfer; not raw total inventory",
+                "live_observation_time": "not retained by snapshot builder",
+                "fc_protection_hours": 96, "transition_window_days": TRANSITION_WINDOW_DAYS,
+                "report_sources": [
+                    {"label": source.get("label"), "available": source.get("available"),
+                     "report_metadata": {k: (source.get("report") or {}).get(k) for k in
+                         ("reportId", "dataStartTime", "dataEndTime", "createdTime", "processingEndTime")},
+                     "snapshot": (source.get("snapshots") or {}).get(audit_asin)}
+                    for source in (today_source, yesterday_source)]}
+
         # All source discovery, mode selection, and target protection is complete.
         # Only now may ERP inventory be mutated.
         company = settings.company
         adjustment_account = settings.custom_amazon_inventory_adjustment_account
         items_list = []
         main_reconciliation_current_quantities = {}
+        main_comment_context = {}
         main_reconciliation_purpose = (
             "Set ERP Main FBA quantities to the run's protected Main FBA targets"
         )
@@ -8162,6 +8493,7 @@ def process_fba_inventory():
                     item_valuation_rate if item_valuation_rate > 0 else 0.01
                 ),
             })
+            main_comment_context[item_code] = amazon_comment_context.get(asin)
             main_reconciliation_current_quantities[(item_code, wh)] = float(
                 current_qty or 0
             )
@@ -8240,8 +8572,20 @@ def process_fba_inventory():
                     "expense_account": adjustment_account,
                     "items": items_list,
                 })
-                main_sr.insert(ignore_permissions=True)
-                main_sr_inserted = True
+                comment_savepoint = "amazon_reconciliation_insert_" + uuid.uuid4().hex
+                frappe.db.savepoint(comment_savepoint)
+                try:
+                    main_sr.insert(ignore_permissions=True)
+                    main_sr_inserted = True
+                    _attach_reconciliation_comments(main_sr, main_reconciliation_purpose,
+                        main_reconciliation_current_quantities,
+                        {"item_context": main_comment_context,
+                         "targets": "Row quantities are effective protected Main targets; guarded unreported rows target zero.",
+                         "amazon_timing": "Live snapshot timestamps only where supplied; capture time is not report observation time."})
+                except Exception:
+                    frappe.db.rollback(save_point=comment_savepoint)
+                    main_sr_inserted = False
+                    raise
                 _upsert_inventory_document(
                     inbound_flow_diagnostics,
                     "Stock Reconciliation",
@@ -8320,6 +8664,7 @@ def process_fba_inventory():
             effective_inbound_targets,
             settings,
             inbound_flow_diagnostics,
+            audit_context=amazon_comment_context,
         )
         _process_historical_inbound_debt(
             settings,
