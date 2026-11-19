@@ -1576,6 +1576,59 @@ def _upsert_inventory_document(
 # Human-readable audit comments are separate from durable recovery/debt markers.
 RECONCILIATION_EXPLANATION_MARKER = "AMAZON_RECONCILIATION_EXPLANATION_V1:"
 RECONCILIATION_TRACE_MARKER = "AMAZON_RECONCILIATION_TRACE_V1:"
+RECONCILIATION_COMMENT_MAX_BYTES = 50000
+
+
+class _ReconciliationAuditRecoveryError(RuntimeError):
+    """Optional comments cannot establish a trustworthy transaction boundary."""
+
+
+def _reconciliation_audit_transaction_fatal(exc):
+    """Do not hide connection loss, deadlocks or implicit transaction changes."""
+    if isinstance(exc, _ReconciliationAuditRecoveryError):
+        return True
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    if names.intersection({"QueryDeadlockError", "QueryTimeoutError", "ImplicitCommitError",
+                           "InterfaceError", "OperationalError", "ConnectionError"}):
+        return True
+    code = (getattr(exc, "args", ()) or (None,))[0]
+    state = getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)
+    return code in (1213, 2006, 2013, 2055) or (isinstance(state, str) and
+        (state.startswith("08") or state in ("40001", "40P01")))
+
+
+def _reconciliation_discard_comment_notifications(document_name, attempted):
+    """Remove only this failed attempt's standard queued Desk comment updates."""
+    try:
+        names = {comment.get("name") for comment in attempted if comment.get("name")}
+        queue = getattr(frappe.local, "_realtime_log", None)
+        if not names or not isinstance(queue, list):
+            return
+        def belongs(event):
+            if not isinstance(event, (list, tuple)) or len(event) < 2 or event[0] != "docinfo_update":
+                return False
+            message = event[1]
+            if not isinstance(message, dict) or message.get("key") != "comments" or message.get("action") not in ("add", "update"):
+                return False
+            row = message.get("doc")
+            return isinstance(row, dict) and row.get("name") in names and row.get("reference_doctype") == "Stock Reconciliation" and row.get("reference_name") == document_name
+        queue[:] = [event for event in queue if not belongs(event)]
+    except Exception:
+        # Cosmetic cleanup must not touch global callbacks or the SQL transaction.
+        pass
+
+
+def _reconciliation_comment_warning(document_name, exc):
+    """Best-effort server warning only: no Error Log write, commit, or DB access."""
+    try:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Readable reconciliation comments skipped for %s after savepoint rollback: %s: %s. "
+            "Inventory processing may continue; durable machine evidence remains required.",
+            str(document_name)[:160], type(exc).__name__, " ".join(str(exc).split())[:300])
+    except Exception:
+        # A diagnostic must not replace the recovered optional-comment failure.
+        pass
 
 
 def _reconciliation_audit_read(label, operation):
@@ -1586,8 +1639,15 @@ def _reconciliation_audit_read(label, operation):
     try:
         return operation(), None
     except Exception as exc:
-        # Failure to restore a usable transaction is fatal, never swallowed.
-        frappe.db.rollback(save_point=point)
+        # A failed inner rollback must not be mistaken for an optional read error.
+        try:
+            frappe.db.rollback(save_point=point)
+        except Exception as recovery_error:
+            raise _ReconciliationAuditRecoveryError(
+                "Readable-comment evidence rollback failed; transaction recovery required") from recovery_error
+        if _reconciliation_audit_transaction_fatal(exc):
+            raise _ReconciliationAuditRecoveryError(
+                "Readable-comment evidence read lost transaction certainty") from exc
         return None, label + ": unavailable (" + type(exc).__name__ + ")"
 
 
@@ -1646,9 +1706,6 @@ def _reconciliation_trace_lines(document, evidence=None):
     source = document.get(globals().get("INBOUND_DEBT_SOURCE_FIELD", "custom_amazon_inbound_debt_source_id"))
     if source:
         lines.append("Explicit debt-source reconciliation link: " + _reconciliation_audit_text(source) + "; not a WO provenance claim.")
-    if evidence is not None:
-        import json as _trace_json
-        lines.append("Caller receipt/debt/decision evidence (not independently verified here): " + _trace_json.dumps(evidence, default=str, sort_keys=True, ensure_ascii=False))
     pairs = sorted({(str(row.get("item_code") or ""), str(row.get("warehouse") or ""))
                     for row in document.get("items") or []})
     # Bound database work independently of the number of reconciliation rows.
@@ -1704,7 +1761,7 @@ def _reconciliation_trace_lines(document, evidence=None):
                     upstream_searched = True
                 continue
             work_orders.add(str(wo_name))
-            lines.append("Explicit Stock Entry.work_order link: " + _reconciliation_audit_text(wo_name) + ".")
+            lines.append("Explicit Stock Entry.work_order link: SE=" + _reconciliation_audit_text(sle.get("voucher_no")) + "; child=" + _reconciliation_audit_text(row.get("name")) + "; WO=" + _reconciliation_audit_text(wo_name) + ".")
             wo, error = _reconciliation_audit_read("Work Order " + str(wo_name), lambda: frappe.get_doc("Work Order", wo_name))
             if error:
                 lines.append(error)
@@ -1720,8 +1777,176 @@ def _reconciliation_trace_lines(document, evidence=None):
         if len(work_orders) > 1:
             lines.append("Multiple Work Orders appear in sampled history: mixed/ambiguous provenance; no per-WO reconciliation allocation is supported.")
     if len(pairs) > 20:
-        lines.append("Trace query budget reached: {} additional item/warehouse pairs were not queried; their trace is unknown. All proposed quantities are in the explanation comment.".format(len(pairs) - 20))
+        lines.append("Trace query budget reached: {} additional item/warehouse pairs were not queried; their trace is unknown. Proposed quantities are in the reconciliation item rows; explanation may be bounded.".format(len(pairs) - 20))
     return lines
+
+
+def _reconciliation_short(value, limit=160):
+    """One-line fields, visibly shortened; never render arbitrary nested JSON."""
+    text = "unknown" if value is None else str(value)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + " [shortened]"
+
+
+def _reconciliation_bounded_comment(marker, lines):
+    """Cap the actual escaped UTF-8 content, preserving whole lines and notice."""
+    import html
+    prefix, suffix = marker + "<pre>", "</pre>"
+    kept = []
+    used = len((prefix + suffix).encode("utf-8"))
+    # Reserve notice space even for hostile multibyte identifiers.
+    for index, line in enumerate(lines):
+        encoded = html.escape(str(line), quote=True)
+        size = len(encoded.encode("utf-8")) + (1 if kept else 0)
+        if used + size > RECONCILIATION_COMMENT_MAX_BYTES - 512:
+            kept.append("SIZE LIMIT: {} remaining lines omitted; details unknown here. Source: reconciliation item rows and linked ERP documents; omitted caller evidence may not be retained. Prepared/proposed only, not proof of posting.".format(len(lines) - index))
+            break
+        kept.append(encoded)
+        used += size
+    content = prefix + "\n".join(kept) + suffix
+    if len(content.encode("utf-8")) > RECONCILIATION_COMMENT_MAX_BYTES:
+        raise ValueError("Readable reconciliation comment exceeded byte budget")
+    return content
+
+
+def _reconciliation_evidence_fields(value, prefix="", depth=0, remaining=None):
+    """Bound traversal and retain explicit omissions, without JSON serialization."""
+    import itertools
+    if remaining is None:
+        remaining = [64]
+    if remaining[0] <= 0:
+        return [prefix + ": nested evidence omitted (field budget)"]
+    remaining[0] -= 1
+    if isinstance(value, dict):
+        count = len(value)
+        entries = list(itertools.islice(value.items(), 16))
+    elif isinstance(value, (list, tuple)):
+        count = len(value)
+        entries = list(itertools.islice(enumerate(value), 16))
+    else:
+        return [(prefix + "=" if prefix else "") + _reconciliation_short(value, 120)]
+    if depth >= 4:
+        return [prefix + ": {} nested entries omitted; inspect source".format(count)]
+    output = []
+    for key, child in entries[:16]:
+        path = prefix + ("." if prefix else "") + _reconciliation_short(key, 60)
+        if remaining[0] <= 0:
+            output.append(prefix + ": remaining nested evidence omitted (field budget); inspect caller source")
+            break
+        output.extend(_reconciliation_evidence_fields(child, path, depth + 1, remaining))
+    if count > 16:
+        output.append(prefix + ": {} additional entries omitted; inspect source".format(count - 16))
+    return output
+
+
+def _reconciliation_explanation_lines(document, reason, before, evidence):
+    short = _reconciliation_short
+    # The document already owns quantities, valuation, batches, warehouse and
+    # posting fields. Comments explain decisions rather than copying those rows.
+    lines = ["Decision: " + short(reason, 500),
+        "Caller observations collected before submission; not independent verification of posting. Quantities and document fields are on the reconciliation, not repeated here."]
+    if evidence is None:
+        lines.append("Decision evidence not supplied; unknown, not inferred.")
+        return lines
+    # Exact shared metadata is emitted once, not copied for every affected item.
+    shared, item_lines = [], []
+    def add_fields(value, label, budget=1000):
+        fields = _reconciliation_evidence_fields(value)
+        kept, used = [], 0
+        import html
+        for index, field in enumerate(fields):
+            size = len(html.escape(field, quote=True).encode("utf-8")) + 2
+            if used + size > budget:
+                kept.append("{} evidence fields omitted; inspect source".format(len(fields) - index))
+                break
+            kept.append(field); used += size
+        return short(label) + ": " + "; ".join(kept)
+    if isinstance(evidence, dict):
+        context = evidence.get("item_context")
+        for key, value in evidence.items():
+            if key != "item_context":
+                shared.append(add_fields(value, key, 1200))
+        seen = set()
+        if isinstance(context, dict):
+            modes = set()
+            for raw in context.values():
+                if isinstance(raw, dict):
+                    nested = raw.get("amazon_decision_evidence")
+                    modes.add(str(nested.get("mode") if isinstance(nested, dict) and "mode" in nested else raw.get("mode")))
+            report_refs = {}
+            for item, raw in context.items():
+                if not isinstance(raw, dict):
+                    item_lines.append(add_fields(raw, item)); continue
+                data = dict(raw)
+                nested = data.pop("amazon_decision_evidence", None)
+                if isinstance(nested, dict):
+                    data.update(nested)
+                for key in ("mode", "snapshot_units", "live_observation_time", "fc_protection_hours", "transition_window_days", "live_global_error"):
+                    if key == "mode" and len(modes) > 1:
+                        continue
+                    if key in data:
+                        rendered = add_fields(data.pop(key), key)
+                        if rendered not in seen:
+                            shared.append(rendered); seen.add(rendered)
+                sources = data.pop("report_sources", None)
+                if isinstance(sources, (list, tuple)):
+                    for src in sources[:4]:
+                        if not isinstance(src, dict): continue
+                        label = short(src.get("label"))
+                        metadata = {k: v for k, v in src.items() if k != "snapshot"}
+                        rendered = add_fields(metadata, "Report " + label)
+                        if rendered not in report_refs:
+                            report_refs[rendered] = "R" + str(len(report_refs) + 1)
+                            shared.append(report_refs[rendered] + " " + rendered)
+                        data[label + " " + report_refs[rendered] + " snapshot"] = src.get("snapshot")
+                    if len(sources) > 4:
+                        data["reports omitted"] = len(sources) - 4
+                for duplicate in ("main_target", "inbound_target", "effective_main_target",
+                                  "effective_inbound_target", "reconciliation_qty", "final_inbound_qty"):
+                    data.pop(duplicate, None)
+                item_lines.append(add_fields(data, item, max(100, min(700, 23000 // max(len(context), 1)))))
+        elif context is not None:
+            shared.append(add_fields(context, "item_context"))
+    else:
+        shared.append(add_fields(evidence, "evidence"))
+    lines.append("Decision evidence: caller observations, not independently verified here; bounded per item.")
+    lines.extend(shared)
+    lines.extend(item_lines)
+    return lines
+
+
+def _reconciliation_compact_trace(lines):
+    """Budget each queried item separately, prioritizing explicit relationships."""
+    header = ["Trace collected before submission, not verification of this reconciliation.",
+        "FIFO dates estimate residence, not physical identity. Candidate manufacture/WO matches do not allocate quantities; WO totals are not reconciled quantities.",
+        "Sample only: up to 20 item/warehouse pairs, 10 ledger rows and 5 manufacture candidates per item; unknown/omitted is not absence."]
+    sections, current = [], None
+    for line in lines:
+        if line.startswith("Item "):
+            current = [line]; sections.append(current)
+        elif current is not None:
+            current.append(line)
+        elif line.startswith("Explicit debt-source"):
+            header.append(_reconciliation_short(line, 250))
+    import html
+    for section in sections:
+        heading, details = section[0], section[1:]
+        # Stable priority, with lookup/error/ambiguity warnings ahead of samples.
+        priority = lambda text: (0 if "Explicit Stock Entry.work_order" in text or text.startswith("Linked Stock Entry child:") else
+                                 1 if any(word in text for word in ("unavailable", "ambiguous", "mismatch", "budget reached")) else
+                                 2 if "Candidate manufacturing SE=" in text else 3 if text.startswith("SLE ") else 4)
+        selected, used = [], 0
+        for line in sorted(details, key=priority):
+            # Shorten fields/verbosity but preserve an explicit shortening notice.
+            text = _reconciliation_short(line, 330)
+            size = len(html.escape(text, quote=True).encode("utf-8")) + 1
+            if used + size <= 1000:
+                selected.append(text); used += size
+        header.append(_reconciliation_short(heading, 240))
+        header.extend(selected)
+        if len(selected) < len(details):
+            header.append("{} trace lines omitted; source: this item's ERP ledger, Stock Entries and Work Orders. Allocation remains unknown.".format(len(details) - len(selected)))
+    return header
 
 
 def _attach_reconciliation_comments(document, reason, before=None, evidence=None):
@@ -1729,21 +1954,25 @@ def _attach_reconciliation_comments(document, reason, before=None, evidence=None
 
     Retry identity is the reconciliation plus each exact marker prefix. Existing
     readable comments are retained, and all older machine-readable comments remain
-    untouched. A failed lookup/write propagates after rolling back this helper's
-    savepoint, so callers retain ownership of inventory transaction recovery.
+    untouched. Ordinary readable-comment failures roll back this whole attempt
+    and warn without blocking inventory. Savepoint establishment, missing source
+    documents, and rollback failures remain fatal; callers own stock recovery.
+    Frappe savepoint rollback does not retract queued hooks. Standard Desk
+    updates for this failed attempt are removed best-effort; custom hooks or
+    unsupported notification formats may still emit a cosmetic refresh. Global
+    callbacks are not cleared because they may also belong to inventory work.
     """
-    import html as _audit_html
-    import json as _audit_json
     import uuid as _audit_uuid
     if document.get("doctype") != "Stock Reconciliation" or not document.get("name"):
         raise ValueError("Audit comments require an inserted Stock Reconciliation")
     point = "amazon_audit_comments_" + _audit_uuid.uuid4().hex
     frappe.db.savepoint(point)
+    attempted_comments = []
     try:
         # Serialize retries on this document, without introducing a commit.
         locked = frappe.db.sql("SELECT name FROM `tabStock Reconciliation` WHERE name=%s FOR UPDATE", (document.name,))
         if not locked:
-            raise ValueError("Reconciliation disappeared before comment insertion")
+            raise _ReconciliationAuditRecoveryError("Reconciliation disappeared before comment insertion")
         existing = frappe.get_all("Comment", filters={"reference_doctype": "Stock Reconciliation",
             "reference_name": document.name, "comment_type": "Comment"}, fields=["name", "content"], limit_page_length=0)
         markers = (RECONCILIATION_EXPLANATION_MARKER, RECONCILIATION_TRACE_MARKER)
@@ -1753,76 +1982,30 @@ def _attach_reconciliation_comments(document, reason, before=None, evidence=None
         present = {marker for marker, count in counts.items() if count == 1}
         if len(present) == 2:
             return
-        explanation = ["Reconciliation " + str(document.name), "Reason: " + _reconciliation_audit_text(reason),
-            "Prepared at ERP local time: " + str(frappe.utils.now_datetime()),
-            "Posting date/time: {} {}".format(document.get("posting_date"), document.get("posting_time") or "not set"),
-            "Status at comment preparation: docstatus={}; DEBUG={}. Quantities below are proposed targets, not proof of submitted, committed or verified results.".format(document.get("docstatus"), bool(DEBUG)),
-            "Before quantities are caller observations; unknown means no supported baseline. Stock UOM quantities are used."]
-        before = before or {}
-        for index, row in enumerate(document.get("items") or [], 1):
-            key = (row.get("item_code"), row.get("warehouse"))
-            baseline = before.get(key)
-            explanation.append("Row {}: item={}; warehouse={}; before warehouse total={}; proposed row quantity={}; proposed valuation rate={}; batch={}; serial={}.".format(
-                index, *[_reconciliation_audit_text(v) for v in (key[0], key[1], baseline, row.get("qty"), row.get("valuation_rate"), row.get("batch_no"), row.get("serial_no"))]))
-        totals = {}
-        for row in document.get("items") or []:
-            key = (row.get("item_code"), row.get("warehouse"))
-            try:
-                value = float(row.get("qty"))
-                import math as _audit_math
-                if not _audit_math.isfinite(value):
-                    raise ValueError("Nonfinite quantity")
-                totals[key] = totals.get(key, 0.0) + value if totals.get(key, 0.0) is not None else None
-            except (TypeError, ValueError):
-                totals[key] = None
-        for key, total in totals.items():
-            delta = "unknown"
-            try:
-                if total is not None and _audit_math.isfinite(float(before[key])):
-                    delta = total - float(before[key])
-            except (KeyError, TypeError, ValueError):
-                pass
-            explanation.append("Item/warehouse proposed total {} @ {} = {}; proposed delta from observed total = {}.".format(key[0], key[1], total if total is not None else "unknown", delta))
-        explanation.append("For split batch/serial rows, the before value is the warehouse total, not a per-row allocation; do not sum repeated before totals.")
-        source = document.get(globals().get("INBOUND_DEBT_SOURCE_FIELD", "custom_amazon_inbound_debt_source_id"))
-        if source:
-            explanation.append("Explicit historical-debt source reconciliation: " + _reconciliation_audit_text(source) + "; this debt link does not establish a Work Order allocation.")
-        if evidence is not None:
-            explanation.append("Caller-supplied decision evidence (observations/proposals, not independently verified by this comment):\n" + _audit_json.dumps(evidence, default=str, sort_keys=True, ensure_ascii=False))
-        else:
-            explanation.append("Amazon targets, snapshot timing and additional decision evidence were not supplied; unknown, not inferred.")
+        explanation = _reconciliation_explanation_lines(document, reason, before or {}, evidence)
         for marker, lines in ((markers[0], explanation), (markers[1], None)):
             if marker in present:
                 continue
             if lines is None:
-                lines = _reconciliation_trace_lines(document, evidence=evidence)
-            if marker == RECONCILIATION_TRACE_MARKER:
-                # Keep whole lines and reserve space for an explicit omission notice.
-                # The explanation still retains every row or fails closed below.
-                trace_lines = "\n".join(lines).splitlines()
-                kept, encoded_bytes = [], len((marker + "<pre></pre>").encode("utf-8"))
-                for index, line in enumerate(trace_lines):
-                    line_bytes = len(_audit_html.escape(line, quote=True).encode("utf-8")) + 1
-                    if encoded_bytes + line_bytes > 59000:
-                        kept.append("TRACE SIZE LIMIT: {} remaining lines omitted. Omitted links and quantities are unknown; inspect source documents. This excerpt does not establish complete provenance or per-WO allocation.".format(len(trace_lines) - index))
-                        break
-                    kept.append(line)
-                    encoded_bytes += line_bytes
-                lines = kept
-            content = marker + "<pre>" + _audit_html.escape("\n".join(lines), quote=True) + "</pre>"
-            # Never silently lose item-level explanation or provenance warnings.
-            if len(content.encode("utf-8")) > 60000:
-                raise ValueError("Readable reconciliation comment exceeds 60000-byte safety limit")
+                lines = _reconciliation_compact_trace(_reconciliation_trace_lines(document))
+            content = _reconciliation_bounded_comment(marker, lines)
             comment = frappe.get_doc({"doctype": "Comment", "comment_type": "Comment",
                 "reference_doctype": "Stock Reconciliation", "reference_name": document.name, "content": content})
+            attempted_comments.append(comment)
             comment.insert(ignore_permissions=True)
             saved = frappe.get_doc("Comment", comment.name)
             if (saved.get("content") != content or saved.get("reference_name") != document.name
                     or saved.get("reference_doctype") != "Stock Reconciliation" or saved.get("comment_type") != "Comment"):
                 raise ValueError("Readable reconciliation comment could not be verified")
-    except Exception:
+    except Exception as exc:
+        # No commit, full rollback, or stock mutation here. If rollback fails,
+        # propagate it: continuing could post inventory in an unknown transaction.
         frappe.db.rollback(save_point=point)
-        raise
+        if _reconciliation_audit_transaction_fatal(exc):
+            raise
+        _reconciliation_discard_comment_notifications(document.name, attempted_comments)
+        _reconciliation_comment_warning(document.name, exc)
+        return
 
 
 def _reconciliation_item_context(rows, states):
