@@ -12,6 +12,8 @@
 # 2026-11-13: Isolate Prep-aging item failures and conservatively scope valuation reposts.
 # 2026-11-17: Atomic linked cleanup evidence; combined orphan aging/cleanup report.
 # 2026-11-18: Separate explanation/trace comments; corrected cleanup diagnostics.
+# 2026-11-20: One verified reconciliation per orphan cleanup run, with batch-wide comments.
+# 2026-11-20: Independent Amazon Item promo history phase.
 from __future__ import annotations
 import csv
 import base64
@@ -1949,6 +1951,55 @@ def _reconciliation_compact_trace(lines):
     return header
 
 
+def _orphan_readable_comment_contents(reason, evidence_rows):
+    """Render two complete comments for the cleanup batch, without querying samples.
+
+    These lines use already-verified ERP FIFO inputs, not candidate same-item
+    manufacturing links. Refuse a batch that cannot fit complete evidence.
+    """
+    import html
+
+    def field(value):
+        return " ".join(str(value if value is not None else "unknown").split())
+
+    explanation = [
+        "Decision: " + field(reason),
+        "Aged Prep and eligible Finished Goods only. Normal transfers and debt correction run first.",
+        "Prepared before posting. Counts are ERP/FIFO estimates, not physical verification.",
+        "Rows: {} | Total qty planned for removal: {:.12g}".format(
+            len(evidence_rows), sum(row["removed"] for row in evidence_rows)),
+    ]
+    trace = [
+        "Source receipts for every proposed cleanup row, from the ERP Stock Ledger.",
+        "FIFO residence is an estimate; these links do not prove where the physical stock went.",
+        "Receipts strictly older than 21 elapsed days only. Newer receipts are not removed.",
+    ]
+    warehouse = None
+    for row in sorted(evidence_rows, key=lambda x: (x["warehouse"], x["item_code"])):
+        if row["warehouse"] != warehouse:
+            warehouse = row["warehouse"]
+            heading = "Warehouse: " + field(warehouse)
+            explanation.extend(("", heading))
+            trace.extend(("", heading))
+        item = field(row["item_code"])
+        explanation.append("{}: before {} | remove {} | keep {} | aged receipts {}".format(
+            item, field(row["before"]), field(row["removed"]), field(row["after"]), len(row["lots"])))
+        trace.append("{} | evaluated {}".format(item, field(row["observed_at"])))
+        for lot in row["lots"]:
+            trace.append("  Qty {} | received {} | {} {} | ledger {}".format(
+                field(lot["qty"]), field(lot["received_at"]), field(lot["voucher_type"]),
+                field(lot["voucher_no"]), field(lot["ledger_entry"])))
+
+    contents = {}
+    for marker, lines in ((RECONCILIATION_EXPLANATION_MARKER, explanation),
+                          (RECONCILIATION_TRACE_MARKER, trace)):
+        content = marker + "<pre>" + "\n".join(html.escape(line, quote=True) for line in lines) + "</pre>"
+        if len(content.encode("utf-8")) > RECONCILIATION_COMMENT_MAX_BYTES:
+            raise ValueError("Complete orphan cleanup comment exceeds the 50,000-byte budget")
+        contents[marker] = content
+    return contents
+
+
 def _attach_reconciliation_comments(document, reason, before=None, evidence=None):
     """Atomically attach two immutable readable comments; never commit or claim posting.
 
@@ -1982,13 +2033,20 @@ def _attach_reconciliation_comments(document, reason, before=None, evidence=None
         present = {marker for marker, count in counts.items() if count == 1}
         if len(present) == 2:
             return
-        explanation = _reconciliation_explanation_lines(document, reason, before or {}, evidence)
+        orphan_rows = evidence.get("orphan_cleanup_rows") if isinstance(evidence, dict) else None
+        orphan_comments = (_orphan_readable_comment_contents(reason, orphan_rows)
+                           if orphan_rows is not None else None)
+        explanation = (None if orphan_comments is not None else
+                       _reconciliation_explanation_lines(document, reason, before or {}, evidence))
         for marker, lines in ((markers[0], explanation), (markers[1], None)):
             if marker in present:
                 continue
-            if lines is None:
-                lines = _reconciliation_compact_trace(_reconciliation_trace_lines(document))
-            content = _reconciliation_bounded_comment(marker, lines)
+            if orphan_comments is not None:
+                content = orphan_comments[marker]
+            else:
+                if lines is None:
+                    lines = _reconciliation_compact_trace(_reconciliation_trace_lines(document))
+                content = _reconciliation_bounded_comment(marker, lines)
             comment = frappe.get_doc({"doctype": "Comment", "comment_type": "Comment",
                 "reference_doctype": "Stock Reconciliation", "reference_name": document.name, "content": content})
             attempted_comments.append(comment)
@@ -8104,6 +8162,9 @@ def _report_suspected_orphaned_prep(settings, cleanup_lines=None):
 ORPHAN_CLEANUP_AGE_DAYS = 21
 ORPHAN_CLEANUP_LOG_TITLE = "Orphaned Transit Warehouse Inventory Cleanup"
 ORPHAN_CLEANUP_MARKER = "AMAZON_ORPHAN_RECEIPT_CLEANUP_V1:"
+ORPHAN_CLEANUP_BATCH_MARKER = "AMAZON_ORPHAN_RECEIPT_CLEANUP_V2:"
+ORPHAN_CLEANUP_BATCH_EVIDENCE_MAX_BYTES = 50000
+_ORPHAN_CLEANUP_MARKERS = (ORPHAN_CLEANUP_MARKER, ORPHAN_CLEANUP_BATCH_MARKER)
 
 
 def _orphan_cleanup_document(doc):
@@ -8114,26 +8175,34 @@ def _orphan_cleanup_document(doc):
     Do not turn an unavailable Comment lookup into False: that could let debt
     discovery consume a cleanup adjustment as an unrelated manual repayment.
     """
-    if str(doc.get("remarks") or "").startswith(ORPHAN_CLEANUP_MARKER):
+    if str(doc.get("remarks") or "").startswith(_ORPHAN_CLEANUP_MARKERS):
         return True
     if not doc.get("name"):
         return False
     comments = frappe.get_all("Comment", filters={
         "reference_doctype": "Stock Reconciliation", "reference_name": doc.name,
         "comment_type": "Comment"}, fields=["name", "content"], limit_page_length=0)
-    return any(str(row.get("content") or "").startswith(ORPHAN_CLEANUP_MARKER)
+    return any(str(row.get("content") or "").startswith(_ORPHAN_CLEANUP_MARKERS)
                for row in comments)
 
 
-def _orphan_cleanup_evidence_content(evidence):
+def _orphan_cleanup_evidence_content(evidence, batch=False):
     # ASCII payload avoids rich-text/HTML interpretation of receipt identifiers.
-    payload = json.dumps(evidence, default=str, sort_keys=True).encode("utf-8")
-    return ORPHAN_CLEANUP_MARKER + base64.b64encode(payload).decode("ascii")
+    payload = json.dumps(evidence, default=str, sort_keys=True,
+                         separators=(",", ":") if batch else None).encode("utf-8")
+    # V1 is base64(JSON); V2 is base64(gzip(JSON)) and contains all rows.
+    if batch:
+        payload = gzip.compress(payload, mtime=0)
+    marker = ORPHAN_CLEANUP_BATCH_MARKER if batch else ORPHAN_CLEANUP_MARKER
+    content = marker + base64.b64encode(payload).decode("ascii")
+    if batch and len(content.encode("utf-8")) > ORPHAN_CLEANUP_BATCH_EVIDENCE_MAX_BYTES:
+        raise ValueError("Combined receipt evidence exceeds the 50,000-byte safety limit; batch withheld")
+    return content
 
 
-def _orphan_cleanup_attach_evidence(document, evidence):
+def _orphan_cleanup_attach_evidence(document, evidence, batch=False):
     """Insert evidence in the SAME uncommitted transaction as the adjustment."""
-    content = _orphan_cleanup_evidence_content(evidence)
+    content = _orphan_cleanup_evidence_content(evidence, batch=batch)
     comment = frappe.get_doc({"doctype": "Comment", "comment_type": "Comment",
         "reference_doctype": "Stock Reconciliation", "reference_name": document.name,
         "content": content})
@@ -8200,10 +8269,14 @@ def _orphan_cleanup_snapshot(item, warehouse, company, observed_at):
 
 def _orphan_cleanup_item(item, warehouse, require_asin, company):
     rows = frappe.db.sql("""SELECT name, is_stock_item, has_serial_no, has_batch_no,
-        custom_asin FROM `tabItem` WHERE name=%s FOR UPDATE""", (item,), as_dict=True)
+        custom_asin, disabled, end_of_life, docstatus
+        FROM `tabItem` WHERE name=%s FOR UPDATE""", (item,), as_dict=True)
     if len(rows) != 1 or not rows[0].is_stock_item:
         raise ValueError("Missing or non-stock Item")
     row = rows[0]
+    if row.disabled or row.docstatus == 2 or (row.end_of_life
+            and str(row.end_of_life)[:10] < str(frappe.utils.now_datetime().date())):
+        raise ValueError("Disabled, cancelled or end-of-life Item requires manual review")
     if row.has_serial_no or row.has_batch_no:
         raise ValueError("Serial/batch stock requires manual review")
     if require_asin and not re.fullmatch(r"[A-Z0-9]{10}", str(row.custom_asin or "").strip()):
@@ -8214,11 +8287,10 @@ def _orphan_cleanup_item(item, warehouse, require_asin, company):
 
 
 def _process_orphan_cleanup(settings, diagnostics):
-    """Run only after successful ordinary/debt phases; FIFO age is not identity.
+    """Publish at most one reconciliation after independent row safety checks.
 
-    Normal evidenced transfers already run first. This policy writes down only
-    the expired residual, never credits another warehouse or consumes debt.
-    Each item is one transaction; uncertain items are logged and left alone.
+    Normal evidenced transfers and debt run first. Only expired FIFO residuals
+    are written down; no credit to another warehouse and no debt allocation.
     """
     preview = bool(DEBUG)
     lines = ["Mode: " + ("PREVIEW ONLY; no inventory changes" if preview else "ACTIVE"),
@@ -8226,6 +8298,10 @@ def _process_orphan_cleanup(settings, diagnostics):
         "Normal transfers and debt correction run first. Younger receipt dates are preserved."]
     lock = None
     acquired = False
+    transaction_open = False
+    document = None
+    commit_attempted = False
+    committed = False
     try:
         if diagnostics is None or diagnostics.get("unverified_draft_scope_unknown"):
             raise ValueError("Prior inventory impact cannot be bounded")
@@ -8247,119 +8323,198 @@ def _process_orphan_cleanup(settings, diagnostics):
         cache = frappe.cache
         if callable(cache) and not hasattr(cache, "lock"):
             cache = cache()
-        # Shares the debt lock: another worker cannot deduct source stock for
-        # debt while this phase reconstructs and writes expired receipt balances.
         lock = cache.lock(INBOUND_DEBT_LOCK_KEY,
             timeout=INBOUND_DEBT_LOCK_TIMEOUT_SECONDS, blocking_timeout=0)
         acquired = bool(lock.acquire(blocking=False))
         if not acquired:
             raise ValueError("Another source cleanup owns the lock")
+
+        # Close the previous phase's read transaction before locking both bins
+        # and histories. Hold locks until the one batch finishes or rolls back.
+        frappe.db.commit()
+        transaction_open = True
+        candidates = []
         for warehouse, require_asin in warehouses:
             if frappe.db.get_value("Warehouse", warehouse, "company") != company:
                 lines.append("SKIPPED WAREHOUSE {0}: company mismatch/missing".format(warehouse))
                 continue
-            candidates = frappe.get_all("Bin", filters={"warehouse": warehouse, "actual_qty": [">", 0]},
+            bins = frappe.get_all("Bin", filters={"warehouse": warehouse, "actual_qty": [">", 0]},
                 fields=["item_code"], limit_page_length=0)
-            for item in sorted({r.get("item_code") for r in candidates if r.get("item_code")}):
-                document = None
-                commit_attempted = False
-                try:
-                    # End prior read transaction before fresh locking reads.
-                    frappe.db.commit()
-                    if not lock.owned():
-                        raise RuntimeError("Cleanup lock ownership lost")
-                    meta = _orphan_cleanup_item(item, warehouse, require_asin, company)
-                    if _transition_item_blocked(diagnostics, item, meta.custom_asin):
-                        raise ValueError("Item has unresolved transition/draft evidence")
-                    if any(s.get("item_code") == item and s.get("skipped")
-                           for s in (diagnostics.get("items") or {}).values()):
-                        raise ValueError("Ordinary sync skipped this item's quantity verification")
-                    affected, _ = _prep_aging_repost_scope(company)
-                    if item in affected:
-                        raise ValueError("Pending valuation repost affects this item")
-                    observed = frappe.utils.now_datetime()
-                    before = _orphan_cleanup_snapshot(item, warehouse, company, observed)
-                    old, quantity, target = _orphan_cleanup_lots(before, observed)
-                    if quantity <= INBOUND_DEBT_QTY_TOLERANCE:
-                        frappe.db.rollback()
-                        continue
-                    evidence = {"item_code": item, "warehouse": warehouse, "observed_at": str(observed),
-                        "before": before["current_qty"], "removed": quantity, "after": target,
-                        "lots": old}
-                    # Keep complete receipt evidence in both the document and log;
-                    # never truncate it or post an untraceable large adjustment.
-                    if len(json.dumps(evidence, default=str, sort_keys=True).encode("utf-8")) > 32000:
-                        raise ValueError("Receipt evidence exceeds cleanup document/log safety limit")
-                    if preview:
-                        frappe.db.rollback()
-                        lines.append("WOULD REMOVE " + json.dumps(evidence, default=str, sort_keys=True))
-                        continue
-                    if before["valuation_rate"] < 0:
-                        raise ValueError("Negative source valuation")
+            candidates.extend((item, warehouse, require_asin)
+                for item in {r.get("item_code") for r in bins if r.get("item_code")})
+
+        skipped_sync_items = {state.get("item_code")
+            for state in (diagnostics.get("items") or {}).values() if state.get("skipped")}
+        if candidates:
+            affected, _ = _prep_aging_repost_scope(company)
+        planned = []
+        tolerance = INBOUND_DEBT_QTY_TOLERANCE
+        for item, warehouse, require_asin in sorted(candidates):
+            if not lock.owned():
+                raise RuntimeError("Cleanup lock ownership lost")
+            point = "amazon_orphan_row_" + uuid.uuid4().hex
+            frappe.db.savepoint(point)
+            try:
+                meta = _orphan_cleanup_item(item, warehouse, require_asin, company)
+                if _transition_item_blocked(diagnostics, item, meta.custom_asin):
+                    raise ValueError("Item has unresolved transition/draft evidence")
+                if item in skipped_sync_items:
+                    raise ValueError("Ordinary sync skipped this item's quantity verification")
+                if item in affected:
+                    raise ValueError("Pending valuation repost affects this item")
+                observed = frappe.utils.now_datetime()
+                before = _orphan_cleanup_snapshot(item, warehouse, company, observed)
+                old, quantity, target = _orphan_cleanup_lots(before, observed)
+                if quantity <= tolerance:
+                    continue
+                evidence = {"item_code": item, "warehouse": warehouse, "observed_at": str(observed),
+                    "before": before["current_qty"], "removed": quantity, "after": target,
+                    "lots": old}
+                if len(json.dumps(evidence, default=str, sort_keys=True).encode("utf-8")) > 32000:
+                    raise ValueError("Receipt evidence exceeds cleanup document/log safety limit")
+                if not preview:
+                    if before["valuation_rate"] < 0 or (target > 0 and before["valuation_rate"] == 0):
+                        raise ValueError("Source valuation is not usable for the cleanup target")
                     fresh = _orphan_cleanup_snapshot(item, warehouse, company, observed)
-                    if fresh["fingerprint"] != before["fingerprint"] or fresh["current_qty"] != before["current_qty"]:
+                    if (fresh["fingerprint"] != before["fingerprint"]
+                            or fresh["current_qty"] != before["current_qty"]
+                            or fresh["valuation_rate"] != before["valuation_rate"]):
                         raise ValueError("Source changed during cleanup preparation")
                     _orphan_cleanup_item(item, warehouse, require_asin, company)
-                    affected, _ = _prep_aging_repost_scope(company)
-                    if item in affected or not lock.owned():
-                        raise ValueError("Repost scope/lock changed before posting")
-                    document = frappe.get_doc({"doctype": "Stock Reconciliation", "company": company,
-                        "purpose": "Stock Reconciliation", "posting_date": str(observed.date()),
-                        "posting_time": str(observed.time()), "set_posting_time": 1,
-                        "expense_account": settings.custom_amazon_inventory_adjustment_account,
-                        "items": [{"item_code": item, "warehouse": warehouse, "qty": target,
-                                   "valuation_rate": before["valuation_rate"]}]})
-                    document.insert(ignore_permissions=True)
-                    _attach_reconciliation_comments(document,
-                        "Remove only remaining receipt quantities strictly older than 21 elapsed days; FIFO residence estimate, not physical batch attribution.",
-                        {(item, warehouse): before["current_qty"]}, evidence)
-                    evidence["reconciliation"] = document.name
-                    evidence_name, evidence_content = _orphan_cleanup_attach_evidence(document, evidence)
-                    document.submit()
-                    posted = _verified_reconciliation_movements([document.name], [warehouse], company)
-                    if (len(posted) != 1 or posted[0].item_code != item
-                            or abs(posted[0].actual_qty + quantity) > INBOUND_DEBT_QTY_TOLERANCE
-                            or abs(_read_bin_actual_qty(item, warehouse) - target) > INBOUND_DEBT_QTY_TOLERANCE):
-                        raise ValueError("Cleanup ledger/Bin reduction could not be verified")
-                    # Verify replay preserves every surviving younger receipt.
-                    after = _orphan_cleanup_snapshot(item, warehouse, company, frappe.utils.now_datetime())
-                    expected = [lot for lot in before["lots"] if lot["ledger_entry"] not in
-                                {old_lot["ledger_entry"] for old_lot in old}]
-                    if after["lots"] != expected:
-                        raise ValueError("Cleanup would alter younger receipt provenance")
-                    if not lock.owned():
-                        raise ValueError("Cleanup lock lost before commit")
-                    _orphan_cleanup_verify_evidence(document, evidence_name, evidence_content)
-                    commit_attempted = True
-                    frappe.db.commit()
-                    evidence["reconciliation"] = document.name
-                    lines.append("REMOVED AND VERIFIED " + json.dumps(evidence, default=str, sort_keys=True))
-                    _upsert_inventory_document(diagnostics, "Stock Reconciliation", document.name,
-                        "Remove only receipt quantities older than 21 days from transit warehouse",
-                        "newly created by orphan cleanup", "submitted, committed, ledger/Bin and younger receipts verified",
-                        source_warehouses=[warehouse], movement_quantity=quantity, affected_item_count=1,
-                        reconciliation_metrics=_reconciliation_quantity_metrics(
-                            [{"item_code": item, "warehouse": warehouse, "qty": target}],
-                            {(item, warehouse): before["current_qty"]}))
-                except Exception as exc:
-                    try:
-                        frappe.db.rollback()
-                    except Exception:
-                        raise RuntimeError("Cleanup rollback failed; remaining items withheld")
-                    label = "COMMIT OUTCOME UNCONFIRMED; review document " + str(getattr(document, "name", None)) if commit_attempted else "SKIPPED"
-                    lines.append("{0} {1}@{2}: {3}".format(label, item, warehouse, _concise_inventory_exception(exc)))
-                    if commit_attempted:
-                        raise RuntimeError("Uncertain cleanup commit; remaining items withheld")
+                planned.append((evidence, before))
+            except Exception as exc:
+                if _reconciliation_audit_transaction_fatal(exc):
+                    raise
+                try:
+                    frappe.db.rollback(save_point=point)
+                except Exception as rollback_exc:
+                    raise RuntimeError("Cleanup row rollback failed; batch withheld") from rollback_exc
+                lines.append("SKIPPED {0}@{1}: {2}".format(item, warehouse,
+                    _concise_inventory_exception(exc)))
+
+        if not lock.owned():
+            raise RuntimeError("Cleanup lock ownership lost")
+        if not planned or preview:
+            frappe.db.rollback()
+            transaction_open = False
+            if preview:
+                lines.extend("WOULD REMOVE " + json.dumps(e, default=str, sort_keys=True)
+                             for e, _ in planned)
+            return lines
+
+        # Recheck discovered valuation work before writing; no marked stock
+        # can join the batch. Other eligible rows retain their own evidence.
+        final_affected, _ = _prep_aging_repost_scope(company)
+        unaffected = []
+        for evidence, before in planned:
+            if evidence["item_code"] in final_affected:
+                lines.append("SKIPPED {0}@{1}: pending valuation repost affects this item".format(
+                    evidence["item_code"], evidence["warehouse"]))
+            else:
+                unaffected.append((evidence, before))
+        planned = unaffected
+        if not planned:
+            frappe.db.rollback()
+            transaction_open = False
+            return lines
+        if not lock.owned():
+            raise RuntimeError("Cleanup lock ownership lost before posting")
+
+        evidence_rows = [evidence for evidence, _ in planned]
+        rows = [{"item_code": e["item_code"], "warehouse": e["warehouse"], "qty": e["after"],
+                 "valuation_rate": before["valuation_rate"]} for e, before in planned]
+        expected = {(e["item_code"], e["warehouse"]): (e, before) for e, before in planned}
+        if len(expected) != len(rows):
+            raise ValueError("Duplicate cleanup item/warehouse")
+        before_map = {key: e["before"] for key, (e, _) in expected.items()}
+        # Refuse oversize before insert and never truncate required evidence.
+        # The exact linked document name is included and rechecked after insert
+        # (still uncommitted). The provisional name conservatively reserves space.
+        provisional = {"reconciliation": "X" * 140, "rows": evidence_rows}
+        _orphan_cleanup_evidence_content(provisional, batch=True)
+        cleanup_reason = (
+            "Remove only remaining receipt quantities strictly older than 21 elapsed days; "
+            "FIFO residence estimate, not physical batch attribution."
+        )
+        _orphan_readable_comment_contents(cleanup_reason, evidence_rows)
+        posting = frappe.utils.now_datetime()
+        document = frappe.get_doc({"doctype": "Stock Reconciliation", "company": company,
+            "purpose": "Stock Reconciliation", "posting_date": str(posting.date()),
+            "posting_time": str(posting.time()), "set_posting_time": 1,
+            "expense_account": settings.custom_amazon_inventory_adjustment_account,
+            "items": rows})
+        document.insert(ignore_permissions=True)
+        _attach_reconciliation_comments(document, cleanup_reason, before_map,
+            {"orphan_cleanup_rows": evidence_rows})
+        evidence_name, evidence_content = _orphan_cleanup_attach_evidence(document,
+            {"reconciliation": document.name, "rows": evidence_rows}, batch=True)
+        if not lock.owned():
+            raise RuntimeError("Cleanup lock ownership lost before submit")
+        document.submit()
+
+        target_warehouses = sorted({warehouse for _, warehouse in expected})
+        posted = _verified_reconciliation_movements([document.name], target_warehouses, company)
+        children = document.get("items") or []
+        child_keys = [(child.item_code, child.warehouse) for child in children]
+        posted_keys = [(sle.item_code, sle.warehouse) for sle in posted]
+        if (len(child_keys) != len(expected) or set(child_keys) != set(expected)
+                or len(posted_keys) != len(expected) or set(posted_keys) != set(expected)):
+            raise ValueError("Cleanup reconciliation child/ledger coverage differs from the batch")
+        # Check all active ledger rows without restricting warehouses: a custom
+        # hook must not generate an additional movement outside this batch.
+        all_posted = frappe.get_all("Stock Ledger Entry", filters={"voucher_type": "Stock Reconciliation",
+            "voucher_no": document.name, "is_cancelled": 0}, fields=["name", "docstatus"],
+            limit_page_length=len(expected) + 1)
+        if (len(all_posted) != len(expected)
+                or any(int(row.get("docstatus", 0)) != 1 for row in all_posted)
+                or {row["name"] for row in all_posted} != {sle.name for sle in posted}):
+            raise ValueError("Unexpected or unsubmitted ledger row for cleanup reconciliation")
+        for sle in posted:
+            item, warehouse = sle.item_code, sle.warehouse
+            evidence, before = expected[(item, warehouse)]
+            if abs(sle.actual_qty + evidence["removed"]) > tolerance:
+                raise ValueError("Cleanup ledger reduction could not be verified: {0}@{1}".format(item, warehouse))
+            after = _orphan_cleanup_snapshot(item, warehouse, company, frappe.utils.now_datetime())
+            if abs(after["current_qty"] - evidence["after"]) > tolerance:
+                raise ValueError("Cleanup Bin reduction could not be verified: {0}@{1}".format(item, warehouse))
+            expired_ids = {lot["ledger_entry"] for lot in evidence["lots"]}
+            surviving = [lot for lot in before["lots"] if lot["ledger_entry"] not in expired_ids]
+            if after["lots"] != surviving:
+                raise ValueError("Cleanup would alter younger receipt provenance: {0}@{1}".format(item, warehouse))
+        _orphan_cleanup_verify_evidence(document, evidence_name, evidence_content)
+        if not lock.owned():
+            raise ValueError("Cleanup lock lost before commit")
+        commit_attempted = True
+        frappe.db.commit()
+        committed = True
+        transaction_open = False
+        lines.extend("REMOVED AND VERIFIED " + json.dumps(dict(e, reconciliation=document.name),
+                     default=str, sort_keys=True) for e in evidence_rows)
+        _upsert_inventory_document(diagnostics, "Stock Reconciliation", document.name,
+            "Remove only receipt quantities older than 21 days from transit warehouses",
+            "newly created by orphan cleanup", "submitted, committed, ledger/Bin and younger receipts verified",
+            source_warehouses=target_warehouses, movement_quantity=sum(e["removed"] for e in evidence_rows),
+            affected_item_count=len({e["item_code"] for e in evidence_rows}),
+            reconciliation_metrics=_reconciliation_quantity_metrics(rows, before_map))
     except Exception as exc:
-        lines.append("CLEANUP WITHHELD: " + _concise_inventory_exception(exc))
+        if transaction_open:
+            try:
+                frappe.db.rollback()
+            except Exception as rollback_exc:
+                lines.append("CLEANUP ROLLBACK FAILED: " + _concise_inventory_exception(rollback_exc))
+        if committed:
+            lines.append("CLEANUP BATCH COMMITTED; REPORT ISSUE: " + _concise_inventory_exception(exc))
+        elif commit_attempted:
+            lines.append("COMMIT OUTCOME UNCONFIRMED; review document {0}: {1}".format(
+                getattr(document, "name", None), _concise_inventory_exception(exc)))
+        else:
+            lines.append("CLEANUP WITHHELD: " + _concise_inventory_exception(exc))
     finally:
         if acquired:
             try:
                 lock.release()
             except Exception as exc:
                 lines.append("LOCK RELEASE ERROR: " + _concise_inventory_exception(exc))
-        # Publish once, together with the post-cleanup aging diagnostic, from
-        # the orchestrator's finally block (including partial-run failures).
         if diagnostics is not None:
             diagnostics["orphan_cleanup_lines"] = lines
     return lines
@@ -8888,6 +9043,1263 @@ def process_fba_inventory():
                 inbound_flow_diagnostics=inbound_flow_diagnostics,
             )
 
+"""Read-only Amazon sale evidence. Inject Sync's authenticated _sp_get.
+
+No missing/error response is a stop. Evidence is source-specific, never a claim
+that no other Amazon coupon/deal exists. No state, ERP or Amazon writes.
+"""
+import hashlib
+import inspect
+import json
+import re
+import time
+from datetime import datetime, date, time as daytime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
+
+
+def _sale_stamp(raw, tz_name, end=False):
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError('Missing schedule date')
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+        day = date.fromisoformat(raw)
+        if end:
+            day += timedelta(days=1)
+        return datetime.combine(day, daytime.min, ZoneInfo(tz_name))
+    result = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError('Schedule timestamp lacks timezone')
+    return result
+
+
+def _sale_money(raw):
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float, Decimal)):
+        raise ValueError('Invalid price')
+    try:
+        value = Decimal(str(raw))
+    except InvalidOperation:
+        raise ValueError('Invalid price') from None
+    if not value.is_finite() or value <= 0:
+        raise ValueError('Price must be finite and positive')
+    return value
+
+
+def _sale_objects(value):
+    if not isinstance(value, list) or any(not isinstance(x, dict) for x in value):
+        raise ValueError('Expected array of objects')
+    return value
+
+
+def _sale_result(identity, observed_at, status='incomplete', events=None, reason='', source='listing'):
+    return dict(identity, source=source, status=status, events=events or [],
+                observed_at=observed_at.isoformat(), reason=reason)
+
+
+def listing_sale_evidence(listing, identity, observed_at, timezone_name='America/Los_Angeles'):
+    """Exact identity, explicit schedules only. Raw end dates remain unchanged.
+
+    An expired returned schedule is a stop only for its own source_id. Missing
+    schedules are unknown. Date-only end is inclusive; timestamp end exclusive.
+    """
+    if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
+        raise ValueError('Observation must be timezone-aware')
+    market, sku, asin = (identity[k] for k in ('marketplace', 'sku', 'asin'))
+    try:
+        if not isinstance(listing, dict) or listing.get('errors') or listing.get('sku') != sku:
+            raise ValueError('Missing, errored or mismatched listing')
+        summaries = [s for s in _sale_objects(listing.get('summaries')) if s.get('marketplaceId') == market]
+        if len(summaries) != 1 or summaries[0].get('asin') != asin:
+            raise ValueError('Unconfirmed listing marketplace/ASIN')
+        if any(x.get('severity') == 'ERROR' for x in _sale_objects(listing.get('issues', []))):
+            raise ValueError('Listing validation errors')
+        attrs = listing.get('attributes')
+        if not isinstance(attrs, dict) or 'purchasable_offer' not in attrs:
+            raise ValueError('Offer attributes missing')
+        matching = []
+        for offer in _sale_objects(attrs['purchasable_offer']):
+            if not isinstance(offer.get('marketplace_id'), str):
+                raise ValueError('Offer marketplace missing')
+            if offer['marketplace_id'] == market and offer.get('audience', 'ALL') == 'ALL':
+                matching.append(offer)
+        if len(matching) != 1:
+            raise ValueError('Standard offer missing or ambiguous')
+        offer = matching[0]
+        currency = offer.get('currency')
+        if not isinstance(currency, str) or not re.fullmatch('[A-Z]{3}', currency):
+            raise ValueError('Currency missing or malformed')
+        if 'discounted_price' not in offer:
+            raise ValueError('Discount schedule omitted; not stop evidence')
+        schedules = []
+        for price in _sale_objects(offer['discounted_price']):
+            entries = _sale_objects(price.get('schedule'))
+            if not entries:
+                raise ValueError('Empty schedule wrapper is uncertain')
+            schedules.extend(entries)
+        bases = []
+        if 'our_price' in offer:
+            for price in _sale_objects(offer['our_price']):
+                entries = _sale_objects(price.get('schedule'))
+                if not entries:
+                    raise ValueError('Empty normal-price schedule')
+                for entry in entries:
+                    amount = _sale_money(entry.get('value_with_tax'))
+                    start = _sale_stamp(entry['start_at'], timezone_name) if 'start_at' in entry else None
+                    end = _sale_stamp(entry['end_at'], timezone_name, True) if 'end_at' in entry else None
+                    if start and end and end <= start:
+                        raise ValueError('Invalid normal-price interval')
+                    if (start is None or start <= observed_at) and (end is None or observed_at < end):
+                        bases.append(amount)
+            if len(set(bases)) != 1:
+                raise ValueError('Active base price ambiguous')
+        events, seen = [], set()
+        for entry in schedules:
+            raw_start, raw_end = entry.get('start_at'), entry.get('end_at')
+            start = _sale_stamp(raw_start, timezone_name)
+            end = _sale_stamp(raw_end, timezone_name, True)
+            price = _sale_money(entry.get('value_with_tax'))
+            if end <= start:
+                raise ValueError('Invalid sale interval')
+            if start > observed_at:
+                continue
+            active = observed_at < end
+            if active and bases and price >= bases[0]:
+                raise ValueError('Sale price not below base')
+            signature = (start, end, price)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            source_id = 'listing:' + hashlib.sha256(json.dumps([market, sku, asin, raw_start if len(raw_start) == 10 else start.astimezone(timezone.utc).isoformat(), currency], separators=(',', ':')).encode()).hexdigest()[:32]
+            events.append(dict(source_id=source_id, source='listing', start=raw_start, end=raw_end,
+                price=str(price), currency=currency, status='active' if active else 'confirmed_stop',
+                evidence='seller-submitted schedule, not checkout execution', observed_at=observed_at.isoformat()))
+        if len({e['source_id'] for e in events}) != len(events):
+            raise ValueError('Conflicting schedules share start identity')
+        if sum(e['status'] == 'active' for e in events) > 1:
+            raise ValueError('Overlapping active sale schedules')
+        return _sale_result(identity, observed_at,
+            'active' if any(e['status'] == 'active' for e in events) else 'confirmed_no_active', events,
+            'Explicit standard-offer schedule inspected; scope is listing schedules only')
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return _sale_result(identity, observed_at, reason='Listing evidence malformed, absent or uncertain')
+
+
+def _sale_get(sp_get, path, query, settings):
+    """Use existing authenticated helper without changing its supported contract."""
+    params = inspect.signature(sp_get).parameters
+    kwargs = {}
+    if 'return_full' in params:
+        kwargs['return_full'] = True
+    if 'max_retry' in params:
+        kwargs['max_retry'] = 1
+    response = sp_get(path, query, settings, **kwargs)
+    if hasattr(response, 'status_code') and response.status_code != 200:
+        raise ValueError('Amazon request failed')
+    if not isinstance(response, dict):
+        response = response.json()
+    if not isinstance(response, dict) or response.get('errors'):
+        raise ValueError('Amazon response unavailable')
+    return response
+
+
+def collect_listing_promo_evidence(sp_get, settings, seller_id, identities, observed_at,
+        timezone_name='America/Los_Angeles', *, max_requests=120, max_seconds=120,
+        sleep=time.sleep, monotonic=time.monotonic):
+    """Batched searchListingsItems, 20 exact SKUs per request. Returns (rows, diag).
+
+    identities: dicts with marketplace, sku (merchant SKU), asin, item_code.
+    Failed/partial batches are wholly incomplete, including any prior page.
+    Caller must close only listing-sourced events, never other source events.
+    """
+    if not isinstance(seller_id, str) or not re.fullmatch('[A-Z0-9]{1,40}', seller_id):
+        raise ValueError('Seller ID required')
+    if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
+        raise ValueError('Aware observation required')
+    results = [_sale_result(x, observed_at, reason='Not successfully queried') for x in identities]
+    diag = dict(request_count=0, incomplete_count=0, source='listing', errors=[])
+    grouped, collisions = {}, set()
+    for n, ident in enumerate(identities):
+        sku, market, asin = (ident.get(k) for k in ('sku', 'marketplace', 'asin'))
+        if not all(isinstance(v, str) and v for v in (sku, market, asin)) or ',' in sku or any(ord(c) < 32 for c in sku) or not re.fullmatch('[A-Z0-9]{10}', asin):
+            continue
+        key = (market, sku)
+        if key in grouped:
+            collisions.add(key)
+        grouped.setdefault(key, n)
+    for key in collisions:
+        del grouped[key]
+    started, last, exhausted = monotonic(), None, False
+    for market in sorted({k[0] for k in grouped}):
+        skus = sorted(k[1] for k in grouped if k[0] == market)
+        for offset in range(0, len(skus), 20):
+            if exhausted:
+                break
+            batch = skus[offset:offset + 20]
+            query = dict(marketplaceIds=market, identifiers=','.join(batch), identifiersType='SKU',
+                         includedData='summaries,attributes,issues', pageSize=20)
+            found, tokens = {}, set()
+            try:
+                while True:
+                    delay = max(0, .25 - (monotonic() - last)) if last is not None else 0
+                    if diag['request_count'] >= max_requests or monotonic() - started + delay >= max_seconds:
+                        exhausted = True
+                        raise ValueError('Budget exhausted')
+                    if delay:
+                        sleep(delay)
+                    last = monotonic()
+                    diag['request_count'] += 1
+                    data = _sale_get(sp_get, '/listings/2021-08-01/items/' + seller_id, query, settings)
+                    for listing in _sale_objects(data.get('items')):
+                        sku = listing.get('sku')
+                        if sku not in batch or sku in found:
+                            raise ValueError('Unexpected or duplicate listing')
+                        found[sku] = listing
+                    pagination = data.get('pagination', {})
+                    if not isinstance(pagination, dict):
+                        raise ValueError('Invalid pagination')
+                    token = pagination.get('nextToken')
+                    if token is None:
+                        break
+                    if not isinstance(token, str) or not token or token in tokens:
+                        raise ValueError('Invalid/repeated page token')
+                    tokens.add(token)
+                    query = dict(query, pageToken=token)
+                for sku, listing in found.items():
+                    n = grouped[(market, sku)]
+                    results[n] = listing_sale_evidence(listing, identities[n], observed_at, timezone_name)
+            except Exception:
+                diag['errors'].append(dict(marketplace=market, reason='Listing batch incomplete'))
+                # Stop first-call authorization/transport storms; no closures.
+                if diag['request_count'] == 1 and not found:
+                    exhausted = True
+    diag['incomplete_count'] = sum(r['status'] == 'incomplete' for r in results)
+    return results, diag
+
+
+# Adapted from the supplied Forecaster v1.0.42 read-only Promotions reader.
+from datetime import date, datetime, time as daytime, timezone, timedelta
+import calendar
+import time as _promo_api_time
+from urllib.parse import quote as _promo_api_quote, unquote as _promo_api_unquote
+_promo_api_source = 'Amazon Promotions API 2025-12-01'
+_promo_api_root = '/promotions/2025-12-01/promotions'
+_promo_api_statuses = {'PROCESSING', 'UPCOMING', 'RUNNING', 'EXPIRED', 'FAILED', 'CANCELLING', 'CANCELLED'}
+_promo_api_types = {'BASKET_BUILDING', 'DEAL', 'PRICE_DISCOUNT', 'COUPON'}
+
+class _promo_api_PromotionSourceError(ValueError):
+    pass
+
+def _promo_api_text(value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise _promo_api_PromotionSourceError(label + ' is missing or invalid')
+    return value.strip()
+
+def _promo_api_path_id(value, label):
+    value = _promo_api_text(value, label)
+    if value in {'.', '..'} or '/' in value or chr(92) in value:
+        raise _promo_api_PromotionSourceError(label + ' contains unsupported path characters')
+    return _promo_api_quote(value, safe='')
+
+def _promo_api_object(value, label):
+    if not isinstance(value, dict):
+        raise _promo_api_PromotionSourceError(label + ' is missing or invalid')
+    return value
+
+def _promo_api_token(container):
+    if 'pagination' not in container:
+        return None
+    pagination = _promo_api_object(container['pagination'], 'pagination')
+    return _promo_api_text(pagination.get('nextToken'), 'pagination.nextToken')
+
+def _promo_api_stamp(value):
+    raw = _promo_api_text(value, 'schedule timestamp')
+    try:
+        parsed = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    except ValueError:
+        raise _promo_api_PromotionSourceError('schedule timestamp is invalid') from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise _promo_api_PromotionSourceError('schedule timestamp must include timezone')
+    return (raw, parsed)
+
+def _promo_api_identity(member):
+    member = _promo_api_object(member, 'selection item')
+    result = {}
+    for key in ('sku', 'asin'):
+        value = member.get(key)
+        if value is not None:
+            result[key] = _promo_api_text(value, 'selection ' + key)
+    if not result:
+        raise _promo_api_PromotionSourceError('selection item has no SKU or ASIN')
+    _promo_api_check_issues(member)
+    result['benefit'] = member.get('benefit')
+    return result
+
+def _promo_api_check_issues(container):
+    if 'issues' not in container:
+        return
+    issues = container['issues']
+    if not isinstance(issues, list) or any((not isinstance(x, dict) for x in issues)):
+        raise _promo_api_PromotionSourceError('issues are malformed')
+    if any((x.get('severity') == 'ERROR' for x in issues)):
+        raise _promo_api_PromotionSourceError('Amazon reports validation errors; item execution scope is uncertain')
+
+def _promo_api_fetch_promotions(get, settings, marketplaces, as_of, *, sleep=_promo_api_time.sleep, monotonic=_promo_api_time.monotonic, max_requests=180, max_seconds=300):
+    """Return (canonical promotion rows, diagnostic dict), without writing state.
+
+    `get` is the account-bound read-only transport defined in this same file, with signature
+    get(path, query, settings, return_full=True, max_retry=1). Its {} errors are
+    rejected. One request per marketplace (Amazon permits one marketplace ID).
+    Budgets bound request count and work between requests; the injected helper
+    must separately enforce socket timeouts. A successful promotion is added
+    only after every selection page is verified. A failed/empty refresh NEVER
+    instructs the caller to remove archived events.
+    """
+    if not callable(get) or not isinstance(as_of, date) or isinstance(as_of, datetime):
+        raise ValueError('A callable GET helper and calendar as_of date are required')
+    if not isinstance(marketplaces, (list, tuple)) or not marketplaces:
+        raise ValueError('Explicit marketplace IDs are required')
+    markets = list(dict.fromkeys((_promo_api_text(x, 'marketplace') for x in marketplaces)))
+    if type(max_requests) is not int or max_requests < 1 or max_seconds <= 0:
+        raise ValueError('Positive request/time budgets are required')
+    diag = dict(source=_promo_api_source, request_count=0, markets_requested=markets, markets_completed=[], query_complete=False, promotions_complete=False, price_schedules_complete=False, coverage_notice='API enumeration only; historical omissions and separate listing sale-price schedules remain unknown.', issues=[], discovered_promotions=[])
+    rows = []
+    started, last = (monotonic(), {})
+    cutoff_year = as_of.year - 5
+    cutoff = as_of.replace(year=cutoff_year, day=min(as_of.day, calendar.monthrange(cutoff_year, as_of.month)[1]))
+    cutoff_text = datetime.combine(cutoff, daytime.min, timezone.utc).isoformat()
+
+    def issue(code, market, pid, message):
+        diag['issues'].append(dict(code=code, marketplace=market, promotion_id=pid, message=message))
+
+    def request(operation, path, query):
+        try:
+            now = monotonic()
+            delay = max(0.0, 10.0 - (now - last[operation])) if operation in last else 0.0
+            if diag['request_count'] >= max_requests or now - started + delay >= max_seconds:
+                raise _promo_api_PromotionSourceError('request/time budget exhausted; remaining scope is unknown')
+            if delay:
+                sleep(delay)
+            diag['request_count'] += 1
+            last[operation] = monotonic()
+        except _promo_api_PromotionSourceError:
+            raise
+        except Exception:
+            raise _promo_api_PromotionSourceError('request timing/throttling failed; remaining scope is unknown') from None
+        try:
+            value = get(path, dict(query), settings, return_full=True, max_retry=1)
+        except Exception:
+            raise _promo_api_PromotionSourceError('GET failed; check existing Amazon Settings authorization and API role') from None
+        value = _promo_api_object(value, 'API response')
+        if not value or value.get('errors'):
+            raise _promo_api_PromotionSourceError('API returned an error or empty response; coverage is unknown')
+        return value
+    recent_cutoff = datetime.combine(as_of - timedelta(days=31), daytime.min, timezone.utc).isoformat()
+    processed = set()
+    completed = {market: True for market in markets}
+    for phase, query_cutoff in (('recent', recent_cutoff),):
+        for market in markets:
+            market_ok = True
+            summaries, seen_ids, tokens = ([], set(), set())
+            expected, page_number = None, 0
+            query = dict(marketplaceIds=market, limit=100, revision='PUBLISHED', endDateAfter=query_cutoff)
+            if phase == 'recent':
+                query['startDateBefore'] = datetime.combine(as_of + timedelta(days=2), daytime.min, timezone.utc).isoformat()
+            try:
+                while True:
+                    response = request('searchPromotions', _promo_api_root, query)
+                    page_number += 1
+                    page = response.get('promotions')
+                    count = response.get('totalResults')
+                    if not isinstance(page, list) or type(count) is not int or count < 0:
+                        raise _promo_api_PromotionSourceError('search response requires promotions array and nonnegative totalResults')
+                    if expected is not None and count != expected:
+                        market_ok = False
+                        issue('PROMOTION_COUNT_CHANGED', market, '', 'Search total changed while paging')
+                    expected = count if expected is None else expected
+                    for summary_index, summary in enumerate(page, 1):
+                        # Keep traceable IDs even when one malformed summary is
+                        # rejected. No raw payload/credentials enter diagnostics.
+                        raw_id = summary.get('promotionId') if isinstance(summary, dict) else None
+                        observation = dict(phase=phase, marketplace=market,
+                            page=page_number, summary_index=summary_index,
+                            promotion_id=raw_id.strip() if isinstance(raw_id, str) else '',
+                            disposition='RETRIEVED_UNVALIDATED')
+                        diag['discovered_promotions'].append(observation)
+                        try:
+                            summary = _promo_api_object(summary, 'promotion summary')
+                            pid = _promo_api_text(summary.get('promotionId'), 'promotion ID')
+                            _promo_api_path_id(pid, 'promotion ID')
+                            if summary.get('marketplaceId') != market:
+                                raise _promo_api_PromotionSourceError('search returned a different marketplace')
+                            if pid in seen_ids:
+                                market_ok = False
+                                observation['disposition'] = 'DUPLICATE_SEARCH_ID'
+                                issue('PROMOTION_DUPLICATE_ID', market, pid, 'Duplicate search ID; retained one lookup')
+                                continue
+                            seen_ids.add(pid)
+                            observation['disposition'] = 'AWAITING_DETAIL'
+                            summaries.append((pid, observation))
+                        except _promo_api_PromotionSourceError as exc:
+                            market_ok = False
+                            observation['disposition'] = 'REJECTED_SUMMARY'
+                            observation['reason_code'] = 'PROMOTION_SUMMARY_INVALID'
+                            issue('PROMOTION_SUMMARY_INVALID', market, observation['promotion_id'], str(exc))
+                        except Exception:
+                            market_ok = False
+                            observation['disposition'] = 'REJECTED_SUMMARY'
+                            observation['reason_code'] = 'PROMOTION_SUMMARY_PROCESSING_FAILED'
+                            issue('PROMOTION_SUMMARY_PROCESSING_FAILED', market, observation['promotion_id'],
+                                  'Unexpected summary processing failure; other records remain usable')
+                    token = _promo_api_token(response)
+                    if token is None:
+                        break
+                    if token in tokens:
+                        raise _promo_api_PromotionSourceError('search pagination repeated a token')
+                    tokens.add(token)
+                    query['paginationToken'] = token
+                if len(seen_ids) != expected:
+                    market_ok = False
+                    issue('PROMOTION_RESULTS_INCOMPLETE', market, '', 'Returned unique IDs differ from totalResults; absent events are not evidence of no promotion')
+            except _promo_api_PromotionSourceError as exc:
+                market_ok = False
+                issue('PROMOTION_SEARCH_FAILED', market, '', str(exc))
+            except Exception:
+                market_ok = False
+                issue('PROMOTION_SEARCH_PROCESSING_FAILED', market, '',
+                      'Unexpected search processing failure; already retrieved IDs remain usable')
+            for pid, observation in summaries:
+                if (market, pid) in processed:
+                    observation['disposition'] = 'ALREADY_ACCEPTED_THIS_RUN'
+                    continue
+                try:
+                    detail = request('getPromotion', _promo_api_root + '/' + _promo_api_path_id(pid, 'promotion ID'), dict(includedData='SELECTION,ISSUES,CUSTOMER_SEGMENTS'))
+                    if 'promotionId' in detail and detail['promotionId'] != pid:
+                        raise _promo_api_PromotionSourceError('promotion detail identity differs from requested ID')
+                    if detail.get('marketplaceId') != market:
+                        raise _promo_api_PromotionSourceError('promotion detail marketplace is missing or different')
+                    status = detail.get('status')
+                    kind = detail.get('promotionType')
+                    if not isinstance(status, str) or not isinstance(kind, str) or status not in _promo_api_statuses or (kind not in _promo_api_types):
+                        raise _promo_api_PromotionSourceError('promotion status or type is unsupported')
+                    _promo_api_check_issues(detail)
+                    schedule = _promo_api_object(detail.get('schedule'), 'promotion schedule')
+                    start_raw, start = _promo_api_stamp(schedule.get('startDate'))
+                    end_raw, end = _promo_api_stamp(schedule.get('endDate'))
+                    if end <= start:
+                        raise _promo_api_PromotionSourceError('promotion interval is empty or reversed')
+                    selection = _promo_api_object(detail.get('selection'), 'promotion selection')
+                    selection_type = selection.get('type')
+                    members, catalog, exclusions = ([], False, [])
+                    if selection_type == 'CATALOG':
+                        selection_detail = _promo_api_object(selection.get('selectionDetails'), 'catalog selection details')
+                        rules = _promo_api_object(selection_detail.get('rules'), 'catalog rules')
+                        if set(rules) - {'excludedItems'}:
+                            raise _promo_api_PromotionSourceError('unsupported catalog rules; refusing to broaden scope')
+                        excluded = rules.get('excludedItems', [])
+                        if not isinstance(excluded, list):
+                            raise _promo_api_PromotionSourceError('catalog exclusions must be an array')
+                        exclusions = [_promo_api_identity(x) for x in excluded]
+                        _promo_api_check_issues(selection_detail)
+                        if 'pagination' in selection_detail:
+                            raise _promo_api_PromotionSourceError('paginated catalog rules are unsupported')
+                        catalog = True
+                        members = [{}]
+                    elif selection_type == 'ITEMS':
+                        sid = _promo_api_text(selection.get('selectionId'), 'selection ID')
+                        revision = selection.get('revisionId')
+                        if type(revision) is not int or revision < 1:
+                            raise _promo_api_PromotionSourceError('selection revision is missing or invalid')
+                        selection_query = dict(revisionId=revision, limit=100, includedData='ISSUES')
+                        tokens = set()
+                        while True:
+                            selected = request('getSelection', _promo_api_root + '/' + _promo_api_path_id(pid, 'promotion ID') + '/selections/' + _promo_api_path_id(sid, 'selection ID'), selection_query)
+                            sel = _promo_api_object(selected.get('selection'), 'selection response')
+                            if sel.get('selectionId') != sid or sel.get('revisionId') != revision or sel.get('type') != 'ITEMS':
+                                raise _promo_api_PromotionSourceError('selection identity/revision changed while paging')
+                            payload = _promo_api_object(sel.get('selectionDetails'), 'selection details')
+                            _promo_api_check_issues(payload)
+                            if not isinstance(payload.get('items'), list):
+                                raise _promo_api_PromotionSourceError('selection items array is missing')
+                            members.extend((_promo_api_identity(x) for x in payload['items']))
+                            token = _promo_api_token(payload)
+                            if token is None:
+                                break
+                            if token in tokens:
+                                raise _promo_api_PromotionSourceError('selection pagination repeated a token')
+                            tokens.add(token)
+                            selection_query['paginationToken'] = token
+                        if not members:
+                            raise _promo_api_PromotionSourceError('selection contains no identifiable items')
+                    else:
+                        raise _promo_api_PromotionSourceError('unsupported promotion selection type')
+                    conditions = {k: detail[k] for k in ('purchaseRequirements', 'customerSegments', 'benefit') if k in detail}
+                    emitted, proposed = {}, []
+                    for member in members:
+                        identity = (member.get('sku', ''), member.get('asin', ''))
+                        if identity in emitted:
+                            if emitted[identity] != member:
+                                raise _promo_api_PromotionSourceError('Conflicting duplicate selection member')
+                            continue
+                        emitted[identity] = member
+                        proposed.append({'Promotion ID': pid, 'Marketplace': market, 'Amazon Merchant SKU': identity[0], 'ASIN': identity[1], 'Start Date': start_raw, 'End Date': end_raw, 'Status': status, 'Source': _promo_api_source, 'Promotion Type': kind, 'Catalog': catalog, 'Excluded Items': exclusions, 'Conditions': dict(conditions, item_benefit=member.get('benefit')), 'Selection Revision': selection.get('revisionId')})
+                    # Commit scope atomically after every page/member passes.
+                    rows.extend(proposed)
+                    processed.add((market, pid))
+                    observation['disposition'] = 'ACCEPTED'
+                    observation['event_rows'] = len(proposed)
+                    observation['status'] = status
+                    observation['start_date'] = start_raw
+                    observation['end_date'] = end_raw
+                except _promo_api_PromotionSourceError as exc:
+                    market_ok = False
+                    observation['disposition'] = 'REJECTED_DETAIL'
+                    observation['reason_code'] = 'PROMOTION_DETAIL_FAILED'
+                    issue('PROMOTION_DETAIL_FAILED', market, pid, str(exc))
+                except Exception:
+                    market_ok = False
+                    observation['disposition'] = 'REJECTED_DETAIL'
+                    observation['reason_code'] = 'PROMOTION_DETAIL_PROCESSING_FAILED'
+                    issue('PROMOTION_DETAIL_PROCESSING_FAILED', market, pid,
+                          'Unexpected promotion processing failure; earlier accepted events retained')
+            completed[market] = completed[market] and market_ok
+    diag['markets_completed'] = [market for market in markets if completed[market]]
+    diag['query_complete'] = len(diag['markets_completed']) == len(markets)
+    diag['accepted_event_rows'] = len(rows)
+    diag['accepted_promotion_ids'] = [dict(marketplace=market, promotion_id=pid)
+                                      for market, pid in sorted(processed)]
+    return (rows, diag)
+
+
+def promotion_rows_evidence(rows, identities, observed_at, timezone_name='America/Los_Angeles'):
+    """Accept only explicit fixed-price, exact SKU AND ASIN selected promotions.
+
+    Coupon/percentage/amount-off and catalog-wide records cannot establish a
+    paid price here. CANCELLED supplies no actual cancellation timestamp, so
+    cannot shorten stored dates. No returned match never establishes closure.
+    """
+    results = []
+    for identity in identities:
+        events = []
+        for row in rows:
+            if (row.get('Marketplace'), row.get('Amazon Merchant SKU'), row.get('ASIN')) != (
+                    identity['marketplace'], identity['sku'], identity['asin']):
+                continue
+            try:
+                if row.get('Catalog') or row.get('Promotion Type') not in ('DEAL', 'PRICE_DISCOUNT'):
+                    continue
+                status = row.get('Status')
+                if status not in ('RUNNING', 'EXPIRED'):
+                    continue
+                start, end = row['Start Date'], row['End Date']
+                sd, ed = _sale_stamp(start, timezone_name), _sale_stamp(end, timezone_name, True)
+                if sd >= ed or sd > observed_at:
+                    continue
+                if (status == 'RUNNING') != (observed_at < ed):
+                    continue
+                conditions = row.get('Conditions') or {}
+                # Targeted/conditional deals cannot be treated as universal price.
+                if conditions.get('purchaseRequirements') or conditions.get('customerSegments'):
+                    continue
+                benefit = conditions.get('item_benefit') or {}
+                if benefit.get('type') != 'FIXED_PRICE':
+                    continue
+                price = benefit.get('price') or {}
+                amount, currency = _sale_money(price.get('amount')), price.get('currencyCode')
+                if not isinstance(currency, str) or not re.fullmatch('[A-Z]{3}', currency):
+                    continue
+                pid = row.get('Promotion ID')
+                if not isinstance(pid, str) or not pid:
+                    continue
+                events.append(dict(source_id='promotion:' + pid, source='promotions',
+                    start=start, end=end, price=str(amount), currency=currency,
+                    status='active' if status == 'RUNNING' else 'confirmed_stop',
+                    observed_at=observed_at.isoformat(), evidence='Exact selected fixed-price promotion'))
+            except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+                continue
+        results.append(_sale_result(identity, observed_at,
+            status='active' if any(e['status'] == 'active' for e in events) else ('confirmed_no_active' if events else 'incomplete'),
+            events=events, reason='Only exact fixed-price selection evidence; no absence-based closures', source='promotions'))
+    return results
+
+
+def collect_promotion_api_evidence(sp_get, settings, identities, observed_at,
+        timezone_name='America/Los_Angeles', *, max_requests=60, max_seconds=120,
+        sleep=time.sleep, monotonic=time.monotonic):
+    """Independent bounded reader, reuses Sync auth. No live calls in tests."""
+    markets = sorted({x['marketplace'] for x in identities})
+    if not markets:
+        return [], dict(request_count=0, issues=[])
+    def get(path, query, selected_settings, **kwargs):
+        if selected_settings is not settings:
+            raise ValueError('Settings mismatch')
+        return _sale_get(sp_get, path, query, settings)
+    rows, diag = _promo_api_fetch_promotions(get, settings, markets,
+        observed_at.astimezone(ZoneInfo(timezone_name)).date(), sleep=sleep,
+        monotonic=monotonic, max_requests=max_requests, max_seconds=max_seconds)
+    return promotion_rows_evidence(rows, identities, observed_at, timezone_name), diag
+
+"""Pure, per-Item promotion planner. No I/O, inventory writes, sales backfill or commits.
+
+Caller persists returned state and row writes atomically, replacing temporary row
+references using bind_promo_rows after insertion. Dates are displayed Amazon dates,
+not UTC conversions. end_date is retained verbatim, including December 31.
+Only an adjacent split within the SAME identified event has a shared boundary:
+the newer segment owns that day. Other endpoints are inclusive for conflict checks.
+"""
+from copy import deepcopy
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
+
+
+class PromoEvidenceError(ValueError):
+    pass
+
+
+def _promo_date(value):
+    if not isinstance(value, str):
+        raise PromoEvidenceError('Dates must be verbatim ISO calendar-date strings')
+    try:
+        parsed = date.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise PromoEvidenceError('Invalid promotion date') from exc
+    if parsed.isoformat() != value:
+        raise PromoEvidenceError('Date must be YYYY-MM-DD')
+    return value
+
+
+def _promo_price(value):
+    if not isinstance(value, str) or not value.strip():
+        raise PromoEvidenceError('Promo price must be explicit numeric Data text')
+    try:
+        number = Decimal(value)
+    except InvalidOperation as exc:
+        raise PromoEvidenceError('Ambiguous promotion price') from exc
+    if not number.is_finite() or number < 0:
+        raise PromoEvidenceError('Invalid promotion price')
+    return number
+
+
+def bind_promo_rows(state, bindings):
+    """Resolve planner's temporary IDs to ERP child names before durable persistence."""
+    result = deepcopy(state)
+    for event in result.get('events', {}).values():
+        for segment in event['segments']:
+            ref = segment['row']
+            if ref.startswith('@promo:'):
+                name = bindings.get(ref)
+                if not isinstance(name, str) or not name or name.startswith('@promo:'):
+                    raise PromoEvidenceError('Missing inserted child-row identity')
+                segment['row'] = name
+    refs = [s['row'] for e in result.get('events', {}).values() for s in e['segments']]
+    if len(refs) != len(set(refs)):
+        raise PromoEvidenceError('Duplicate child-row identity')
+    return result
+
+
+def plan_promo_lifecycle(rows, observations, state, observed_on):
+    """Plan one Item atomically; unsafe evidence returns no operations/state changes.
+
+    rows: [{name,start_date,end_date,promo_price,units_sold,...}].
+    observations: [{event_id,start_date,end_date,promo_price,confirmed:True,
+      effective_price_date?: YYYY-MM-DD, marketplace_id?:str,currency?:str}].
+    Complete authoritative event dates are required even for an end/extension.
+    state: {version:1,events:{event_id:{segments:[{row,start_date,end_date,
+      promo_price}],marketplace_id?:str,currency?:str}}}. Caller must provide
+    durable names and trusted event identity, never synthesize event_id from dates
+    or price. Existing four-field rows may be adopted only by unique exact date/price match.
+    Optional table columns are not needed. Missing events are not ended implicitly.
+    """
+    original = deepcopy(state)
+    warnings = []
+    try:
+        today = _promo_date(observed_on)
+        if not isinstance(state, dict) or state.get('version') != 1 or not isinstance(state.get('events'), dict):
+            raise PromoEvidenceError('Missing or unsupported durable promotion identity state')
+        work = deepcopy(state)
+        table = {}
+        for row in rows:
+            name = row.get('name')
+            if not isinstance(name, str) or not name or name in table or name.startswith('@promo:'):
+                raise PromoEvidenceError('Missing/duplicate persisted child identity')
+            table[name] = deepcopy(row)
+            _promo_date(row.get('start_date')); _promo_date(row.get('end_date'))
+            _promo_price(row.get('promo_price'))
+            if row['start_date'] > row['end_date']:
+                raise PromoEvidenceError('Existing promotion has inverted dates')
+        owners = {}
+        for key, event in work['events'].items():
+            if not isinstance(key, str) or not key or not event.get('segments'):
+                raise PromoEvidenceError('Invalid durable event identity')
+            for segment in event['segments']:
+                ref = segment['row']
+                if ref not in table or ref in owners:
+                    raise PromoEvidenceError('Missing or multiply assigned durable promotion row')
+                owners[ref] = key
+                for field in ('start_date', 'end_date', 'promo_price'):
+                    if table[ref].get(field) != segment.get(field):
+                        raise PromoEvidenceError('Promotion row changed outside recorded lifecycle; reconcile identity first')
+        operations = []
+        seen = set()
+        def update(segment, **fields):
+            changes = {k:v for k,v in fields.items() if segment[k] != v}
+            if changes:
+                segment.update(changes)
+                table[segment['row']].update(changes)
+                operations.append({'action':'update','row':segment['row'],'fields':changes})
+        for obs in observations:
+            if obs.get('confirmed') is not True:
+                raise PromoEvidenceError('Uncertain promotion evidence; no mutation')
+            key = obs.get('event_id')
+            if not isinstance(key, str) or not key or key in seen:
+                raise PromoEvidenceError('Missing/duplicate source event identity')
+            seen.add(key)
+            if obs.get('action') == 'end':
+                existing = work['events'].get(key)
+                if not existing or not existing.get('segments'):
+                    raise PromoEvidenceError('Explicit end has no proven existing event')
+                end = _promo_date(obs.get('end_date'))
+                kind = obs.get('end_date_kind', 'last_sale_date')
+                if kind == 'first_no_sale_date':
+                    end = (date.fromisoformat(end) - timedelta(days=1)).isoformat()
+                elif kind != 'last_sale_date':
+                    raise PromoEvidenceError('Unknown explicit end date convention')
+                if end > today or end < existing['segments'][-1]['start_date']:
+                    raise PromoEvidenceError('Explicit end conflicts with observed history')
+                update(existing['segments'][-1], end_date=end)
+                continue
+            if obs.get('action') not in (None, 'upsert'):
+                raise PromoEvidenceError('Unsupported lifecycle action')
+            start = _promo_date(obs.get('start_date')); end = _promo_date(obs.get('end_date'))
+            price = obs.get('promo_price'); number = _promo_price(price)
+            if start > end:
+                raise PromoEvidenceError('Promotion start follows end')
+            event = work['events'].get(key)
+            if event is None:
+                event = {'segments': []}
+                for field in ('marketplace_id', 'currency'):
+                    if obs.get(field): event[field] = obs[field]
+                work['events'][key] = event
+                # Bootstrap only an exact, unique manual row. This is adoption,
+                # not a heuristic merge based on overlapping dates or price alone.
+                candidates = [r for ref, r in table.items() if ref not in owners
+                    and r['start_date'] == start and r['end_date'] == end
+                    and _promo_price(r['promo_price']) == number
+                    and all(not r.get(f) or not obs.get(f) or r[f] == obs[f]
+                            for f in ('marketplace_id', 'currency'))]
+                if len(candidates) > 1:
+                    raise PromoEvidenceError('Multiple matching legacy rows; cannot adopt identity')
+                if candidates:
+                    row = candidates[0]
+                    event['segments'].append({'row':row['name'], **{f:row[f] for f in
+                        ('start_date','end_date','promo_price')}})
+                    owners[row['name']] = key
+                    warnings.append('Event %s: adopted uniquely exact existing row %s; sales history retained.' % (key,row['name']))
+            else:
+                for field in ('marketplace_id', 'currency'):
+                    if event.get(field) != obs.get(field) and (event.get(field) or obs.get(field)):
+                        raise PromoEvidenceError('Changed/unknown event market or currency identity')
+            segments = event['segments']
+            if segments:
+                last = segments[-1]
+                if number == _promo_price(last['promo_price']):
+                    update(segments[0], start_date=start)
+                    update(last, end_date=end)
+                    continue
+                boundary = obs.get('effective_price_date')
+                if boundary is None:
+                    boundary = today
+                    warnings.append('Event %s: undocumented price boundary uses first observed date %s; no inferred historical price/backfill.' % (key, boundary))
+                boundary = _promo_date(boundary)
+                if not (start <= boundary <= end) or boundary < last['start_date'] or boundary > today:
+                    raise PromoEvidenceError('Price boundary cannot safely split existing history')
+                update(segments[0], start_date=start)
+                if boundary == last['start_date']:
+                    update(last, end_date=end, promo_price=price)
+                    warnings.append('Event %s: same-day price change replaces its latest row; Date resolution cannot represent intraday prices; units_sold retained.' % key)
+                    continue
+                update(last, end_date=boundary)
+                segment_start = boundary
+            else:
+                segment_start = start
+            ref = '@promo:%d' % (len(operations) + len(table))
+            while ref in table: ref += 'x'
+            fields = {'start_date':segment_start,'end_date':end,'promo_price':price,'units_sold':0}
+            segment = {'row':ref, **{k:fields[k] for k in ('start_date','end_date','promo_price')}}
+            segments.append(segment)
+            table[ref] = {'name':ref, **fields}
+            owners[ref] = key
+            operations.append({'action':'insert','row':ref,'event_id':key,'fields':fields})
+        # Validate all final rows, including unmanaged history. Never silently trim
+        # another promotion or erase historical prices to accommodate a new one.
+        previous = {}
+        for key, event in work['events'].items():
+            segments = event['segments']
+            for index, segment in enumerate(segments):
+                if segment['start_date'] > segment['end_date']:
+                    raise PromoEvidenceError('Date correction would invert a historical segment')
+                if index:
+                    prev = segments[index-1]
+                    if prev['end_date'] != segment['start_date'] or prev['start_date'] >= segment['start_date']:
+                        raise PromoEvidenceError('Date correction breaks event split history')
+                    previous[(prev['row'], segment['row'])] = True
+        ordered = sorted(table.values(), key=lambda r:(r['start_date'], r['end_date'], r['name']))
+        for i, left in enumerate(ordered):
+            for right in ordered[i+1:]:
+                if right['start_date'] > left['end_date']: break
+                if left['end_date'] == right['start_date'] and (left['name'],right['name']) in previous:
+                    continue
+                raise PromoEvidenceError('Promotion dates overlap: %s / %s' % (left['name'],right['name']))
+        return {'operations':operations,'state':work,'warnings':warnings,'blocked':False}
+    except (PromoEvidenceError, KeyError, TypeError, AttributeError) as exc:
+        return {'operations':[],'state':original,'warnings':[str(exc)],'blocked':True}
+
+
+def promo_owner_on(rows, state, day):
+    """Return unique row identity owning a day; shared split belongs to newer row."""
+    day = _promo_date(day)
+    excluded = set()
+    for event in state['events'].values():
+        segments = event['segments']
+        for old, new in zip(segments, segments[1:]):
+            if old['end_date'] == new['start_date'] == day:
+                excluded.add(old['row'])
+    matches = [r['name'] for r in rows if r['start_date'] <= day <= r['end_date'] and r['name'] not in excluded]
+    if len(matches) > 1: raise PromoEvidenceError('Ambiguous overlapping promotions')
+    return matches[0] if matches else None
+
+# ──────────────────────────────────────────
+# Amazon promo history (independent of inventory and stock transactions)
+# ──────────────────────────────────────────
+# One market per Item, because the history is an Item-level price timeline.
+PROMO_HISTORY_MARKETPLACE = MYI_US_MARKETPLACE_ID
+PROMO_HISTORY_TIMEZONE = "America/Los_Angeles"
+PROMO_HISTORY_TABLE_FIELD = ""  # Optional explicit Item Table fieldname
+PROMO_HISTORY_SELLER_ID = ""  # Optional Seller ID when not in existing Settings
+_PROMO_HISTORY_FIELDS = ("start_date", "end_date", "promo_price", "units_sold")
+_PROMO_HISTORY_CHILD = "Amazon Promo Sale History"
+_PROMO_HISTORY_MARKER = "AMAZON_ITEM_PROMO_SYNC_V1:"
+_PROMO_HISTORY_LOG = "Amazon Promo Sale History Sync"
+
+
+def _promo_history_schema():
+    meta = frappe.get_meta("Item")
+    tables = [f for f in meta.fields if f.fieldtype == "Table" and f.options]
+    explicit = PROMO_HISTORY_TABLE_FIELD.strip()
+    if explicit:
+        matches = [f for f in tables if f.fieldname == explicit]
+    else:
+        preferred = [f for f in tables if f.options == _PROMO_HISTORY_CHILD]
+        matches = preferred or [f for f in tables if
+            "amazon" in f"{f.label} {f.options}".casefold()
+            and "promo" in f"{f.label} {f.options}".casefold()]
+    compatible = []
+    for field in matches:
+        child = frappe.get_meta(field.options)
+        schema = {f.fieldname: f.fieldtype for f in child.fields}
+        if (child.istable and schema.get("start_date") == "Date"
+                and schema.get("end_date") == "Date"
+                and schema.get("promo_price") in {"Data", "Currency", "Float"}
+                and schema.get("units_sold") == "Int"):
+            compatible.append((field.fieldname, field.options, schema))
+    if len(compatible) != 1:
+        raise ValueError("Expected one compatible Amazon promo Table on Item; verify Customize Form or configure PROMO_HISTORY_TABLE_FIELD")
+    fieldname, childtype, schema = compatible[0]
+    tables = ("tabItem", f"tab{childtype}", "tabComment")
+    engines = frappe.db.sql(
+        "SELECT TABLE_NAME AS table_name, ENGINE AS engine FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (%s, %s, %s)",
+        tables, as_dict=True)
+    if {r["table_name"] for r in engines if str(r["engine"]).upper() == "INNODB"} != set(tables):
+        raise ValueError("Promo Item, child and audit tables must be transactional InnoDB tables")
+    return fieldname, childtype, schema
+
+
+def _promo_history_seller(settings):
+    keys = ("seller_id", "sellerId", "selling_partner_id", "merchant_id", "merchantId",
+            "custom_seller_id", "custom_selling_partner_id", "custom_merchant_id",
+            "amazon_seller_id", "custom_amazon_seller_id")
+    options = [PROMO_HISTORY_SELLER_ID] + [settings.get(key) for key in keys]
+    values = {str(val).strip().upper() for val in options if str(val or "").strip()}
+    if len(values) != 1 or not re.fullmatch(r"[A-Z0-9]{1,40}", next(iter(values), "")):
+        raise ValueError("Listings lookup needs one unambiguous Amazon Seller ID in existing Settings or PROMO_HISTORY_SELLER_ID")
+    return next(iter(values))
+
+
+def _promo_history_item_scope():
+    meta = frappe.get_meta("Item")
+    seller_fields = [f.fieldname for f in meta.fields
+        if f.fieldtype in {"Data", "Small Text"}
+        and " ".join(str(f.label or "").casefold().split()) == "amazon seller sku"]
+    if len(seller_fields) != 1:
+        raise ValueError("Expected one Item field with the exact label Amazon Seller SKU")
+    seller = seller_fields[0]
+    columns = ["name", "disabled", "is_stock_item", "custom_asin", "custom_amazon_fnsku", seller]
+    rows = frappe.get_all("Item",
+        filters={"custom_amazon_fnsku": ["is", "set"]}, fields=columns)
+    candidates = defaultdict(list)
+    for row in rows:
+        sku = str(row.get(seller) or "").strip()
+        if sku:
+            candidates[sku].append(row)
+    result = {}
+    rejected = 0
+    for sku, group in candidates.items():
+        if len(group) != 1:
+            rejected += len(group)
+            continue
+        row = group[0]
+        asin = str(row.get("custom_asin") or "").strip()
+        if (not row.get("disabled") and row.get("is_stock_item") and
+                str(row.get("custom_amazon_fnsku") or "").strip() and re.fullmatch(r"[A-Z0-9]{10}", asin)):
+            result[sku] = (row["name"], asin, str(row["custom_amazon_fnsku"]).strip())
+    return seller, result, rejected
+
+
+def _promo_history_marker_name(item):
+    return "amazon-item-promo-" + hashlib.sha256(item.encode("utf-8")).hexdigest()
+
+
+def _promo_history_state_read(item, scope):
+    name = _promo_history_marker_name(item)
+    row = frappe.db.get_value("Comment", name,
+        ["reference_doctype", "reference_name", "comment_type", "content"], as_dict=True)
+    if not row:
+        return name, None, {}, None
+    if (row.get("reference_doctype") != "Item" or row.get("reference_name") != item
+            or row.get("comment_type") != "Comment"):
+        raise ValueError("Promo audit marker belongs to another document")
+    # Frappe may wrap text in paragraph tags; the encoded marker itself is plain ASCII.
+    hits = re.findall(r"AMAZON_ITEM_PROMO_SYNC_V1:([A-Za-z0-9+/=]+)", str(row.get("content") or ""))
+    if len(hits) != 1 or len(hits[0]) > 48000:
+        raise ValueError("Missing or invalid promo audit marker; existing history left unchanged")
+    with gzip.GzipFile(fileobj=io.BytesIO(base64.b64decode(hits[0], validate=True))) as zipped:
+        raw = zipped.read(1000001)
+    if len(raw) > 1000000:
+        raise ValueError("Promo audit marker exceeds decoded limit")
+    payload = json.loads(raw)
+    if (not isinstance(payload, dict) or payload.get("scope") != scope
+            or not isinstance(payload.get("state"), dict)):
+        raise ValueError("Promo audit marker scope or payload mismatch")
+    observed = datetime.fromisoformat(payload["observed_at"])
+    if observed.tzinfo is None:
+        raise ValueError("Promo audit marker timestamp lacks timezone")
+    return name, row, payload["state"], observed
+
+
+def _promo_history_state_write(name, row, item, scope, observed_at, state):
+    serialized = json.dumps({"scope": scope, "observed_at": observed_at.isoformat(),
+                            "state": state}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(serialized) > 1000000:
+        raise ValueError("Promo audit marker exceeds decoded limit")
+    token = base64.b64encode(gzip.compress(serialized.encode("ascii"), mtime=0)).decode("ascii")
+    if len(token) > 48000:
+        raise ValueError("Promo audit marker exceeds stored limit")
+    text = "Amazon promo sync row identity and audit state. Do not edit. " + _PROMO_HISTORY_MARKER + token
+    if row:
+        frappe.db.set_value("Comment", name, "content", text)
+    else:
+        marker = frappe.get_doc({"doctype": "Comment", "comment_type": "Comment",
+            "reference_doctype": "Item", "reference_name": item, "content": text})
+        marker.insert(ignore_permissions=True, set_name=name)
+        if marker.name != name:
+            raise ValueError("ERP did not preserve the expected promo audit marker name")
+    if frappe.db.get_value("Comment", name, "content") is None:
+        raise ValueError("ERP promo audit marker was not saved")
+
+
+def _promo_history_log(lines):
+    try:
+        frappe.log_error("\n".join(lines[:120]), _PROMO_HISTORY_LOG)
+    except Exception:
+        # Logging is optional; it must never turn a promo failure into a sync failure.
+        try:
+            frappe.logger().warning("Unable to write Amazon promo sync report")
+        except Exception:
+            pass
+
+
+def _run_promo_history_after_inventory():
+    """The inventory transaction is already complete. Errors here never propagate."""
+    try:
+        _run_item_promo_history_sync()
+    except Exception as exc:
+        try:
+            frappe.db.rollback()
+        except Exception:
+            pass
+        _promo_history_log([f"Promo phase unavailable ({type(exc).__name__}): {str(exc)[:400]}",
+                           "Inventory processing was not rolled back; prior promo rows were retained."])
+
+
+def _promo_history_canonical_price(value):
+    number = Decimal(str(value).strip())
+    if not number.is_finite() or number <= 0:
+        raise ValueError("Invalid saved promo price")
+    # Canonical string across Data, Currency and Float field representations.
+    return format(number.normalize(), "f")
+
+
+def _promo_history_row(child):
+    return {"name": child.name, "start_date": str(child.get("start_date") or ""),
+            "end_date": str(child.get("end_date") or ""),
+            "promo_price": _promo_history_canonical_price(child.get("promo_price")),
+            "units_sold": child.get("units_sold"), "marketplace_id": child.get("marketplace_id"),
+            "currency": child.get("currency"), "promo_key": child.get("promo_key")}
+
+
+def _promo_history_event_rows(results, state):
+    observations = []
+    live_events = state["events"]
+    aliases = dict(state.get("listing_segment_aliases") or {})
+    latest = dict(state.get("latest_listing_segment") or {})
+    candidates_all = []
+    for result in results:
+        for event in result.get("events", []):
+            raw_start, raw_end = event["start"], event["end"]
+            # Retain Amazon's displayed calendar date, not a relocated UTC date.
+            start = date.fromisoformat(raw_start[:10]).isoformat()
+            end = date.fromisoformat(raw_end[:10]).isoformat()
+            source_id, currency, status = event["source_id"], event.get("currency"), event["status"]
+            if status not in {"active", "confirmed_stop"}:
+                continue
+            if PROMO_HISTORY_MARKETPLACE == MYI_US_MARKETPLACE_ID and currency != "USD":
+                raise ValueError("US promo did not provide a USD price")
+            candidates_all.append(dict(event, source_id=source_id, start_date=start, end_date=end,
+                                       promo_price=_promo_history_canonical_price(event["price"]),
+                                       marketplace_id=result["marketplace"]))
+    # Listings has no schedule ID. A changed start is not normally proof it is
+    # the same sale. Explicit old-end/new-start timestamp equality, the same
+    # verified listing/currency, a known old segment and different prices are
+    # sufficient for a single price split. Without these, leave conflicts alone.
+    transitions = {}
+    for new in candidates_all:
+        new_id = new["source_id"]
+        if (new["status"] != "active" or new.get("source") != "listing"
+                or new_id in live_events or new_id in aliases or len(new["start"]) <= 10):
+            continue
+        choices = []
+        for old in candidates_all:
+            old_id = old["source_id"]
+            canon = aliases.get(old_id, old_id)
+            if (old["status"] != "confirmed_stop" or old.get("source") != "listing"
+                    or canon not in live_events or latest.get(canon, canon) != old_id
+                    or old_id == new_id or len(old["end"]) <= 10
+                    or old["currency"] != new["currency"] or old["marketplace_id"] != new["marketplace_id"]
+                    or old["promo_price"] == new["promo_price"]):
+                continue
+            tail = live_events[canon]["segments"][-1]
+            if (tail["promo_price"] == old["promo_price"]
+                    and _sale_stamp(old["end"], PROMO_HISTORY_TIMEZONE, True) ==
+                        _sale_stamp(new["start"], PROMO_HISTORY_TIMEZONE)):
+                choices.append((old_id, canon))
+        if len(choices) == 1:
+            old_id, canon = choices[0]
+            aliases[new_id] = canon
+            latest[canon] = new_id
+            transitions[new_id] = new["start_date"]
+    for item in candidates_all:
+        source_id = item["source_id"]
+        canonical = aliases.get(source_id, source_id)
+        active_tail = latest.get(canonical)
+        if active_tail and active_tail != source_id:
+            continue  # Authoritative stop of an earlier price segment, not the promo.
+        if item["status"] == "confirmed_stop" and canonical not in live_events:
+            continue  # Do not backfill expired promos.
+        start = (live_events[canonical]["segments"][0]["start_date"]
+                 if source_id in aliases else item["start_date"])
+        observation = {"event_id": canonical, "start_date": start, "end_date": item["end_date"],
+                       "promo_price": item["promo_price"], "confirmed": True,
+                       "marketplace_id": item["marketplace_id"], "currency": item["currency"]}
+        if item["status"] == "confirmed_stop":
+            observation["action"] = "end"
+            if item.get("end_date_kind"):
+                observation["end_date_kind"] = item["end_date_kind"]
+        effective = transitions.get(source_id) or item.get("effective_price_date")
+        if effective:
+            observation["effective_price_date"] = effective
+        observations.append(observation)
+    # Cross-source mirrors only when date/price/market/currency match exactly.
+    groups = defaultdict(list)
+    for obs in observations:
+        if obs.get("action") == "end":
+            key = ("end", obs["event_id"], obs["end_date"], obs.get("end_date_kind"))
+        else:
+            key = ("active", obs["marketplace_id"], obs["currency"], obs["start_date"],
+                   obs["end_date"], obs["promo_price"])
+        groups[key].append(obs)
+    merged = []
+    for choices in groups.values():
+        if len({c["event_id"] for c in choices if c["event_id"] in live_events}) > 1:
+            raise ValueError("Two previously distinct promotions now claim the same date and price")
+        merged.append(min(choices, key=lambda c: (c["event_id"] not in live_events,
+            not c["event_id"].startswith("promotion:"), c["event_id"])))
+    return merged, aliases, latest
+
+
+def _promo_history_apply(item, seller_field, expected, schema, scope, results, observed_at):
+    fieldname, childtype, fields = schema
+    # Serialize writers against the Item and validate that its listing identity did not
+    # change while the external read was in flight. Also locks against regular Item saves.
+    if not frappe.db.sql("SELECT name FROM `tabItem` WHERE name = %s FOR UPDATE", (item,)):
+        raise ValueError("Item disappeared before promo write")
+    doc = frappe.get_doc("Item", item)
+    sku, asin, fnsku = expected
+    if (str(doc.get(seller_field) or "").strip() != sku
+            or str(doc.get("custom_asin") or "").strip() != asin
+            or str(doc.get("custom_amazon_fnsku") or "").strip() != fnsku
+            or doc.get("disabled") or not doc.get("is_stock_item")):
+        raise ValueError("Item listing identity changed during promo fetch")
+    marker_name, marker, state, prior_stamp = _promo_history_state_read(item, scope)
+    if prior_stamp is not None and observed_at <= prior_stamp:
+        return 0, ["An equal or newer promo observation was already processed"]
+    state = state or {"version": 1, "events": {}}
+    incoming, aliases, latest = _promo_history_event_rows(results, state)
+    if not incoming:
+        return 0, []
+    children = list(doc.get(fieldname) or [])
+    by_name = {child.name: child for child in children}
+    plan = plan_promo_lifecycle([_promo_history_row(c) for c in children], incoming, state,
+                                observed_at.astimezone(ZoneInfo(PROMO_HISTORY_TIMEZONE)).date().isoformat())
+    ops = plan["operations"]
+    warnings = list(plan["warnings"])
+    if plan["blocked"]:
+        return 0, warnings
+    if DEBUG:
+        return len(ops), warnings
+    if aliases:
+        plan["state"]["listing_segment_aliases"] = aliases
+        plan["state"]["latest_listing_segment"] = latest
+    if not ops and plan["state"] == state:
+        return 0, warnings
+    bindings = {}
+    expected_rows = {child.name: _promo_history_row(child) for child in children}
+    for op in ops:
+        values = dict(op["fields"])
+        ref = op["row"]
+        if op["action"] == "update":
+            for key, value in values.items():
+                by_name[ref].set(key, value)
+            expected_rows[ref].update(values)
+        elif op["action"] == "insert":
+            event = plan["state"]["events"][op["event_id"]]
+            if fields.get("promo_key") in {"Data", "Small Text"}:
+                values["promo_key"] = op["event_id"]
+            if fields.get("marketplace_id") in {"Data", "Small Text"} and event.get("marketplace_id"):
+                values["marketplace_id"] = event["marketplace_id"]
+            if fields.get("currency") in {"Data", "Small Text", "Link"} and event.get("currency"):
+                values["currency"] = event["currency"]
+            planned_child = doc.append(fieldname, values)
+            bindings[ref] = planned_child
+            expected_rows[ref] = dict(values)
+        else:
+            raise ValueError("Unsupported promo operation")
+    if ops:
+        doc.save(ignore_permissions=True)
+    ref_bindings = {ref: child.name for ref, child in bindings.items()}
+    state = bind_promo_rows(plan["state"], ref_bindings)
+    # Check saved rows and untouched units before creating/updating the audit marker.
+    saved = frappe.get_doc("Item", item)
+    saved_rows = {_row["name"]: _row for _row in
+                  (_promo_history_row(child) for child in saved.get(fieldname) or [])}
+    if set(saved_rows) != {ref_bindings.get(ref, ref) for ref in expected_rows}:
+        raise ValueError("Saved promo row set differs from the plan")
+    for ref, expected_row in expected_rows.items():
+        actual = saved_rows[ref_bindings.get(ref, ref)]
+        for key in ("start_date", "end_date", "promo_price", "units_sold", "currency", "marketplace_id", "promo_key"):
+            if key in expected_row and actual.get(key) != expected_row[key]:
+                raise ValueError("Saved promo dates, price or units differ from the plan")
+    _promo_history_state_write(marker_name, marker, item, scope, observed_at, state)
+    if _promo_history_state_read(item, scope)[2] != state:
+        raise ValueError("ERP promo audit marker verification failed")
+    return len(ops), warnings
+
+
+def _run_item_promo_history_sync():
+    cache = getattr(frappe, "cache", None)
+    if callable(cache) and not hasattr(cache, "lock"):
+        cache = cache()
+    lock = cache.lock("amazon_item_promo_history_sync_v1", timeout=3600, blocking_timeout=0)
+    if not lock.acquire(blocking=False):
+        _promo_history_log(["Skipped: another promo sync is already running."])
+        return
+    try:
+        _run_item_promo_history_locked()
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
+
+
+def _run_item_promo_history_locked():
+    schema = _promo_history_schema()
+    settings = AmazonRepository("q3opu7c5ac").amz_setting
+    if PROMO_HISTORY_MARKETPLACE not in parse_marketplaces(settings.custom_marketplace):
+        raise ValueError("Promo-history marketplace is not in configured Amazon marketplaces")
+    try:
+        seller = _promo_history_seller(settings)
+        seller_issue = ""
+    except ValueError as exc:
+        seller = ""
+        seller_issue = str(exc)
+    seller_field, mapping, rejected = _promo_history_item_scope()
+    observed = datetime.now(timezone.utc)
+    identities = [{"item_code": item, "sku": sku, "asin": asin, "marketplace": PROMO_HISTORY_MARKETPLACE}
+                  for sku, (item, asin, fnsku) in sorted(mapping.items())]
+    # Carry no database transaction across Amazon network requests.
+    frappe.db.rollback()
+    def safe_source(name, fetch, *args):
+        try:
+            return fetch(*args)
+        except Exception as exc:
+            return [], {"request_count": 0, "phase_error": f"{name} lookup failed ({type(exc).__name__})"}
+    listing, listing_stats = (safe_source("Listings", collect_listing_promo_evidence,
+        _sp_get, settings, seller, identities, observed, PROMO_HISTORY_TIMEZONE)
+        if seller else ([], {"incomplete_count": len(identities), "phase_error": seller_issue}))
+    promotions, promo_stats = safe_source("Promotions", collect_promotion_api_evidence,
+        _sp_get, settings, identities, observed, PROMO_HISTORY_TIMEZONE)
+    by_item = defaultdict(list)
+    for result in [*listing, *promotions]:
+        if result.get("events"):
+            by_item[result["item_code"]].append(result)
+    sku_by_item = {value[0]: (sku, value[1], value[2]) for sku, value in mapping.items()}
+    lines = [f"Mode: {'DEBUG preview' if DEBUG else 'ACTIVE'}; marketplace: {PROMO_HISTORY_MARKETPLACE}",
+             f"Exact New listings in scope: {len(identities)}; identity collisions skipped: {rejected}",
+             "Incomplete lookups never remove saved promo history. No historical backfill."]
+    changes = failures = 0
+    for stats in (listing_stats, promo_stats):
+        if stats.get("phase_error"):
+            lines.append(stats["phase_error"])
+        for issue in stats.get("issues", [])[:8]:
+            lines.append(f"Promotions API: {issue.get('code', 'incomplete source')}")
+        if stats.get("errors"):
+            lines.append(f"Listings API: {len(stats['errors'])} incomplete batches")
+    for item, results in sorted(by_item.items()):
+        identity = sku_by_item[item]
+        scope = hashlib.sha256(json.dumps(["q3opu7c5ac", PROMO_HISTORY_MARKETPLACE, *identity],
+                                  separators=(",", ":")).encode("utf-8")).hexdigest()
+        try:
+            count, warnings = _promo_history_apply(item, seller_field, identity, schema, scope, results, observed)
+            # Exact adoption can save only marker state, with no visible row change.
+            if DEBUG:
+                frappe.db.rollback()
+            else:
+                frappe.db.commit()
+            changes += count
+            for warning in warnings:
+                if len(lines) < 105:
+                    lines.append(f"{item}: {warning[:240]}")
+        except Exception as exc:
+            failures += 1
+            try:
+                frappe.db.rollback()
+            except Exception:
+                raise RuntimeError("Promo transaction could not be rolled back; remaining promo writes skipped") from None
+            if len(lines) < 105:
+                lines.append(f"{item}: promo update not verified ({type(exc).__name__}: {str(exc)[:240]}); not retried")
+    lines[3:3] = [f"Listings requests: {listing_stats.get('request_count', 0)}; incomplete Listings items: {listing_stats.get('incomplete_count', 0)}; campaign requests: {promo_stats.get('request_count', 0)}",
+                   f"Items with promo evidence: {len(by_item)}; row changes {'previewed' if DEBUG else 'saved'}: {changes}; item write failures: {failures}"]
+    _promo_history_log(lines)
+
 # ──────────────────────────────────────────
 # Scheduler wrapper
 # ──────────────────────────────────────────
@@ -8931,3 +10343,7 @@ def run_daily_fba_inventory_sync():
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Daily FBA Inventory Sync Error")
         raise
+    # Settle the original successful inventory run before starting independent
+    # promo work; an Item-side rollback must not roll back stock documents.
+    frappe.db.commit()
+    _run_promo_history_after_inventory()
