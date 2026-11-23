@@ -14,6 +14,7 @@
 # 2026-11-18: Separate explanation/trace comments; corrected cleanup diagnostics.
 # 2026-11-20: One verified reconciliation per orphan cleanup run, with batch-wide comments.
 # 2026-11-20: Independent Amazon Item promo history phase.
+# 2026-11-23: US Seller ID; bound repost holds, defer orphan work for saved/unknown progress.
 from __future__ import annotations
 import csv
 import base64
@@ -7909,95 +7910,178 @@ def _prep_aging_reconstruct(rows, current_qty, observed_at):
             "old_lots": old, "lots": residual}
 
 
-def _prep_aging_repost_scope(company):
-    """Conservative item dependency closure; never infer safety from seed warehouse.
-
-    Includes historical/cancelled SLE connections deliberately: valuation reposts
-    can propagate through manufacturing and transfers beyond the initiating item.
-    Unknown roots or bounded-query overflow leave the whole scan unresolved.
-    This is diagnostic-only and grants no authority for stock writes.
-    """
-    pending = frappe.get_all("Repost Item Valuation", filters={
-        "company": company, "docstatus": ["!=", 2],
-        "status": ["not in", ["Completed", "Skipped"]]},
-        fields=["name", "status"], limit_page_length=5001)
-    if len(pending) > 5000:
+def _orphan_pending_repost_rows(company, lock=False):
+    """Current read at the active write gate; ordinary reads for diagnostic discovery."""
+    doctype = "Repost Item Valuation"
+    fields = ["name", "company", "docstatus", "status", "based_on", "item_code",
+              "warehouse", "posting_date", "voucher_type", "voucher_no",
+              "recreate_stock_ledgers", "items_to_be_repost",
+              "reposting_data_file", "current_index"]
+    meta = frappe.get_meta(doctype)
+    if not all(field in ("name", "docstatus") or meta.has_field(field) for field in fields):
+        raise ValueError("Cannot verify valuation repost metadata on this ERP site")
+    if lock:
+        # The field list is fixed above. FOR UPDATE avoids the transaction's
+        # earlier repeatable-read snapshot and keeps the checked jobs stable.
+        rows = frappe.db.sql("SELECT " + ", ".join(fields) +
+            " FROM `tabRepost Item Valuation` WHERE company=%s AND docstatus!=2"
+            " AND status NOT IN ('Completed','Skipped') ORDER BY name LIMIT 5001 FOR UPDATE",
+            (company,), as_dict=True)
+    else:
+        rows = frappe.get_all(doctype, filters={
+            "company": company, "docstatus": ["!=", 2],
+            "status": ["not in", ["Completed", "Skipped"]]},
+            fields=fields, order_by="name asc", limit_page_length=5001)
+    if len(rows) > 5000:
         raise ValueError("Repost discovery exceeds safety limit")
-    affected, notes = set(), []
-    for job in pending:
-        doc = frappe.get_doc("Repost Item Valuation", job["name"])
-        if doc.get("company") != company or doc.get("docstatus") == 2:
-            raise ValueError("Repost scope changed during discovery: " + job["name"])
-        if doc.get("status") in ("Completed", "Skipped"):
-            # ERPNext uses Skipped for a job superseded by another repost.
-            # Any covering active job is still included by the discovery query.
-            continue
-        if doc.get("recreate_stock_ledgers"):
-            raise ValueError("Cannot prove dependency scope while ledger recreation is pending: " + job["name"])
-        roots = set()
-        if doc.get("item_code"):
-            roots.add(str(doc.get("item_code")))
-        voucher_type, voucher_no = doc.get("voucher_type"), doc.get("voucher_no")
-        if voucher_type and voucher_no:
-            rows = frappe.get_all("Stock Ledger Entry", filters={
-                "company": company, "voucher_type": voucher_type, "voucher_no": voucher_no},
-                fields=["item_code"], limit_page_length=50001)
-            if len(rows) > 50000:
-                raise ValueError("Repost voucher history exceeds safety limit: " + job["name"])
-            roots.update(str(r["item_code"]) for r in rows if r.get("item_code"))
-            # Also inspect current voucher children, because SLE recreation may
-            # temporarily remove ledger rows or include newly added items.
-            voucher = frappe.get_doc(voucher_type, voucher_no)
-            if voucher.get("company") != company:
-                raise ValueError("Repost voucher company mismatch: " + job["name"])
-            children = voucher.get("items") or []
-            roots.update(str(r.get("item_code")) for r in children if r.get("item_code"))
-        if not roots:
-            raise ValueError("Cannot establish affected items for repost {0} (status {1})".format(
-                job["name"], doc.get("status")))
-        affected.update(roots)
-        notes.append("{0} (status {1}); seed items: {2}".format(
-            job["name"], doc.get("status"), ", ".join(sorted(roots))))
-    frontier, seen_vouchers = set(affected), set()
-    queries = 0
-    while frontier:
-        if len(affected) > 5000 or queries >= 200:
-            raise ValueError("Repost dependency scope exceeds safety limit")
-        group = sorted(frontier)[:100]
-        frontier.difference_update(group)
-        rows = frappe.get_all("Stock Ledger Entry", filters={
-            "company": company, "item_code": ["in", group]},
-            fields=["voucher_type", "voucher_no"], limit_page_length=50001)
+    return rows
+
+
+def _orphan_repost_signature(rows):
+    return tuple(sorted((row["name"], json.dumps(dict(row), default=str, sort_keys=True))
+                        for row in rows))
+
+
+def _prep_aging_repost_scope(company, pending=None):
+    """Hold reachable (item, warehouse) ledgers, not historical co-batched items.
+
+    Seed transaction jobs from their SLEs, including cancelled originals.
+    For valuation propagation follow forward, uncancelled SLEs and their
+    explicit dependencies. A whole posting day is included to err on the safe
+    side for same-time rows. The absence of a verified scope never clears a job.
+    """
+    if pending is None:
+        pending = _orphan_pending_repost_rows(company)
+    earliest, scanned, notes = {}, {}, []
+    detail_pairs, shared_seen, transfer_children = {}, set(), {}
+    pair_fields = ["item_code", "warehouse", "posting_date"]
+    queries, ledger_rows = 0, 0
+
+    def read_ledger(filters, fields):
+        nonlocal queries, ledger_rows
         queries += 1
-        if len(rows) > 50000:
+        if queries > 2000 or ledger_rows > 200000:
+            raise ValueError("Repost dependency query safety limit reached")
+        rows = frappe.get_all("Stock Ledger Entry", filters={"company": company, **filters},
+                              fields=fields, limit_page_length=50001)
+        ledger_rows += len(rows)
+        if len(rows) > 50000 or ledger_rows > 200000:
             raise ValueError("Repost dependency ledger exceeds safety limit")
-        vouchers = set()
+        return rows
+
+    def add(row):
+        item, warehouse = row.get("item_code"), row.get("warehouse")
+        if not item or not warehouse:
+            raise ValueError("Repost ledger has no item or warehouse identity")
+        raw_date = str(row.get("posting_date") or "")
+        try:
+            day = datetime.strptime(raw_date, "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            raise ValueError("Repost ledger has no valid posting date") from None
+        key = str(item), str(warehouse)
+        earliest[key] = min(day, earliest.get(key, day))
+        if len(earliest) > 5000:
+            raise ValueError("Repost dependency scope exceeds safety limit")
+        return key
+
+    for job in pending:
+        name = job["name"]
+        if job.get("company") != company or job.get("docstatus") == 2:
+            raise ValueError("Invalid repost discovery scope: " + name)
+        if job.get("recreate_stock_ledgers"):
+            raise ValueError("Cannot prove dependency scope while ledger recreation is pending: " + name)
+        # v15.81.3 can store dynamically discovered item/warehouse roots in a
+        # private checkpoint rather than the inline list. Newer v15 has other
+        # resume shapes. Never infer a complete hold set from the starting
+        # document or current ledger when native progress cannot be verified.
+        if (job.get("status") != "Queued" or job.get("reposting_data_file")
+                or str(job.get("current_index") or 0) != "0"):
+            raise ValueError("Valuation repost is running, failed, or has saved progress; orphan scope withheld until resolved: " + name)
+        seeds = []
+        if job.get("based_on") == "Item and Warehouse":
+            seeds.append(job)
+        elif job.get("based_on") == "Transaction":
+            voucher_type, voucher_no = job.get("voucher_type"), job.get("voucher_no")
+            if not voucher_type or not voucher_no:
+                raise ValueError("Missing transaction identity for repost " + name)
+            seeds.extend(read_ledger({"voucher_type": voucher_type, "voucher_no": voucher_no}, pair_fields))
+        else:
+            raise ValueError("Unknown valuation repost mode: " + name)
+        # ERPNext can merge multiple roots into the surviving job. Do not rely
+        # on one nominal item after another queue row was marked Skipped.
+        stored = job.get("items_to_be_repost")
+        if stored:
+            if isinstance(stored, str):
+                if len(stored) > 4_000_000:
+                    raise ValueError("Merged repost scope exceeds safety limit: " + name)
+                stored = json.loads(stored)
+            if not isinstance(stored, list) or len(stored) > 5000 or any(
+                    not isinstance(row, dict) for row in stored):
+                raise ValueError("Invalid merged repost scope: " + name)
+            seeds.extend(stored)
+        if not seeds:
+            raise ValueError("Cannot establish affected item/warehouse for repost " + name)
+        roots = sorted({add(row) for row in seeds})
+        shown = ", ".join("{0}@{1}".format(*key) for key in roots[:12])
+        if len(roots) > 12:
+            shown += " (+{0} more)".format(len(roots) - 12)
+        notes.append("{0} (status {1}); seed ledgers: {2}".format(name, job.get("status"), shown))
+
+    while True:
+        frontier = [(day, item, wh) for (item, wh), day in earliest.items()
+                    if (item, wh) not in scanned or day < scanned[(item, wh)]]
+        if not frontier:
+            break
+        day, item, warehouse = min(frontier)
+        scanned[item, warehouse] = day
+        rows = read_ledger({"item_code": item, "warehouse": warehouse,
+                           "posting_date": [">=", day], "is_cancelled": 0},
+                          ["voucher_type", "voucher_no", "dependant_sle_voucher_detail_no", "actual_qty"])
         for row in rows:
-            if not row.get("voucher_type") or not row.get("voucher_no"):
+            kind, voucher = row.get("voucher_type"), row.get("voucher_no")
+            if not kind or not voucher:
                 raise ValueError("Repost dependency ledger has no voucher identity")
-            vouchers.add((row["voucher_type"], row["voucher_no"]))
-        for voucher_type in sorted({v[0] for v in vouchers - seen_vouchers}):
-            names = sorted(v[1] for v in vouchers - seen_vouchers if v[0] == voucher_type)
-            for offset in range(0, len(names), 100):
-                if queries >= 200:
-                    raise ValueError("Repost dependency query safety limit reached")
-                batch = names[offset:offset + 100]
-                linked = frappe.get_all("Stock Ledger Entry", filters={
-                    "company": company, "voucher_type": voucher_type,
-                    "voucher_no": ["in", batch]}, fields=["item_code"],
-                    limit_page_length=50001)
-                queries += 1
-                if len(linked) > 50000:
-                    raise ValueError("Repost linked ledger exceeds safety limit")
-                for row in linked:
-                    item = row.get("item_code")
-                    if not item:
-                        raise ValueError("Repost linked ledger has no item")
-                    if item not in affected:
-                        affected.add(item)
-                        frontier.add(item)
-        seen_vouchers.update(vouchers)
-    return affected, notes
+            detail = row.get("dependant_sle_voucher_detail_no")
+            if detail and detail not in detail_pairs:
+                # Older v15 may follow a same-detail row even when that row has
+                # a dependency of its own, so do not exclude chained links.
+                links = read_ledger({"voucher_detail_no": detail, "is_cancelled": 0}, pair_fields)
+                detail_pairs[detail] = {add(linked) for linked in links}
+            shares_cost = kind in ("Stock Entry", "Subcontracting Receipt",
+                                   "Purchase Receipt", "Purchase Invoice", "Asset Capitalization")
+            if not shares_cost or (kind, voucher) in shared_seen:
+                continue
+            qty = _prep_aging_number(row.get("actual_qty"))
+            if qty >= 0 and not (kind == "Subcontracting Receipt" and detail):
+                continue
+            if kind == "Stock Entry" and detail:
+                if voucher not in transfer_children:
+                    try:
+                        entry = frappe.get_doc("Stock Entry", voucher)
+                    except Exception as exc:
+                        if _reconciliation_audit_transaction_fatal(exc):
+                            raise
+                        transfer_children[voucher] = {}
+                    else:
+                        children = entry.get("items") or []
+                        independent = (entry.get("company") == company
+                            and entry.get("docstatus") == 1 and entry.get("purpose") == "Material Transfer"
+                            and not entry.get("additional_costs") and children
+                            and all(child.get("name") and child.get("item_code") and
+                                    child.get("s_warehouse") and child.get("t_warehouse") for child in children))
+                        transfer_children[voucher] = ({child.get("name"): child for child in children}
+                                                      if independent else {})
+                child = transfer_children[voucher].get(detail)
+                if (child and child.get("item_code") == item and child.get("s_warehouse") == warehouse
+                        and (item, child.get("t_warehouse")) in detail_pairs[detail]):
+                    continue  # standard, same-item transfer with no pooled cost
+            # Manufacture, repack and shared/uncertain costing may propagate
+            # to several positive outputs; a reconciliation never fans out.
+            shared_seen.add((kind, voucher))
+            for linked in read_ledger({"voucher_type": kind, "voucher_no": voucher,
+                                       "actual_qty": [">", 0], "is_cancelled": 0}, pair_fields):
+                add(linked)
+    return set(earliest), notes
 
 
 def _orphan_report_pages(header, lines, max_bytes=48000):
@@ -8068,7 +8152,7 @@ def _report_suspected_orphaned_prep(settings, cleanup_lines=None):
                   "voucher_type", "voucher_no", "is_cancelled", "docstatus"]
         for item in sorted(quantities):
             try:
-                if item in affected:
+                if (item, warehouse) in affected:
                     raise ValueError("Pending/non-completed valuation repost may affect this item; "
                                      "see repost scope notes")
                 # Per-item bounded reads: one malformed or oversized history must
@@ -8111,9 +8195,9 @@ def _report_suspected_orphaned_prep(settings, cleanup_lines=None):
         after_affected, after_notes = _prep_aging_repost_scope(company)
         newly_affected = after_affected - affected
         if newly_affected:
-            report["candidates"] = [r for r in report["candidates"] if r["item_code"] not in newly_affected]
+            report["candidates"] = [r for r in report["candidates"] if (r["item_code"], warehouse) not in newly_affected]
             unavailable = {r["item_code"] for r in report["unavailable"]}
-            for item in sorted(newly_affected.intersection(quantities) - unavailable):
+            for item in sorted({i for i, w in newly_affected if w == warehouse and i in quantities} - unavailable):
                 report["unavailable"].append({"item_code": item, "reason": "Valuation repost scope changed during scan"})
                 report["items_checked"] -= 1
         report["repost_notes"] = sorted(set(report["repost_notes"] + after_notes))
@@ -8346,7 +8430,8 @@ def _process_orphan_cleanup(settings, diagnostics):
         skipped_sync_items = {state.get("item_code")
             for state in (diagnostics.get("items") or {}).values() if state.get("skipped")}
         if candidates:
-            affected, _ = _prep_aging_repost_scope(company)
+            initial_reposts = _orphan_pending_repost_rows(company)
+            affected, _ = _prep_aging_repost_scope(company, initial_reposts)
         planned = []
         tolerance = INBOUND_DEBT_QTY_TOLERANCE
         for item, warehouse, require_asin in sorted(candidates):
@@ -8360,8 +8445,8 @@ def _process_orphan_cleanup(settings, diagnostics):
                     raise ValueError("Item has unresolved transition/draft evidence")
                 if item in skipped_sync_items:
                     raise ValueError("Ordinary sync skipped this item's quantity verification")
-                if item in affected:
-                    raise ValueError("Pending valuation repost affects this item")
+                if (item, warehouse) in affected:
+                    raise ValueError("Pending valuation repost affects this item/warehouse")
                 observed = frappe.utils.now_datetime()
                 before = _orphan_cleanup_snapshot(item, warehouse, company, observed)
                 old, quantity, target = _orphan_cleanup_lots(before, observed)
@@ -8402,21 +8487,12 @@ def _process_orphan_cleanup(settings, diagnostics):
                              for e, _ in planned)
             return lines
 
-        # Recheck discovered valuation work before writing; no marked stock
-        # can join the batch. Other eligible rows retain their own evidence.
-        final_affected, _ = _prep_aging_repost_scope(company)
-        unaffected = []
-        for evidence, before in planned:
-            if evidence["item_code"] in final_affected:
-                lines.append("SKIPPED {0}@{1}: pending valuation repost affects this item".format(
-                    evidence["item_code"], evidence["warehouse"]))
-            else:
-                unaffected.append((evidence, before))
-        planned = unaffected
-        if not planned:
-            frappe.db.rollback()
-            transaction_open = False
-            return lines
+        # A current read (not the earlier repeatable-read snapshot) must agree
+        # before writing. If queue roots changed mid-run, retry with fresh
+        # dependency evidence rather than clearing an unverified candidate.
+        current_reposts = _orphan_pending_repost_rows(company, lock=True)
+        if _orphan_repost_signature(current_reposts) != _orphan_repost_signature(initial_reposts):
+            raise ValueError("Valuation repost queue changed during cleanup; will retry next sync")
         if not lock.owned():
             raise RuntimeError("Cleanup lock ownership lost before posting")
 
@@ -9873,7 +9949,7 @@ def promo_owner_on(rows, state, day):
 PROMO_HISTORY_MARKETPLACE = MYI_US_MARKETPLACE_ID
 PROMO_HISTORY_TIMEZONE = "America/Los_Angeles"
 PROMO_HISTORY_TABLE_FIELD = ""  # Optional explicit Item Table fieldname
-PROMO_HISTORY_SELLER_ID = ""  # Optional Seller ID when not in existing Settings
+PROMO_HISTORY_SELLER_ID = "A1H9C5WYP4XZPR"  # US Seller ID for promo Listings lookup
 _PROMO_HISTORY_FIELDS = ("start_date", "end_date", "promo_price", "units_sold")
 _PROMO_HISTORY_CHILD = "Amazon Promo Sale History"
 _PROMO_HISTORY_MARKER = "AMAZON_ITEM_PROMO_SYNC_V1:"
