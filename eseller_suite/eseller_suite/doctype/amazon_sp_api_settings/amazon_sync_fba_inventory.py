@@ -15,6 +15,7 @@
 # 2026-11-20: One verified reconciliation per orphan cleanup run, with batch-wide comments.
 # 2026-11-20: Independent Amazon Item promo history phase.
 # 2026-11-23: US Seller ID; bound repost holds, defer orphan work for saved/unknown progress.
+# 2026-11-24: Refresh promo units from exact-price ERP Sales Order lines.
 from __future__ import annotations
 import csv
 import base64
@@ -10289,6 +10290,142 @@ def _promo_history_apply(item, seller_field, expected, schema, scope, results, o
     return len(ops), warnings
 
 
+def _promo_units_totals(rows, today, load_sales, state=None):
+    """Recompute from ERP, never add today's rows to the previously saved total."""
+    rows = [row for row in rows if row.get("marketplace_id") in (None, "", PROMO_HISTORY_MARKETPLACE)]
+    canonical = []
+    for row in rows:
+        canonical.append({**row, "start_date": _promo_date(str(row["start_date"])),
+                          "end_date": _promo_date(str(row["end_date"])),
+                          "promo_price": _promo_history_canonical_price(row["promo_price"])})
+    state = state or {"version": 1, "events": {}}
+    plan = plan_promo_lifecycle(canonical, [], state, today)
+    if plan["blocked"]:
+        raise ValueError("Promo date ownership is unverified: " + "; ".join(plan["warnings"]))
+    split_ends = {old["row"] for event in state["events"].values()
+                  for old, new in zip(event["segments"], event["segments"][1:])
+                  if old["end_date"] == new["start_date"]}
+    windows = defaultdict(list)
+    totals = {}
+    for row in canonical:
+        start, end = row["start_date"], row["end_date"]
+        if start > today:
+            continue
+        name = row["name"]
+        totals[name] = 0
+        # Durable lifecycle assigns a shared split date to the newer row, not
+        # to both prices. A standalone/terminal end date remains inclusive.
+        if name in split_ends:
+            end = (date.fromisoformat(end) - timedelta(days=1)).isoformat()
+        if start <= end:
+            currency = str(row.get("currency") or "USD").strip().upper()
+            windows[currency, Decimal(row["promo_price"])].append((start, min(end, today), name))
+    if not windows:
+        return totals
+    starts = [start for group in windows.values() for start, _, _ in group]
+    ends = [end for group in windows.values() for _, end, _ in group]
+    seen = set()
+    for sale in load_sales(min(starts), max(ends)):
+        name = sale["name"]
+        if not name or name in seen:
+            raise ValueError("Missing or duplicate ERP sales-line identity")
+        seen.add(name)
+        if re.search(r"-USED(?=$|[^\w])", str(sale.get("item_name") or ""), re.IGNORECASE):
+            continue
+        price = Decimal(str(sale["rate"]))
+        if not price.is_finite():
+            raise ValueError("Invalid ERP sales-line unit price")
+        qty = Decimal(str(sale["qty"]))
+        if not qty.is_finite():
+            raise ValueError("Invalid ERP sales-line quantity")
+        if qty <= 0:
+            continue
+        stock_qty = Decimal(str(sale["stock_qty"]))
+        if not stock_qty.is_finite() or stock_qty <= 0:
+            raise ValueError("Missing positive stock-unit quantity on ERP sale")
+        # Convert alternate sales UOMs to the individual units represented by
+        # the promo. Recheck the product to avoid rounded-in price matches.
+        total_price = price * qty
+        unit_price = total_price / stock_qty
+        if total_price != unit_price * stock_qty:
+            continue
+        group = windows.get((str(sale["currency"]).upper(), unit_price), ())
+        order_day = str(sale["transaction_date"])
+        for start, end, row_name in group:
+            if start <= order_day <= end:
+                if stock_qty != stock_qty.to_integral_value():
+                    raise ValueError("Promo sales require whole stock units")
+                totals[row_name] += int(stock_qty)
+                break
+    return totals
+
+
+def _promo_units_sales(item, start, end, has_amazon_status):
+    # The Amazon importer writes purchase date to transaction_date and per-unit
+    # ItemPrice to rate. Match exact Item and transaction currency, not ASIN or
+    # company-currency totals. Include other confirmed ERP channels at that price.
+    rule = "so.docstatus = 1"
+    if has_amazon_status:
+        status = "LOWER(TRIM(COALESCE(so.amazon_order_status, '')))"
+        rule = (f"((so.docstatus = 1 AND {status} NOT IN ('canceled', 'cancelled')) "
+                f"OR (so.docstatus = 0 AND {status} IN ('shipped', 'shipped - picked up')))")
+    return frappe.db.sql(
+        "SELECT line.name, line.item_name, line.rate, line.qty, line.stock_qty, "
+        "so.transaction_date, so.currency "
+        "FROM `tabSales Order Item` line JOIN `tabSales Order` so ON so.name = line.parent "
+        "WHERE line.parenttype = 'Sales Order' AND line.parentfield = 'items' "
+        "AND line.item_code = %s AND BINARY line.item_code = BINARY %s "
+        "AND so.transaction_date BETWEEN %s AND %s AND " + rule,
+        (item, item, start, end), as_dict=True)
+
+
+def _refresh_promo_units(schema, observed, item_scopes):
+    """Separate transaction per Item; stock and promo lifecycle writes stay committed."""
+    fieldname, childtype, fields = schema
+    today = observed.astimezone(ZoneInfo(PROMO_HISTORY_TIMEZONE)).date().isoformat()
+    scope = {"parenttype": "Item", "parentfield": fieldname, "start_date": ["<=", today]}
+    items = frappe.get_all(childtype, filters=scope, fields=["parent"], distinct=True)
+    has_status = frappe.get_meta("Sales Order").has_field("amazon_order_status")
+    # The discovery read must not anchor a snapshot before an Item lock.
+    frappe.db.rollback()
+    updated = failures = 0
+    warnings = []
+    for item in sorted({row["parent"] for row in items}):
+        try:
+            if not frappe.db.sql("SELECT name FROM `tabItem` WHERE name = %s FOR UPDATE", (item,)):
+                raise ValueError("Item disappeared before promo units refresh")
+            columns = ["name", "start_date", "end_date", "promo_price", "units_sold"]
+            columns += [key for key in ("currency", "marketplace_id") if key in fields]
+            rows = frappe.get_all(childtype, filters={"parenttype": "Item",
+                                 "parentfield": fieldname, "parent": item}, fields=columns)
+            marker_scope = item_scopes.get(item)
+            state = _promo_history_state_read(item, marker_scope)[2] if marker_scope else None
+            totals = _promo_units_totals(rows, today, lambda start, end:
+                                         _promo_units_sales(item, start, end, has_status), state)
+            changes = {row["name"]: totals[row["name"]] for row in rows
+                       if row["name"] in totals and row["units_sold"] != totals[row["name"]]}
+            if DEBUG:
+                frappe.db.rollback()
+            else:
+                for name, qty in changes.items():
+                    frappe.db.set_value(childtype, name, "units_sold", qty)
+                    if frappe.db.get_value(childtype, name, "units_sold") != qty:
+                        raise ValueError("Saved promo unit count could not be verified")
+                if changes:
+                    # Flag concurrent stale Item editors via Frappe's modified check.
+                    frappe.db.set_value("Item", item, "modified", frappe.utils.now_datetime())
+                    frappe.db.commit()
+                else:
+                    frappe.db.rollback()
+            updated += len(changes)
+        except Exception as exc:
+            failures += 1
+            frappe.db.rollback()
+            if len(warnings) < 15:
+                warnings.append(f"{item}: promo units not verified ({type(exc).__name__}: {str(exc)[:220]})")
+    return updated, failures, warnings
+
+
 def _run_item_promo_history_sync():
     cache = getattr(frappe, "cache", None)
     if callable(cache) and not hasattr(cache, "lock"):
@@ -10349,10 +10486,12 @@ def _run_item_promo_history_locked():
             lines.append(f"Promotions API: {issue.get('code', 'incomplete source')}")
         if stats.get("errors"):
             lines.append(f"Listings API: {len(stats['errors'])} incomplete batches")
+    item_scopes = {item: hashlib.sha256(json.dumps(
+        ["q3opu7c5ac", PROMO_HISTORY_MARKETPLACE, *identity], separators=(",", ":")).encode("utf-8")).hexdigest()
+        for item, identity in sku_by_item.items()}
     for item, results in sorted(by_item.items()):
         identity = sku_by_item[item]
-        scope = hashlib.sha256(json.dumps(["q3opu7c5ac", PROMO_HISTORY_MARKETPLACE, *identity],
-                                  separators=(",", ":")).encode("utf-8")).hexdigest()
+        scope = item_scopes[item]
         try:
             count, warnings = _promo_history_apply(item, seller_field, identity, schema, scope, results, observed)
             # Exact adoption can save only marker state, with no visible row change.
@@ -10374,6 +10513,18 @@ def _run_item_promo_history_locked():
                 lines.append(f"{item}: promo update not verified ({type(exc).__name__}: {str(exc)[:240]}); not retried")
     lines[3:3] = [f"Listings requests: {listing_stats.get('request_count', 0)}; incomplete Listings items: {listing_stats.get('incomplete_count', 0)}; campaign requests: {promo_stats.get('request_count', 0)}",
                    f"Items with promo evidence: {len(by_item)}; row changes {'previewed' if DEBUG else 'saved'}: {changes}; item write failures: {failures}"]
+    try:
+        unit_changes, unit_failures, unit_warnings = _refresh_promo_units(schema, observed, item_scopes)
+        lines.insert(5, f"Promo unit rows {'previewed (existing rows only)' if DEBUG else 'updated'} from ERP: "
+                        f"{unit_changes}; item count failures: {unit_failures}")
+        lines.extend(unit_warnings)
+    except Exception as exc:
+        try:
+            frappe.db.rollback()
+        except Exception:
+            pass
+        lines.insert(5, f"Promo unit refresh unavailable ({type(exc).__name__}: {str(exc)[:220]}); "
+                        "inventory and prior promo lifecycle updates were not rolled back.")
     _promo_history_log(lines)
 
 # ──────────────────────────────────────────
